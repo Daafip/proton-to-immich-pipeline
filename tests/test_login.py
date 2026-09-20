@@ -106,6 +106,13 @@ class TestRedirectServer(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
 
+    class Response:
+        def __init__(self, code, headers, body):
+            self.code, self.headers, self.body = code, headers, body
+
+        def read(self):
+            return self.body
+
     def fetch(self, path="/"):
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *a, **kw):
@@ -113,9 +120,13 @@ class TestRedirectServer(unittest.TestCase):
 
         opener = urllib.request.build_opener(NoRedirect)
         try:
-            return opener.open(f"http://127.0.0.1:{self.port}{path}")
+            resp = opener.open(f"http://127.0.0.1:{self.port}{path}")
         except urllib.error.HTTPError as exc:
-            return exc
+            resp = exc
+        try:
+            return self.Response(resp.code, resp.headers, resp.read())
+        finally:
+            resp.close()
 
     def test_redirects_with_the_fragment_intact(self):
         resp = self.fetch()

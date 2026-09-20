@@ -1,0 +1,115 @@
+[
+ {
+  "uid": "BASE64UID1==~BASE64NODE1==",
+  "parentUid": "BASE64UID0==~BASE64PARENT==",
+  "name": {
+   "ok": true,
+   "value": "IMG_20171221_185511090_HDR.jpg"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "user@example.com"
+  },
+  "type": "file",
+  "mediaType": "image/jpeg",
+  "isShared": false,
+  "isSharedPublicly": false,
+  "creationTime": "2026-02-15T16:03:29.000Z",
+  "modificationTime": "2026-02-15T16:03:30.000Z",
+  "totalStorageSize": 763203,
+  "activeRevision": {
+   "ok": true,
+   "value": {
+    "uid": "BASE64REV1==",
+    "state": "active",
+    "creationTime": "2026-02-15T16:03:29.000Z",
+    "contentAuthor": {
+     "ok": true,
+     "value": "user@example.com"
+    },
+    "storageSize": 763203,
+    "isImported": false,
+    "claimedSize": 604740,
+    "claimedModificationTime": "2026-02-12T12:20:22.000Z",
+    "claimedDigests": {
+     "sha1": "0da474d6ab1adda2fffa629db0b933475a41d8e3",
+     "sha1Verified": false
+    },
+    "claimedAdditionalMetadata": {
+     "Media": {
+      "Width": 4632,
+      "Height": 3474
+     },
+     "Camera": {
+      "Device": "Moto G (5S)",
+      "CaptureTime": "2017-12-27T18:55:15.000Z"
+     }
+    }
+   }
+  },
+  "treeEventScopeId": "SCOPE1=="
+ },
+ {
+  "uid": "BASE64UID2==~BASE64NODE2==",
+  "parentUid": "BASE64UID0==~BASE64PARENT==",
+  "name": {
+   "ok": true,
+   "value": "IMG_20171222_185512090_HDR.mp4"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "user@example.com"
+  },
+  "type": "file",
+  "mediaType": "video/mp4",
+  "isShared": false,
+  "isSharedPublicly": false,
+  "creationTime": "2026-02-15T16:30:37.000Z",
+  "modificationTime": "2026-02-15T16:30:39.000Z",
+  "totalStorageSize": 4320782,
+  "activeRevision": {
+   "ok": true,
+   "value": {
+    "uid": "BASE64REV2==",
+    "state": "active",
+    "creationTime": "2026-02-15T16:30:37.000Z",
+    "contentAuthor": {
+     "ok": true,
+     "value": "user@example.com"
+    },
+    "storageSize": 4320782,
+    "isImported": false,
+    "claimedSize": 4314887,
+    "claimedModificationTime": "2026-02-12T12:38:40.000Z",
+    "claimedDigests": {
+     "sha1": "4e02f0e25b7a0636f89fda3077feb90fdfa191a4",
+     "sha1Verified": false
+    },
+    "claimedAdditionalMetadata": {
+     "Media": {
+      "Width": 1280,
+      "Height": 720,
+      "Duration": 18.343764
+     }
+    }
+   }
+  },
+  "treeEventScopeId": "SCOPE2=="
+ }
+]

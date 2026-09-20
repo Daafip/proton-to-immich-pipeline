@@ -32,6 +32,7 @@ class Stats:
     uploaded: int = 0
     duplicates: int = 0
     verified: int = 0
+    skipped_present: int = 0
     purged: int = 0
     failed: int = 0
     quarantined: int = 0
@@ -107,6 +108,7 @@ class Pipeline:
         dry = self.dry_run if dry_run is None else dry_run
         extensions = list(self.cfg.get("proton.extensions", []) or [])
         excludes = list(self.cfg.get("proton.exclude_globs", []) or [])
+        media_prefixes = list(self.cfg.get("proton.media_type_prefixes", []) or [])
         roots = list(self.cfg.get("proton.roots", []) or [])
 
         try:
@@ -121,7 +123,8 @@ class Pipeline:
             log.info("pull.root", root=root, backend=self.backend.name)
             try:
                 for node in self.backend.walk(root):
-                    if not proton.should_include(node, extensions, excludes):
+                    if not proton.should_include(node, extensions, excludes,
+                                                 media_prefixes):
                         self.stats.skipped += 1
                         continue
                     if dry:
@@ -137,7 +140,8 @@ class Pipeline:
 
                     result = state.upsert_discovered(
                         self.conn, node.node_id, node.path, node.name,
-                        node.size, node.modified)
+                        node.size, node.modified,
+                        claimed_sha1=node.sha1, capture_time=node.capture_time)
                     if result == "new":
                         self.stats.discovered += 1
                         log.transition(node.node_id, "-", state.DISCOVERED, path=node.path)
@@ -160,9 +164,62 @@ class Pipeline:
                  unchanged=self.stats.unchanged, skipped=self.stats.skipped, dry_run=dry)
         return self.stats
 
+    # -- Phase 1b: ask Immich before transferring anything -----------------
+    def precheck(self, limit: int | None = None, chunk: int = 500) -> Stats:
+        """Skip downloading anything Immich already holds.
+
+        Proton hands over a sha1 for every file at discovery time, and Immich
+        dedupes on sha1, so the two can be matched before a byte moves. The
+        digest is the uploader's claim rather than a server guarantee, which is
+        why this is opt-in: a wrong claim that happened to match a different
+        asset already in Immich would skip a file that never actually arrived.
+        A wrong claim that matches nothing simply downloads as normal.
+        """
+        rows = state.select_for_precheck(self.conn, limit=limit)
+        if not rows:
+            log.info("precheck.nothing_to_do")
+            return self.stats
+
+        for start in range(0, len(rows), chunk):
+            batch = rows[start:start + chunk]
+            try:
+                known = self.client.bulk_upload_check(
+                    [(r["node_id"], r["claimed_sha1"]) for r in batch])
+            except ImmichAuthError as exc:
+                raise AuthFailure(f"immich: {exc}") from exc
+            except ImmichError as exc:
+                # Purely an optimisation: fall back to downloading.
+                log.warn("precheck.unavailable", detail=str(exc)[:200])
+                return self.stats
+
+            for row in batch:
+                hit = known.get(row["node_id"])
+                if not (hit and hit.found and hit.asset_id):
+                    continue
+                if self.dry_run:
+                    log.info("precheck.dry_run_present", node_id=row["node_id"])
+                    self.stats.skipped_present += 1
+                    continue
+                state.mark_uploaded(self.conn, row["node_id"], hit.asset_id,
+                                    is_duplicate=True, sha1=row["claimed_sha1"])
+                log.transition(row["node_id"], state.DISCOVERED, state.UPLOADED,
+                               asset_id=hit.asset_id, reason="already in immich",
+                               downloaded=False)
+                self.stats.skipped_present += 1
+                self.stats.duplicates += 1
+
+        log.info("precheck.done", already_present=self.stats.skipped_present,
+                 checked=len(rows))
+        return self.stats
+
     # -- Phase 2: download -------------------------------------------------
     def _ready_path(self, row: sqlite3.Row, sha1: str) -> Path:
-        ts = state.parse_ts(row["remote_modified"]) or datetime.now(timezone.utc)
+        # Bucket by capture date, not by when the file reached Proton: a bulk
+        # import stamps every node with the migration date, which would put the
+        # entire library in one directory.
+        ts = (state.parse_ts(_row_get(row, "capture_time"))
+              or state.parse_ts(row["remote_modified"])
+              or datetime.now(timezone.utc))
         bucket = self.cfg.ready_dir / ts.strftime("%Y-%m")
         candidate = bucket / row["remote_name"]
         if candidate.exists():
@@ -244,6 +301,12 @@ class Pipeline:
                 if actual == 0:
                     raise ProtonError("downloaded file is empty")
                 digest = sha1_file(scratch)
+                claimed = _row_get(row, "claimed_sha1")
+                if claimed and claimed != digest:
+                    # Proton reports sha1Verified: false, so the claim is the
+                    # uploader's word. Our own digest is what Immich gets.
+                    log.warn("download.digest_mismatch", node_id=node_id,
+                             claimed=claimed, actual=digest)
                 target = self._ready_path(row, digest)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(scratch, target)  # same filesystem: atomic
@@ -507,6 +570,16 @@ class Pipeline:
             log.transition(row["node_id"], state.VERIFIED, state.PURGED, path=local)
             self.stats.purged += 1
 
+        # Rows matched by claimed digest never had a file; nothing to delete,
+        # but they should still reach a terminal state.
+        for row in state.select_verified_without_file(self.conn):
+            if self.dry_run:
+                continue
+            state.mark_purged(self.conn, row["node_id"])
+            log.transition(row["node_id"], state.VERIFIED, state.PURGED,
+                           downloaded=False)
+            self.stats.purged += 1
+
         if not self.dry_run:
             _prune_empty_dirs(self.cfg.ready_dir)
             self._clean_scratch()
@@ -537,11 +610,21 @@ class Pipeline:
         if reset:
             log.info("run.resumed", **{k: v for k, v in reset.items()})
         self.pull()
+        if self.cfg.get("immich.precheck_claimed_digests"):
+            self.precheck()
         self.download(backfill=backfill)
         self.push()
         self.verify()
         self.reap()
         return self.stats
+
+
+def _row_get(row: sqlite3.Row, column: str) -> Any:
+    """sqlite3.Row raises on unknown columns; tolerate a pre-migration row."""
+    try:
+        return row[column]
+    except (IndexError, KeyError):
+        return None
 
 
 def _remove_if_empty(path: Path) -> None:

@@ -91,6 +91,12 @@ immich:
   album_strategy: flat
   album_name: Proton Import
   batch_mode: hardlink
+  # Ask Immich whether it already holds a file -- matching Proton's reported
+  # sha1 against Immich's own dedupe index -- and skip downloading it if so.
+  # Worth turning on for a re-run or against an Immich that already has some
+  # of the library; it saves nothing against an empty one. Off by default
+  # because Proton reports the digest as unverified (sha1Verified: false).
+  precheck_claimed_digests: false
 
 limits:
   max_files: 500

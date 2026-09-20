@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DISCOVERED = "discovered"
 DOWNLOADING = "downloading"
@@ -55,7 +55,11 @@ CREATE TABLE IF NOT EXISTS assets (
   attempts        INTEGER DEFAULT 0,
   first_seen      TEXT NOT NULL,
   last_attempt    TEXT,
-  last_error      TEXT
+  last_error      TEXT,
+  -- v2: from Proton's activeRevision. claimed_sha1 is the uploader's digest
+  -- (not server-verified); capture_time is when the photo was actually taken.
+  claimed_sha1    TEXT,
+  capture_time    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
@@ -98,8 +102,22 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    migrate(conn)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    """Add columns a database created by an older version is missing."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(assets)")}
+    added = []
+    for column, ddl in (("claimed_sha1", "TEXT"), ("capture_time", "TEXT")):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE assets ADD COLUMN {column} {ddl}")
+            added.append(column)
+    if added:
+        conn.commit()
+    return added
 
 
 def resume(conn: sqlite3.Connection) -> dict[str, int]:
@@ -135,6 +153,8 @@ def upsert_discovered(
     remote_size: int | None,
     remote_modified: str | None,
     now: str | None = None,
+    claimed_sha1: str | None = None,
+    capture_time: str | None = None,
 ) -> str:
     """Insert or refresh one node. Returns 'new', 'changed' or 'unchanged'."""
     now = now or utcnow()
@@ -145,10 +165,10 @@ def upsert_discovered(
     if row is None:
         conn.execute(
             "INSERT INTO assets (node_id, remote_path, remote_name, remote_size,"
-            " remote_modified, status, first_seen, last_attempt)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            " remote_modified, status, first_seen, last_attempt, claimed_sha1,"
+            " capture_time) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (node_id, remote_path, remote_name, remote_size, remote_modified,
-             DISCOVERED, now, now),
+             DISCOVERED, now, now, claimed_sha1, capture_time),
         )
         return "new"
 
@@ -163,9 +183,10 @@ def upsert_discovered(
             "UPDATE assets SET remote_path=?, remote_name=?, remote_size=?,"
             " remote_modified=?, local_path=NULL, sha1=NULL, status=?,"
             " immich_asset_id=NULL, is_duplicate=0, attempts=0,"
-            " last_attempt=?, last_error=NULL WHERE node_id=?",
+            " last_attempt=?, last_error=NULL, claimed_sha1=?, capture_time=?"
+            " WHERE node_id=?",
             (remote_path, remote_name, remote_size, remote_modified,
-             DISCOVERED, now, node_id),
+             DISCOVERED, now, claimed_sha1, capture_time, node_id),
         )
         return "changed"
 
@@ -267,6 +288,20 @@ def select_for_upload(
     return rows[:limit] if limit is not None else rows
 
 
+def select_for_precheck(
+    conn: sqlite3.Connection,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Discovered rows carrying a claimed digest, so Immich can be asked
+    whether the file is already there before a byte is transferred."""
+    rows = conn.execute(
+        "SELECT * FROM assets WHERE status=? AND claimed_sha1 IS NOT NULL"
+        " ORDER BY node_id",
+        (DISCOVERED,),
+    ).fetchall()
+    return rows[:limit] if limit is not None else rows
+
+
 def select_for_verify(conn: sqlite3.Connection, limit: int | None = None) -> list[sqlite3.Row]:
     rows = conn.execute(
         "SELECT * FROM assets WHERE status=? ORDER BY last_attempt", (UPLOADED,)
@@ -293,6 +328,14 @@ def select_for_reap(
         if ts is None or ts <= cutoff:
             out.append(row)
     return out
+
+
+def select_verified_without_file(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Verified rows that never had a local file -- matched by claimed digest
+    and so never downloaded. There is nothing to delete, only to close out."""
+    return conn.execute(
+        "SELECT * FROM assets WHERE status=? AND local_path IS NULL", (VERIFIED,)
+    ).fetchall()
 
 
 def get(conn: sqlite3.Connection, node_id: str) -> sqlite3.Row | None:
@@ -333,9 +376,16 @@ def mark_uploaded(
     node_id: str,
     asset_id: str | None,
     is_duplicate: bool = False,
+    sha1: str | None = None,
 ) -> None:
+    extra: dict[str, Any] = {}
+    if sha1 is not None:
+        # Set when the row was matched on Proton's claimed digest without ever
+        # being downloaded: it is the checksum Immich matched, so verify can
+        # use it. local_path stays NULL, which is what marks it as never-fetched.
+        extra["sha1"] = sha1
     _set_status(conn, node_id, UPLOADED, immich_asset_id=asset_id,
-                is_duplicate=1 if is_duplicate else 0, last_error=None)
+                is_duplicate=1 if is_duplicate else 0, last_error=None, **extra)
     conn.commit()
 
 

@@ -51,7 +51,12 @@ _AUTH_HINTS = (
 _ID_KEYS = ("node_id", "nodeId", "uid", "linkId", "link_id", "id")
 _NAME_KEYS = ("name", "filename", "fileName", "basename")
 _PATH_KEYS = ("path", "fullPath", "full_path", "remotePath", "remote_path", "Path")
-_SIZE_KEYS = ("size", "sizeBytes", "size_bytes", "fileSize", "totalSize", "Size")
+# claimedSize is the plaintext content size. totalStorageSize/storageSize are
+# the ENCRYPTED size and run ~25% larger -- using one of those as "the file
+# size" fails every post-download size check.
+_SIZE_KEYS = ("claimedSize", "claimed_size", "size", "sizeBytes", "size_bytes",
+              "fileSize", "totalSize", "Size")
+_STORAGE_SIZE_KEYS = ("totalStorageSize", "storageSize")
 _MTIME_KEYS = ("modified", "modifiedAt", "modified_at", "modificationTime",
                "modification_time", "lastModified", "last_modified", "mtime",
                "updatedAt", "updated_at", "captureTime", "capture_time", "ModTime")
@@ -69,6 +74,12 @@ class RemoteNode:
     size: int | None
     modified: str | None
     is_folder: bool
+    # From activeRevision. `sha1` is the uploader's claimed digest -- the same
+    # algorithm Immich dedupes with. `capture_time` is when the photo was
+    # taken, which is usually nothing like when it was put into Proton.
+    sha1: str | None = None
+    capture_time: str | None = None
+    media_type: str | None = None
 
     @property
     def ext(self) -> str:
@@ -160,13 +171,38 @@ def normalize_entry(obj: dict[str, Any], parent_path: str) -> RemoteNode | None:
         # No stable id available: the path is the next best primary key.
         node_id = f"path:{path}"
 
+    revision = unwrap(obj.get("activeRevision")) or {}
+    if not isinstance(revision, dict):
+        revision = {}
+    digests = unwrap(revision.get("claimedDigests")) or {}
+    if not isinstance(digests, dict):
+        digests = {}
+    extra = unwrap(revision.get("claimedAdditionalMetadata")) or {}
+    camera = (extra.get("Camera") or {}) if isinstance(extra, dict) else {}
+
+    size = _coerce_int(_first(revision, _SIZE_KEYS))
+    if size is None:
+        size = _coerce_int(_first(obj, _SIZE_KEYS))
+    if size is None:
+        # Last resort only: this is the encrypted size, not the content size.
+        size = _coerce_int(_first(obj, _STORAGE_SIZE_KEYS))
+        if size is not None:
+            log.debug("proton.storage_size_fallback", name=str(name))
+
+    capture = _coerce_ts(camera.get("CaptureTime") if isinstance(camera, dict) else None)
+    if not capture:
+        capture = _coerce_ts(_first(revision, ("claimedModificationTime",)))
+
     return RemoteNode(
         node_id=str(node_id),
         path=path,
         name=str(name),
-        size=_coerce_int(_first(obj, _SIZE_KEYS)),
+        size=size,
         modified=_coerce_ts(_first(obj, _MTIME_KEYS)),
         is_folder=is_folder_entry(obj),
+        sha1=(str(digests.get("sha1")).lower() if digests.get("sha1") else None),
+        capture_time=capture,
+        media_type=_first(obj, ("mediaType", "media_type", "mimeType")),
     )
 
 
@@ -242,10 +278,17 @@ def safe_filename(name: str, fallback: str = "asset") -> str:
     return cleaned or fallback
 
 
-def should_include(node: RemoteNode, extensions: list[str], exclude_globs: list[str]) -> bool:
+def should_include(node: RemoteNode, extensions: list[str], exclude_globs: list[str],
+                   media_prefixes: list[str] | None = None) -> bool:
     if node.is_folder:
         return False
-    if extensions and node.ext not in {e.lower() for e in extensions}:
+    # mediaType is authoritative when present; extensions are the fallback for
+    # entries that do not carry one.
+    if node.media_type and media_prefixes:
+        if not any(str(node.media_type).lower().startswith(p.lower())
+                   for p in media_prefixes):
+            return False
+    elif extensions and node.ext not in {e.lower() for e in extensions}:
         return False
     for pattern in exclude_globs or []:
         if fnmatch.fnmatch(node.name, pattern) or fnmatch.fnmatch(node.path, pattern):
@@ -396,6 +439,10 @@ class ProtonCliBackend(Backend):
 
         proc.kill()
         stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                stream.close()
+        proc.wait(timeout=5)
         raise ProtonError(
             f"no sign-in URL from `{self.binary} auth login --json` "
             f"within {timeout}s: {stderr[:300]}")

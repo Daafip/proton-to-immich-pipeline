@@ -1,0 +1,89 @@
+[
+ {
+  "uid": "BASE64UID1==~BASE64NODEID1==",
+  "parentUid": "BASE64UID0==~BASE64PARENT==",
+  "name": {
+   "ok": true,
+   "value": "Photos from 2017"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "user@example.com"
+  },
+  "type": "folder",
+  "isShared": false,
+  "isSharedPublicly": false,
+  "creationTime": "2026-02-15T16:02:56.000Z",
+  "modificationTime": "2026-02-15T16:02:56.000Z",
+  "folder": {
+   "isImported": false
+  },
+  "treeEventScopeId": "SCOPE1=="
+ },
+ {
+  "uid": "BASE64UID2==~BASE64NODEID2==",
+  "parentUid": "BASE64UID0==~BASE64PARENT==",
+  "name": {
+   "ok": true,
+   "value": "Photos from 2020"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "user@example.com"
+  },
+  "type": "folder",
+  "isShared": false,
+  "isSharedPublicly": false,
+  "creationTime": "2026-02-15T16:52:41.000Z",
+  "modificationTime": "2026-02-15T16:52:41.000Z",
+  "folder": {
+   "isImported": false
+  },
+  "treeEventScopeId": "SCOPE2=="
+ },
+ {
+  "uid": "BASE64UID3==~BASE64NODEID3==",
+  "parentUid": "BASE64UID0==~BASE64PARENT==",
+  "name": {
+   "ok": true,
+   "value": "Photos from 2019"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "user@example.com"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "user@example.com"
+  },
+  "type": "folder",
+  "isShared": false,
+  "isSharedPublicly": false,
+  "creationTime": "2026-02-15T16:52:41.000Z",
+  "modificationTime": "2026-02-15T16:52:41.000Z",
+  "folder": {
+   "isImported": false
+  },
+  "treeEventScopeId": "SCOPE3=="
+ }
+]

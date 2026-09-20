@@ -30,6 +30,7 @@ Proton node id in SQLite.
 | Subcommand | What it does |
 |---|---|
 | `pull` | Walk the configured roots, record new/changed nodes. No transfers. |
+| `precheck` | Mark files Immich already holds, so they are never downloaded. |
 | `download` | Fetch `discovered` nodes into `staging/ready/<yyyy-mm>/`, sha1-checked. |
 | `push` | Upload to Immich, record asset ids, flag server-side duplicates. |
 | `verify` | Confirm each asset exists server-side and its checksum matches. |
@@ -333,7 +334,7 @@ makes them readable interactively; `-v` adds the executed commands.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-132 tests, no network and no Docker: the Proton backend and Immich server are
+165 tests, no network and no Docker: the Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap` runs end to end,
 including the failure paths (truncated transfers, checksum mismatches, expired
 sessions mid-run, killed runs resuming, quarantine after repeated failures).
@@ -373,6 +374,41 @@ several things the plan had to leave open:
 7. **Remote paths start at `/my-files`**, not `/Photos`, and `/` lists the
    top-level sections. On this account the photos live in `/my-files/Photos`,
    one folder per year plus an imported-albums folder.
+8. **`name` is a `{"ok": bool, "value": str}` envelope, not a string** —
+   Proton names are encrypted, and decryption can fail. A naive parser puts
+   `{'ok': True, ...}` on disk as the filename. Everything derived from
+   encrypted metadata arrives this way, so unwrapping is applied to every
+   field lookup. When `ok` is false the node falls back to its uid, which the
+   CLI accepts in paths; local filenames are sanitised because a uid is base64
+   and can contain `/`.
+9. **There is no `path` field**, and the node id is `uid`. Paths are built from
+   the parent path plus the name. Confirmed field set for a listing entry:
+   `uid`, `parentUid`, `name`, `type` (`folder`), `folder.isImported`,
+   `creationTime`, `modificationTime` (`2026-02-15T16:02:56.000Z`),
+   `isShared`, `isSharedPublicly`, `directRole`, `ownedBy`, `keyAuthor`,
+   `nameAuthor`, `treeEventScopeId`. A file entry adds `mediaType`,
+   `totalStorageSize` and `activeRevision`.
+10. **`totalStorageSize` is the encrypted size, not the file size.** The
+    content size is `activeRevision.value.claimedSize`, and the encrypted one
+    runs ~25% larger (604,740 vs 763,203 bytes on a sample photo). Taking the
+    wrong one fails the post-download size check on *every* file, and silently
+    inflates the `max_bytes` accounting by a fifth.
+11. **Proton already stores a sha1 per file** in
+    `activeRevision.value.claimedDigests.sha1` — the same algorithm Immich
+    dedupes with, though `sha1Verified` is false, so it is the uploader's claim
+    rather than a server guarantee. It is recorded as `claimed_sha1` and a
+    mismatch after download is logged, but the locally computed digest is
+    what Immich is given.
+12. **Timestamps describe the import, not the photo.** A bulk migration stamps
+    `creationTime`, `modificationTime` *and* `claimedModificationTime` with the
+    migration date; the real date is
+    `claimedAdditionalMetadata.Camera.CaptureTime`. Staging buckets therefore
+    use capture time — on one sample folder that is 13 directories instead of
+    one holding 2,109 files. `modificationTime` is still what change detection
+    compares, which is correct: it tracks the node, not the photo.
+13. **`mediaType` is reported** (`image/jpeg`, `video/mp4`), so filtering
+    prefers it over file extensions and falls back to extensions only when it
+    is absent.
 
 Two smaller departures from the plan's design:
 
@@ -385,10 +421,43 @@ Two smaller departures from the plan's design:
 - **`src/` has three modules the plan did not list** — `config.py`, `log.py` and
   `pipeline.py` — so that the orchestration can be tested against fakes.
 
-Still untested here, because it needs the real VM: the sign-in flow itself, the
-shape of `filesystem list --json` output from an authenticated session (the
-parser accepts every plausible field spelling, but only real output confirms
-it), and the immich-cli container invocation.
+`tests/fixtures/proton_list_real_folders.json` is captured from a real
+authenticated listing, with only uids and emails redacted, so the folder path
+through discovery is covered by a regression test rather than by guesswork.
+
+`proton_list_real_files.json` does the same for file entries. Replaying a real
+2,109-entry listing through `pull` discovers all of them, records content sizes
+(1.64 GB, where the encrypted sizes would have claimed 1.98 GB), captures a
+sha1 for every file, spreads them over 13 capture-date buckets, and reports
+zero new on a second pass — the Phase 1 acceptance test, against real data.
+
+Still untested here, because it needs the VM: the sign-in completing end to
+end, the download and upload paths against live services, and the immich-cli
+container invocation.
+
+### Skipping what Immich already has
+
+Proton reports a sha1 for every file at discovery, and Immich dedupes on sha1,
+so the two can be matched *before* anything is transferred:
+
+```bash
+python3 sync.py precheck          # mark them
+python3 sync.py run --precheck    # or fold it into a run
+```
+
+Rows that match are marked `uploaded` with the existing asset id and
+`is_duplicate`, and never downloaded. They still pass through `verify` against
+the server, and `reap` closes them out — there is simply no local file to
+delete. Replayed against a real 2,109-file listing with half the library
+already in Immich, that skips 1,055 downloads and 883 MB.
+
+Enable it with `immich.precheck_claimed_digests: true`, or per-run with
+`--precheck`. It is off by default because Proton reports the digest as
+`sha1Verified: false` — it is the uploader's claim. A wrong claim that matches
+nothing simply downloads as normal; the theoretical bad case is a wrong claim
+that happens to match a *different* asset already in Immich, which would skip a
+file that never actually arrived. Against an empty Immich it saves nothing, so
+there is no reason to turn it on for a first backfill.
 
 ---
 

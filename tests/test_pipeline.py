@@ -263,6 +263,125 @@ class TestPush(PipelineTest):
         self.assertEqual(state.get(self.conn, "node-1")["status"], state.UPLOADED)
 
 
+class TestPrecheck(PipelineTest):
+    """Skip downloading what Immich already holds, using Proton's claimed sha1."""
+
+    def seed_with_digests(self, count=3):
+        contents = []
+        for i in range(count):
+            body = f"content-{i}".encode() * 10
+            path = f"/Photos/IMG_{i}.jpg"
+            self.backend.add(path, body)
+            contents.append(body)
+        return contents
+
+    def pull_with_claimed(self, contents):
+        """Discovery records the digest Proton reports."""
+        pipeline = self.pipe(run_id="r1")
+        pipeline.pull()
+        for i, body in enumerate(contents):
+            self.conn.execute(
+                "UPDATE assets SET claimed_sha1=? WHERE node_id=?",
+                (sha1_bytes(body), f"node-{i + 1}"))
+        self.conn.commit()
+        return pipeline
+
+    def test_files_already_in_immich_are_never_downloaded(self):
+        contents = self.seed_with_digests(3)
+        self.server.add(sha1_bytes(contents[0]), "existing-1")
+        pipeline = self.pull_with_claimed(contents)
+
+        pipeline.precheck()
+        self.assertEqual(pipeline.stats.skipped_present, 1)
+        row = state.get(self.conn, "node-1")
+        self.assertEqual(row["status"], state.UPLOADED)
+        self.assertEqual(row["immich_asset_id"], "existing-1")
+        self.assertEqual(row["is_duplicate"], 1)
+        self.assertIsNone(row["local_path"], "it was never fetched")
+
+        pipeline.download()
+        self.assertNotIn("/Photos/IMG_0.jpg", self.backend.downloads)
+        self.assertEqual(len(self.backend.downloads), 2)
+
+    def test_unknown_digests_are_left_for_download(self):
+        contents = self.seed_with_digests(2)
+        pipeline = self.pull_with_claimed(contents)
+        pipeline.precheck()
+        self.assertEqual(pipeline.stats.skipped_present, 0)
+        self.assertEqual(state.counts(self.conn)[state.DISCOVERED], 2)
+
+    def test_rows_without_a_claimed_digest_are_ignored(self):
+        self.seed(2)
+        pipeline = self.pipe(run_id="r1")
+        pipeline.pull()
+        pipeline.precheck()
+        self.assertEqual(pipeline.stats.skipped_present, 0)
+
+    def test_skipped_rows_still_verify_against_the_server(self):
+        contents = self.seed_with_digests(1)
+        self.server.add(sha1_bytes(contents[0]), "existing-1")
+        pipeline = self.pull_with_claimed(contents)
+        pipeline.precheck()
+        pipeline.verify()
+        self.assertEqual(state.get(self.conn, "node-1")["status"], state.VERIFIED)
+
+    def test_skipped_rows_reach_a_terminal_state(self):
+        contents = self.seed_with_digests(1)
+        self.server.add(sha1_bytes(contents[0]), "existing-1")
+        pipeline = self.pull_with_claimed(contents)
+        pipeline.precheck()
+        pipeline.verify()
+        pipeline.reap()
+        self.assertEqual(state.get(self.conn, "node-1")["status"], state.PURGED)
+        self.assertEqual(state.backlog(self.conn), 0)
+
+    def test_precheck_outage_falls_back_to_downloading(self):
+        contents = self.seed_with_digests(2)
+        self.server.add(sha1_bytes(contents[0]), "existing-1")
+        pipeline = self.pull_with_claimed(contents)
+        pipeline._client = FakeImmichClient(self.server, fail_precheck=True)
+        pipeline.precheck()
+        self.assertEqual(pipeline.stats.skipped_present, 0)
+        pipeline.download()
+        self.assertEqual(pipeline.stats.downloaded, 2, "nothing is lost")
+
+    def test_dry_run_records_nothing(self):
+        contents = self.seed_with_digests(1)
+        self.server.add(sha1_bytes(contents[0]), "existing-1")
+        self.pull_with_claimed(contents)
+        dry = self.pipe(run_id="r2", dry_run=True)
+        dry.precheck()
+        self.assertEqual(dry.stats.skipped_present, 1)
+        self.assertEqual(state.get(self.conn, "node-1")["status"], state.DISCOVERED)
+
+    def test_batching_covers_every_row(self):
+        contents = self.seed_with_digests(5)
+        for body in contents:
+            self.server.add(sha1_bytes(body))
+        pipeline = self.pull_with_claimed(contents)
+        pipeline.precheck(chunk=2)
+        self.assertEqual(pipeline.stats.skipped_present, 5)
+
+    def test_run_skips_precheck_unless_enabled(self):
+        contents = self.seed_with_digests(1)
+        self.server.add(sha1_bytes(contents[0]), "existing-1")
+        self.pull_with_claimed(contents)
+        pipeline = self.pipe(run_id="r2")
+        pipeline.run()
+        self.assertEqual(pipeline.stats.skipped_present, 0)
+        self.assertIn("/Photos/IMG_0.jpg", self.backend.downloads)
+
+    def test_run_uses_precheck_when_enabled(self):
+        contents = self.seed_with_digests(1)
+        self.server.add(sha1_bytes(contents[0]), "existing-1")
+        self.pull_with_claimed(contents)
+        self.cfg.set("immich.precheck_claimed_digests", True)
+        pipeline = self.pipe(run_id="r2")
+        pipeline.run()
+        self.assertEqual(pipeline.stats.skipped_present, 1)
+        self.assertEqual(self.backend.downloads, [])
+
+
 class TestVerifyAndReap(PipelineTest):
     def uploaded(self, count=2):
         self.seed(count)

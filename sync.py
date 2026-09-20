@@ -108,9 +108,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.add_argument("--max-bytes", type=int, help="max bytes this pass")
     p_dl.add_argument("--backfill", action="store_true",
                       help="use the backfill limits instead of the nightly ones")
+    p_dl.add_argument("--precheck", action="store_true",
+                      help="skip files Immich already holds, using Proton's sha1")
 
     p_push = sub.add_parser("push", parents=[common], help="upload staged files to Immich")
     p_push.add_argument("--limit", type=int)
+
+    p_pre = sub.add_parser("precheck", parents=[common],
+                           help="mark discovered files Immich already holds")
+    p_pre.add_argument("--limit", type=int)
 
     p_verify = sub.add_parser("verify", parents=[common], help="confirm uploads server-side")
     p_verify.add_argument("--limit", type=int)
@@ -123,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--backfill", action="store_true")
     p_run.add_argument("--now", action="store_true",
                        help="retry failed assets immediately, ignoring backoff")
+    p_run.add_argument("--precheck", action="store_true",
+                       help="skip files Immich already holds, using Proton's sha1")
 
     p_status = sub.add_parser("status", parents=[common], help="print pipeline health")
     p_status.add_argument("--json", action="store_true", help="raw status.json")
@@ -268,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if getattr(args, "now", False):
         cfg.set("limits.backoff_base_sec", 0)
+    if getattr(args, "precheck", False):
+        cfg.set("immich.precheck_claimed_digests", True)
 
     try:
         with SingleInstance(cfg.lock_path):
@@ -282,7 +292,11 @@ def main(argv: list[str] | None = None) -> int:
                         log.info("resumed", **{k: v for k, v in reset.items()})
                     if args.command == "pull":
                         pipeline.pull()
+                    elif args.command == "precheck":
+                        pipeline.precheck(limit=args.limit)
                     elif args.command == "download":
+                        if cfg.get("immich.precheck_claimed_digests"):
+                            pipeline.precheck()
                         pipeline.download(limit=args.limit, max_bytes=args.max_bytes,
                                           backfill=args.backfill)
                     elif args.command == "push":

@@ -145,6 +145,34 @@ class TestSelection(StateTest):
         self.assertEqual(len(state.select_for_reap(self.conn, keep_days=7, now=future)), 1)
 
 
+class TestMigration(StateTest):
+    def test_v1_database_gains_the_new_columns(self):
+        self.conn.execute("DROP TABLE assets")
+        self.conn.execute(
+            "CREATE TABLE assets (node_id TEXT PRIMARY KEY, remote_path TEXT NOT NULL,"
+            " remote_name TEXT NOT NULL, remote_size INTEGER, remote_modified TEXT,"
+            " local_path TEXT, sha1 TEXT, status TEXT NOT NULL, immich_asset_id TEXT,"
+            " is_duplicate INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0,"
+            " first_seen TEXT NOT NULL, last_attempt TEXT, last_error TEXT)")
+        self.conn.commit()
+        self.assertEqual(sorted(state.migrate(self.conn)),
+                         ["capture_time", "claimed_sha1"])
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(assets)")}
+        self.assertIn("claimed_sha1", cols)
+        self.assertIn("capture_time", cols)
+
+    def test_migration_is_idempotent(self):
+        self.assertEqual(state.migrate(self.conn), [])
+
+    def test_revision_fields_round_trip(self):
+        state.upsert_discovered(
+            self.conn, "n1", "/p/a.jpg", "a.jpg", 100, "2026-02-15T16:00:00Z",
+            claimed_sha1="a" * 40, capture_time="2017-12-27T18:55:15.000Z")
+        row = state.get(self.conn, "n1")
+        self.assertEqual(row["claimed_sha1"], "a" * 40)
+        self.assertEqual(row["capture_time"], "2017-12-27T18:55:15.000Z")
+
+
 class TestCounts(StateTest):
     def test_backlog_excludes_finished_states(self):
         self.add("a")

@@ -38,6 +38,9 @@ DEFAULTS: dict[str, Any] = {
         "roots": ["/my-files/Photos"],
         "timeout_sec": 900,
         "max_depth": 25,
+        # Preferred filter: the CLI reports mediaType (image/jpeg, video/mp4).
+        # Extensions below are the fallback when no mediaType is present.
+        "media_type_prefixes": ["image/", "video/"],
         # Skip anything not in this list. Empty list = accept everything.
         "extensions": [
             ".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".avif",
@@ -86,6 +89,11 @@ DEFAULTS: dict[str, Any] = {
         # Hardlink each batch into its own dir so a push only touches the rows
         # it selected. "ready" mounts staging/ready wholesale instead.
         "batch_mode": "hardlink",
+        # Ask Immich whether it already holds a file, using the sha1 Proton
+        # reports at discovery, and skip downloading it if so. Saves an entire
+        # transfer per already-imported file; off by default because Proton
+        # reports the digest as unverified (sha1Verified: false).
+        "precheck_claimed_digests": False,
     },
     "limits": {
         "max_files": 500,

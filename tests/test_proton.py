@@ -51,6 +51,121 @@ class TestNormalisation(unittest.TestCase):
             proton.parse_json_output("totally not json")
 
 
+class TestRealCliOutput(unittest.TestCase):
+    """Captured from cli-drive@0.6.0: `filesystem list /my-files/Photos --json`.
+
+    Only the uids and emails are redacted; the structure is verbatim.
+    """
+
+    def setUp(self):
+        self.nodes = nodes_from("proton_list_real_folders.json", "/my-files/Photos")
+
+    def test_all_entries_parse(self):
+        self.assertEqual(len(self.nodes), 3)
+        self.assertTrue(all(n is not None for n in self.nodes))
+
+    def test_name_is_unwrapped_from_the_ok_value_envelope(self):
+        # The regression that matters: name is {"ok": true, "value": "..."},
+        # so a naive parser yields "{'ok': True, ...}" as the filename.
+        self.assertEqual(self.nodes[0].name, "Photos from 2017")
+        self.assertFalse(self.nodes[0].name.startswith("{"))
+
+    def test_uid_becomes_the_node_id(self):
+        self.assertEqual(self.nodes[0].node_id, "BASE64UID1==~BASE64NODEID1==")
+
+    def test_paths_are_built_from_parent_and_name(self):
+        # There is no path field in the output at all.
+        self.assertEqual(self.nodes[0].path, "/my-files/Photos/Photos from 2017")
+
+    def test_type_folder_is_recognised(self):
+        self.assertTrue(all(n.is_folder for n in self.nodes),
+                        "folders must be walked, not uploaded")
+
+    def test_folders_are_never_uploaded(self):
+        self.assertFalse(any(proton.should_include(n, [".jpg"], []) for n in self.nodes))
+
+    def test_modification_time_round_trips(self):
+        from src import state
+        self.assertEqual(self.nodes[0].modified, "2026-02-15T16:02:56.000Z")
+        parsed = state.parse_ts(self.nodes[0].modified)
+        self.assertIsNotNone(parsed, "the reaper and yyyy-mm buckets depend on this")
+        self.assertEqual(parsed.year, 2026)
+
+
+class TestRealFileEntries(unittest.TestCase):
+    """Captured from a real listing of a folder containing photos."""
+
+    def setUp(self):
+        self.nodes = nodes_from("proton_list_real_files.json",
+                                "/my-files/Photos/Photos from 2017")
+        self.image = self.nodes[0]
+
+    def test_files_are_not_mistaken_for_folders(self):
+        self.assertTrue(all(not n.is_folder for n in self.nodes))
+
+    def test_size_is_the_content_size_not_the_encrypted_size(self):
+        # The trap: totalStorageSize/storageSize (763203) are the ENCRYPTED
+        # size, ~26% larger than the real content. Using one of those would
+        # fail the post-download size check on every single file.
+        self.assertEqual(self.image.size, 604740)
+        self.assertNotEqual(self.image.size, 763203)
+
+    def test_claimed_sha1_is_captured(self):
+        self.assertIsNotNone(self.image.sha1)
+        self.assertEqual(len(self.image.sha1), 40)
+        self.assertEqual(self.image.sha1, self.image.sha1.lower())
+
+    def test_capture_time_differs_from_proton_modification_time(self):
+        # A bulk import stamps every node with the migration date; bucketing by
+        # it would put the whole library in one directory.
+        self.assertTrue(self.image.capture_time.startswith("2017-12-27"))
+        self.assertTrue(self.image.modified.startswith("2026-02-15"))
+
+    def test_media_type_is_read(self):
+        self.assertEqual(self.image.media_type, "image/jpeg")
+        self.assertTrue(self.nodes[1].media_type.startswith("video/"))
+
+    def test_media_type_prefixes_accept_photos_and_videos(self):
+        for node in self.nodes:
+            self.assertTrue(
+                proton.should_include(node, [], [], ["image/", "video/"]))
+
+    def test_media_type_prefixes_reject_documents(self):
+        doc = proton.RemoteNode("id", "/x/a.pdf", "a.pdf", 1, None, False,
+                                media_type="application/pdf")
+        self.assertFalse(proton.should_include(doc, [], [], ["image/", "video/"]))
+
+    def test_extension_fallback_when_no_media_type(self):
+        node = proton.RemoteNode("id", "/x/a.jpg", "a.jpg", 1, None, False)
+        self.assertTrue(proton.should_include(node, [".jpg"], [], ["image/"]))
+
+    def test_storage_size_used_only_as_a_last_resort(self):
+        stripped = {"uid": "u1", "type": "file", "name": {"ok": True, "value": "a.jpg"},
+                    "totalStorageSize": 999}
+        self.assertEqual(proton.normalize_entry(stripped, "/x").size, 999)
+
+
+class TestUnwrap(unittest.TestCase):
+    def test_ok_true_yields_the_value(self):
+        self.assertEqual(proton.unwrap({"ok": True, "value": "x"}), "x")
+
+    def test_ok_false_yields_nothing(self):
+        # Undecryptable metadata is absent, not empty.
+        self.assertIsNone(proton.unwrap({"ok": False, "error": "cannot decrypt"}))
+
+    def test_plain_values_pass_through(self):
+        self.assertEqual(proton.unwrap("plain"), "plain")
+        self.assertEqual(proton.unwrap(42), 42)
+        self.assertEqual(proton.unwrap({"isImported": False}), {"isImported": False})
+
+    def test_undecryptable_name_falls_back_to_the_uid(self):
+        node = proton.normalize_entry(
+            {"uid": "UID123==", "type": "file",
+             "name": {"ok": False, "error": "cannot decrypt"}}, "/my-files")
+        self.assertEqual(node.name, "UID123==")
+        self.assertEqual(node.node_id, "UID123==")
+
+
 class TestFiltering(unittest.TestCase):
     def node(self, name, folder=False):
         return proton.RemoteNode("id", f"/Photos/{name}", name, 1, None, folder)
