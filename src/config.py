@@ -51,6 +51,10 @@ DEFAULTS: dict[str, Any] = {
         # Session probe: cli-drive has no `auth status`, so listing the
         # top-level sections stands in for one.
         "auth_probe_path": "/",
+        # PROTON_DRIVE_LOG_LEVEL: DEBUG | INFO | WARNING | ERROR. The CLI
+        # defaults to DEBUG and writes proton-drive.log into cache_dir with no
+        # rotation, which is not what you want on a nightly unattended run.
+        "cli_log_level": "WARNING",
         # `sync.py login` serves the sign-in URL as a redirect on this port so
         # a phone can reach it. Deliberately not Immich's 2283.
         "login_redirect_port": 8399,

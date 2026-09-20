@@ -357,6 +357,15 @@ class TestEnvironment(unittest.TestCase):
             proton.ProtonCliBackend(self.cfg)._env()
         self.assertIn("PROTON_DRIVE_CACHE_DIR", str(ctx.exception))
 
+    def test_cli_log_level_is_pinned_down_from_debug(self):
+        env = proton.ProtonCliBackend(self.cfg)._env()
+        self.assertEqual(env["PROTON_DRIVE_LOG_LEVEL"], "WARNING")
+
+    def test_log_level_is_uppercased(self):
+        self.cfg.set("proton.cli_log_level", "info")
+        self.assertEqual(
+            proton.ProtonCliBackend(self.cfg)._env()["PROTON_DRIVE_LOG_LEVEL"], "INFO")
+
     def test_default_store_is_not_forced(self):
         self.cfg.set("proton.credentials_store", None)
         self.assertNotIn("PROTON_DRIVE_CREDENTIALS_STORE",

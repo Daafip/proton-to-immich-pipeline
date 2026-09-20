@@ -55,6 +55,9 @@ proton:
     - "*/.trash/*"
   # There is no `auth status` subcommand; listing this path is the session probe.
   auth_probe_path: "/"
+  # The CLI defaults to DEBUG and writes proton-drive.log into cache_dir with
+  # no rotation. DEBUG | INFO | WARNING | ERROR.
+  cli_log_level: WARNING
   # Argument templates, verified against cli-drive@0.6.0.
   # {path} = remote path, {dest_dir} = local destination FOLDER (the CLI takes
   # a folder and picks the filename itself). "-c skip" is required: without a

@@ -322,6 +322,7 @@ class ProtonCliBackend(Backend):
         self.max_depth = int(cfg.get("proton.max_depth", 25))
         self.cmd = cfg.get("proton.cmd", {})
         self.credentials_store = cfg.get("proton.credentials_store")
+        self.log_level = cfg.get("proton.cli_log_level")
         self.auth_probe_path = cfg.get("proton.auth_probe_path", "/")
 
     def _env(self) -> dict[str, str]:
@@ -340,6 +341,10 @@ class ProtonCliBackend(Backend):
             env["PROTON_DRIVE_CACHE_DIR"] = str(self.cache_dir)
         if self.credentials_store:
             env["PROTON_DRIVE_CREDENTIALS_STORE"] = str(self.credentials_store)
+        if self.log_level:
+            # The CLI defaults to DEBUG and writes into the cache dir, which is
+            # on the same SSD as Immich, with no rotation of its own.
+            env["PROTON_DRIVE_LOG_LEVEL"] = str(self.log_level).upper()
         return env
 
     def _template(self, key: str, default: list[str], **subs: str) -> list[str]:
