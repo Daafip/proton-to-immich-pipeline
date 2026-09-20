@@ -37,6 +37,30 @@ class TestMiniYaml(unittest.TestCase):
         self.assertEqual(parsed["key"], "value")
         self.assertEqual(parsed["url"], "http://h/#frag")
 
+    def test_roots_with_spaces_and_hyphens(self):
+        """Real Proton folder names: "Photos from 2024", "Albums 2019 - 2026 google"."""
+        parsed = _mini_yaml(
+            "proton:\n"
+            "  roots:\n"
+            "    - /my-files/Photos/Photos from 2024\n"
+            '    - "/my-files/Photos/Albums 2019 - 2026 google"\n'
+            "  max_depth: 25\n"
+        )
+        self.assertEqual(parsed["proton"]["roots"], [
+            "/my-files/Photos/Photos from 2024",
+            "/my-files/Photos/Albums 2019 - 2026 google",
+        ])
+        self.assertEqual(parsed["proton"]["max_depth"], 25)
+
+    def test_a_year_folder_name_stays_a_string(self):
+        # "Photos from 2024" must not be coerced by the number sniffing.
+        self.assertEqual(_mini_yaml("roots:\n  - Photos from 2024\n")["roots"],
+                         ["Photos from 2024"])
+
+    def test_multiple_roots_override_the_default(self):
+        cfg = Config({"proton": {"roots": ["/a", "/b"]}})
+        self.assertEqual(cfg.get("proton.roots"), ["/a", "/b"])
+
     def test_maps_in_lists_rejected_clearly(self):
         with self.assertRaises(ConfigError):
             _mini_yaml("items:\n  - name: a\n")

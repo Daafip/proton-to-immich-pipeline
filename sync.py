@@ -129,6 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--probe", action="store_true",
                           help="actively check Proton and Immich reachability")
 
+    p_login = sub.add_parser("login", parents=[common],
+                             help="sign in to Proton (serves a phone-friendly link)")
+    p_login.add_argument("--port", type=int,
+                         help="port for the redirect page (default 8399)")
+    p_login.add_argument("--bind", default="0.0.0.0",
+                         help="address to bind the redirect page to")
+    p_login.add_argument("--no-serve", action="store_true",
+                         help="just print the URL, start no server")
+    p_login.add_argument("--timeout", type=int,
+                         help="seconds to wait for the sign-in (default 300)")
+
     p_requeue = sub.add_parser("requeue", parents=[common], help="put failed/quarantined rows back in play")
     p_requeue.add_argument("node_ids", nargs="*")
 
@@ -212,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     problems = cfg.validate()
-    if problems and args.command != "status":
+    if problems and args.command not in ("status", "login"):
         for problem in problems:
             log.error("config.invalid", problem=problem)
         return EXIT_PARTIAL
@@ -235,6 +246,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "status":
         try:
             return cmd_status(cfg, conn, args)
+        finally:
+            conn.close()
+
+    if args.command == "login":
+        from src.login import run_login
+        try:
+            return run_login(cfg, port=args.port, bind=args.bind,
+                             serve=not args.no_serve, timeout=args.timeout)
         finally:
             conn.close()
 

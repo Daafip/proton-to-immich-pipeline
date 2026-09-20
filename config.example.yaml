@@ -21,11 +21,24 @@ proton:
   #                  no keyring; cache_dir is chmod 700, keep it that way.
   #   pass        -- the Unix `pass` store, GPG-backed and headless-friendly.
   credentials_store: unsafe_file
-  # Proton's own root folder is /my-files. Run
-  #   proton-drive filesystem list /
-  # to see the top-level sections and find the phone's photo backup folder.
+  # Folders to sync. Every entry is walked recursively, so one parent folder
+  # covers everything beneath it. Discover what is there with:
+  #   proton-drive filesystem list /              # top-level sections
+  #   proton-drive filesystem list /my-files/Photos
+  #
+  # Quotes are only needed if a name contains a colon; spaces are fine either
+  # way. Paths are always posix, and a literal / inside a folder name is
+  # escaped with a backslash.
   roots:
-    - /my-files
+    - /my-files/Photos
+
+  # Or list folders individually to sync a subset -- one year per night keeps
+  # a backfill within the per-run caps and the staging free-space floor:
+  #
+  # roots:
+  #   - "/my-files/Photos/Photos from 2025"
+  #   - "/my-files/Photos/Photos from 2026"
+
   timeout_sec: 900
   max_depth: 25
   extensions:

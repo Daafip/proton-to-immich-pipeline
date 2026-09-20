@@ -35,6 +35,7 @@ Proton node id in SQLite.
 | `verify` | Confirm each asset exists server-side and its checksum matches. |
 | `reap` | Delete verified local files once past the retention grace period. |
 | `run` | All of the above, in order. This is what the timer runs. |
+| `login` | Sign in to Proton, serving a phone-friendly redirect link. |
 | `status` | Print pipeline health (`--json` for machine output). |
 | `requeue` | Put `failed` / `quarantined` rows back in play. |
 
@@ -83,17 +84,55 @@ need `gnome-keyring` on the VM. The session token is then a plaintext file in
 `staging/.proton`, which the tool creates `chmod 700` — leave it that way, and
 remember it is a live credential when you back that disk up.
 
-Sign in (the callback is a loopback listener, so forward the port):
+### Signing in, from a phone
+
+**There is no loopback callback.** `auth login --json` prints
+`{"signInUrl": "https://account.proton.me/desktop/login?...#payload=..."}` and
+then waits. The payload is in the URL *fragment*, which never leaves the
+browser — the account page hands the session to Proton's API and the CLI polls
+for it. So the browser never calls back to the VM, nothing listens on a local
+port, and **no `ssh -L` forwarding is needed**. The CLI's own help says it:
+*"you can use different device to sign in"*.
+
+That leaves one problem: getting a 200-character URL onto a phone. `sync.py
+login` solves it by serving that URL as a redirect on a LAN port:
 
 ```bash
-ssh -L 8080:localhost:8080 you@vm
-export PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton
-export PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file
-proton-drive auth login -v          # paste the printed URL into your browser
+python3 sync.py login              # default port 8399, binds 0.0.0.0
 ```
 
+```
+  Open this on the device you want to sign in with:
+
+      http://192.168.68.52:8399/          <-- phone-friendly
+      http://localhost:8399/
+
+  Or paste the full URL directly:
+
+      https://account.proton.me/desktop/login?app=drive&pv=3#payload=...
+```
+
+Open that on the phone and it redirects to Proton. If `qrencode` is installed
+it also prints a scannable QR. The command waits for the sign-in to finish and
+reports the result.
+
+```bash
+python3 sync.py login --port 9000    # any port you like, just not Immich's 2283
+python3 sync.py login --bind 127.0.0.1   # local only
+python3 sync.py login --no-serve         # just print the URL
+```
+
+Two things worth knowing: the redirect page has to be reachable from whatever
+VLAN the phone is on, and while it is up (5 minutes by default) anyone on that
+network who opens it gets a Proton sign-in page. It is a short window on a home
+LAN, but `--bind 127.0.0.1` is there if you would rather not.
+
 **Acceptance:** this must work from a *non-interactive* SSH command, and still
-work after `sudo reboot`:
+work after `sudo reboot`. This is the step that actually bites: on a desktop
+with D-Bus running and a session already signed in, a non-interactive shell can
+still get `You need to login first`, because the keyring collection is locked.
+That is the `keychain` store failing exactly where an unattended timer needs it
+to work — hence `unsafe_file` on the VM.
 
 ```bash
 ssh you@vm 'PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton \
@@ -101,17 +140,42 @@ ssh you@vm 'PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton \
   proton-drive filesystem list / --json'
 ```
 
-### Find the photo backup root
+### Choose what to sync
 
 Proton's own root is `/my-files`, and `/` lists the top-level sections:
 
 ```bash
-proton-drive filesystem list /            # sections
-proton-drive filesystem list /my-files    # then walk down to the phone's folder
+proton-drive filesystem list /                 # sections
+proton-drive filesystem list /my-files/Photos  # year folders live here
 ```
 
-Put the folder the phone backs up into in `proton.roots`. This is open
-decision 2 from the plan and the pipeline cannot guess it.
+`proton.roots` is a list, and **every entry is walked recursively**. So one
+parent folder takes everything beneath it:
+
+```yaml
+proton:
+  roots:
+    - /my-files/Photos
+```
+
+Or name folders individually to sync a subset — one year per night keeps a
+backfill inside the per-run caps and the free-space floor:
+
+```yaml
+proton:
+  roots:
+    - "/my-files/Photos/Photos from 2025"
+    - "/my-files/Photos/Photos from 2026"
+    - "/my-files/Photos/Albums 2019 - 2026 google"
+```
+
+Spaces and hyphens in folder names are fine and need no quoting (quote only if
+a name contains a colon). Nothing is ever passed through a shell, so a name
+like `Photos from 2024` stays a single argument.
+
+With `album_strategy: folder`, these folder names become the Immich album
+names — `Photos from 2024` and so on — which is worth knowing before you pick
+between that and one flat album (open decision 1).
 
 ### If Phase 0 fights back
 
@@ -128,7 +192,7 @@ defaults in `src/config.py`. The three you must set:
 
 ```yaml
 proton:
-  roots: [/my-files/...]     # the phone's backup folder
+  roots: ["/my-files/Photos"]   # a list; each entry is walked recursively
 immich:
   url: http://<vm-ip>:2283/api   # the /api suffix is mandatory
   api_key: ""                    # leave empty; use IMMICH_API_KEY instead
@@ -269,7 +333,7 @@ makes them readable interactively; `-v` adds the executed commands.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-106 tests, no network and no Docker: the Proton backend and Immich server are
+132 tests, no network and no Docker: the Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap` runs end to end,
 including the failure paths (truncated transfers, checksum mismatches, expired
 sessions mid-run, killed runs resuming, quarantine after repeated failures).
@@ -282,22 +346,33 @@ sessions mid-run, killed runs resuming, quarantine after repeated failures).
 Verified locally against `cli-drive@0.6.0` / SDK `js@0.19.2`, which settles
 several things the plan had to leave open:
 
-1. **`PROTON_DRIVE_UNSAFE_SECRETS` does not exist.** The real knob is
+1. **`PROTON_DRIVE_UNSAFE_SECRETS` does not exist in 0.6.0.** The real knob is
    `PROTON_DRIVE_CREDENTIALS_STORE=keychain|unsafe_file|pass`, so headless
    operation is supported outright and `gnome-keyring` should be unnecessary.
-2. **`filesystem download` takes a destination *folder*, not a file path**, and
+   The old name was real, though: `LouisBrunner/ha-proton-drive` sets
+   `PROTON_DRIVE_UNSAFE_SECRETS=true` and pins `CLI_VERSION = "0.5.0"`, so the
+   variable was renamed between 0.5 and 0.6. That integration is where the
+   build plan's claim came from.
+2. **The sign-in has no loopback callback**, so no port forwarding is needed —
+   see [Signing in, from a phone](#signing-in-from-a-phone). `auth login --json`
+   emits a single `signInUrl` line and waits while it polls. (ha-proton-drive
+   drives it the same way: read the first stdout line, take `signInUrl`, show
+   it to the user.)
+3. **`filesystem download` takes a destination *folder*, not a file path**, and
    prompts unless `-c skip` is given — a prompt would hang an unattended run
    forever. Each download gets its own scratch folder so a skipped conflict can
    never promote another node's leftover file.
-3. **There is no `auth status` subcommand.** The session probe is
+4. **There is no `auth status` subcommand.** The session probe is
    `filesystem list /`.
-4. **An expired session prints `You need to login first`** on stdout, exit 1,
+5. **An expired session prints `You need to login first`** on stdout, exit 1,
    not JSON even under `--json`. Detecting that string is what turns a dead
-   session into `auth_ok: false` instead of a generic error.
-5. **`filesystem list` has no recursive flag**, so discovery is a breadth-first
+   session into `auth_ok: false` instead of a generic error. ha-proton-drive
+   matches on the same string, which is reassuring.
+6. **`filesystem list` has no recursive flag**, so discovery is a breadth-first
    walk, depth-capped by `proton.max_depth`.
-6. **Remote paths start at `/my-files`**, not `/Photos`, and `/` lists the
-   top-level sections.
+7. **Remote paths start at `/my-files`**, not `/Photos`, and `/` lists the
+   top-level sections. On this account the photos live in `/my-files/Photos`,
+   one folder per year plus an imported-albums folder.
 
 Two smaller departures from the plan's design:
 

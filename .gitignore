@@ -1,0 +1,20 @@
+# Real config holds an Immich API key and the Proton paths.
+config.yaml
+*.local.yaml
+
+# CLI dumps: these carry node UIDs and the account email.
+*dump*.json
+hidden_dump.json
+
+# Runtime artefacts, if anyone ever runs the pipeline from the checkout.
+staging/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+status.json
+
+__pycache__/
+*.pyc
+.venv/
+
+hidden_*

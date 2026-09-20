@@ -17,7 +17,11 @@ import fnmatch
 import json
 import os
 import posixpath
+import queue
+import re
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -71,10 +75,27 @@ class RemoteNode:
         return posixpath.splitext(self.name)[1].lower()
 
 
+def unwrap(value: Any) -> Any:
+    """cli-drive wraps decryptable metadata as {"ok": bool, "value": ...}.
+
+    Names, and anything else derived from encrypted attributes, arrive this
+    way because decryption can fail. `ok: false` means "this field is not
+    available", which is different from "this field is empty".
+    """
+    if isinstance(value, dict) and ("ok" in value or "value" in value):
+        if value.get("ok") is False:
+            return None
+        if "value" in value:
+            return value["value"]
+    return value
+
+
 def _first(obj: dict[str, Any], keys: tuple[str, ...]) -> Any:
     for k in keys:
-        if k in obj and obj[k] not in (None, ""):
-            return obj[k]
+        if k in obj:
+            value = unwrap(obj[k])
+            if value not in (None, ""):
+                return value
     return None
 
 
@@ -100,6 +121,8 @@ def _coerce_ts(value: Any) -> str | None:
 
 def is_folder_entry(obj: dict[str, Any]) -> bool:
     flag = _first(obj, _FOLDER_KEYS)
+    if isinstance(flag, str):
+        flag = flag.lower() in ("true", "yes", "folder", "1")
     if isinstance(flag, bool):
         return flag
     type_value = _first(obj, _TYPE_KEYS)
@@ -118,16 +141,21 @@ def normalize_entry(obj: dict[str, Any], parent_path: str) -> RemoteNode | None:
         return None
     name = _first(obj, _NAME_KEYS)
     path = _first(obj, _PATH_KEYS)
-    if not name and not path:
+    node_id_raw = _first(obj, _ID_KEYS)
+    if not name and not path and not node_id_raw:
         return None
-    if not name:
+    if not name and path:
         name = posixpath.basename(str(path).rstrip("/"))
+    if not name:
+        # "When name cannot be decrypted or conflicts with other node(s),
+        # node UIDs can be used instead" -- proton-drive filesystem help.
+        name = str(node_id_raw)
     if not path:
         # The CLI requires / inside a node name to be backslash-escaped.
         path = posixpath.join(parent_path or "/", str(name).replace("/", "\\/"))
     path = "/" + str(path).lstrip("/")
 
-    node_id = _first(obj, _ID_KEYS)
+    node_id = node_id_raw
     if not node_id:
         # No stable id available: the path is the next best primary key.
         node_id = f"path:{path}"
@@ -198,6 +226,20 @@ def parse_json_output(text: str) -> Any:
 def looks_like_auth_failure(text: str) -> bool:
     low = (text or "").lower()
     return any(hint in low for hint in _AUTH_HINTS)
+
+
+_UNSAFE_FILENAME = re.compile(r"[/\\\x00]")
+
+
+def safe_filename(name: str, fallback: str = "asset") -> str:
+    """A remote name is untrusted input for the local filesystem.
+
+    Proton names may contain / (the CLI escapes it with a backslash), and an
+    undecryptable name falls back to a uid, which is base64 and can contain /.
+    """
+    cleaned = _UNSAFE_FILENAME.sub("_", str(name or "")).strip().strip(".")
+    cleaned = cleaned[:200]
+    return cleaned or fallback
 
 
 def should_include(node: RemoteNode, extensions: list[str], exclude_globs: list[str]) -> bool:
@@ -292,6 +334,71 @@ class ProtonCliBackend(Backend):
         except ProtonError as exc:
             log.warn("proton.auth_probe_failed", detail=str(exc)[:200])
             return False
+
+    def start_login(self, timeout: int = 30) -> tuple[str, subprocess.Popen]:
+        """Start `auth login --json` and return (signInUrl, live process).
+
+        cli-drive@0.6.0 prints exactly one JSON line, {"signInUrl": "..."},
+        then blocks until the sign-in completes. The URL carries its payload in
+        the fragment, so it is a desktop-pairing flow: the CLI polls Proton's
+        API and the browser never calls back to this machine. That means any
+        device can complete it -- there is no loopback port to forward.
+        """
+        argv = [self.binary, "auth", "login", "--json"]
+        log.debug("proton.login_exec", argv=" ".join(argv))
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=self._env(), bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise ProtonError(f"{self.binary} not found on PATH") from exc
+
+        # A reader thread rather than select(): select watches the OS pipe,
+        # but readline() fills a Python-level buffer, so a noise line arriving
+        # in the same chunk as the JSON would leave the URL sitting in that
+        # buffer with select reporting nothing more to read.
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def reader() -> None:
+            try:
+                for line in proc.stdout:  # type: ignore[union-attr]
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        threading.Thread(target=reader, daemon=True).start()
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                line = lines.get(timeout=min(remaining, 0.5))
+            except queue.Empty:
+                if proc.poll() is not None:
+                    break
+                continue
+            if line is None:
+                break
+            line = line.strip()
+            if not line.startswith("{"):
+                log.debug("proton.login_noise", line=line[:200])
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            url = payload.get("signInUrl") or payload.get("url")
+            if url:
+                return str(url), proc
+
+        proc.kill()
+        stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        raise ProtonError(
+            f"no sign-in URL from `{self.binary} auth login --json` "
+            f"within {timeout}s: {stderr[:300]}")
 
     def list_dir(self, path: str) -> list[RemoteNode]:
         args = self._template("list", ["filesystem", "list", "{path}", "--json"], path=path)

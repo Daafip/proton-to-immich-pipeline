@@ -248,6 +248,66 @@ class TestEnvironment(unittest.TestCase):
                          proton.ProtonCliBackend(self.cfg)._env())
 
 
+class TestPathsWithSpaces(unittest.TestCase):
+    """Folder names like "Photos from 2024" must survive as ONE argument.
+
+    Nothing goes through a shell -- subprocess is always given an argv list --
+    so a space in a folder name must never split into two arguments.
+    """
+
+    def setUp(self):
+        self.cfg = load(None)
+        self.backend = proton.ProtonCliBackend(self.cfg)
+        self.calls = []
+
+        class Result:
+            stdout, stderr, returncode = "[]", "", 0
+
+        def fake_run(args, timeout=None):
+            self.calls.append(args)
+            return Result()
+
+        self.backend._run = fake_run
+
+    def test_root_with_spaces_is_a_single_argument(self):
+        root = "/my-files/Photos/Photos from 2024"
+        self.backend.list_dir(root)
+        self.assertIn(root, self.calls[0])
+        self.assertEqual(self.calls[0], ["filesystem", "list", root, "--json"])
+
+    def test_root_with_hyphens_is_a_single_argument(self):
+        root = "/my-files/Photos/Albums 2019 - 2026 google"
+        self.backend.list_dir(root)
+        self.assertEqual(self.calls[0][2], root)
+
+    def test_child_paths_keep_the_parent_spaces(self):
+        node = proton.normalize_entry(
+            {"nodeId": "n1", "name": "IMG_0001.jpg", "size": 1, "type": "file"},
+            "/my-files/Photos/Photos from 2024")
+        self.assertEqual(node.path,
+                         "/my-files/Photos/Photos from 2024/IMG_0001.jpg")
+
+    def test_download_passes_a_spaced_path_intact(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        node = proton.RemoteNode(
+            "n1", "/my-files/Photos/Photos from 2024/IMG_1.jpg", "IMG_1.jpg",
+            4, None, False)
+
+        class Result:
+            stdout, stderr, returncode = "", "", 0
+
+        def fake_run(args, timeout=None):
+            self.calls.append(args)
+            (Path(args[-1]) / "IMG_1.jpg").write_bytes(b"data")
+            return Result()
+
+        self.backend._run = fake_run
+        self.backend.download(node, Path(tmp.name) / "scratch" / "IMG_1.jpg")
+        self.assertIn(node.path, self.calls[0])
+
+
 class TestPathEscaping(unittest.TestCase):
     def test_slash_in_node_name_is_escaped(self):
         node = proton.normalize_entry({"name": "foo/bar.jpg", "size": 1}, "/my-files")

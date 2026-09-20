@@ -31,9 +31,11 @@ DEFAULTS: dict[str, Any] = {
         #   unsafe_file -- plaintext session file in the cache dir (headless)
         #   pass        -- the Unix `pass` store (GPG-backed, headless)
         "credentials_store": "keychain",
-        # Proton's own root is /my-files; `proton-drive filesystem list /`
-        # prints the top-level sections. Set this to the phone's backup folder.
-        "roots": ["/my-files"],
+        # Each entry is walked recursively. Name one parent folder to take
+        # everything under it, or list individual folders to sync a subset
+        # (handy for spreading a backfill over several nights).
+        # `proton-drive filesystem list /` prints the top-level sections.
+        "roots": ["/my-files/Photos"],
         "timeout_sec": 900,
         "max_depth": 25,
         # Skip anything not in this list. Empty list = accept everything.
@@ -46,6 +48,10 @@ DEFAULTS: dict[str, Any] = {
         # Session probe: cli-drive has no `auth status`, so listing the
         # top-level sections stands in for one.
         "auth_probe_path": "/",
+        # `sync.py login` serves the sign-in URL as a redirect on this port so
+        # a phone can reach it. Deliberately not Immich's 2283.
+        "login_redirect_port": 8399,
+        "login_timeout_sec": 300,
         # Argument templates, verified against cli-drive@0.6.0. Overridable so
         # a future flag change needs a config edit, not a code change.
         # {path} = remote path, {dest_dir} = local destination FOLDER.
