@@ -1,0 +1,11 @@
+{
+  "items": [
+    {"nodeId": "n-001", "name": "IMG_0001.jpg", "size": 2048576,
+     "modifiedAt": "2026-08-01T10:00:00Z", "type": "file"},
+    {"nodeId": "n-002", "name": "IMG_0002.heic", "size": 3145728,
+     "modifiedAt": "2026-08-02T11:30:00Z", "type": "file"},
+    {"nodeId": "n-dir", "name": "2026-07", "type": "folder"},
+    {"nodeId": "n-003", "name": "notes.txt", "size": 12,
+     "modifiedAt": "2026-08-03T09:00:00Z", "type": "file"}
+  ]
+}

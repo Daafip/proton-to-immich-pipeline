@@ -1,0 +1,114 @@
+# proton-immich-sync -- copy to config.yaml and edit.
+# Every key here is optional; anything omitted falls back to src/config.py DEFAULTS.
+
+staging:
+  root: /mnt/immich/staging
+  # Abort a download pass if free space would drop below this (GB).
+  # Staging shares the SSD with Immich's own data.
+  min_free_gb: 20
+
+proton:
+  # "proton-cli" = the official Bun binary. "rclone" = the Phase 0 fallback
+  # (rclone's protondrive backend; credentials in rclone.conf, no keyring).
+  backend: proton-cli
+  binary: proton-drive
+  # PROTON_DRIVE_CACHE_DIR. Defaults to <staging.root>/.proton.
+  cache_dir: /mnt/immich/staging/.proton
+  # Where the CLI keeps its session (PROTON_DRIVE_CREDENTIALS_STORE):
+  #   keychain    -- libsecret / Secret Service. The default, but it needs an
+  #                  unlocked keyring, which is painful on a headless VM.
+  #   unsafe_file -- plaintext session file in cache_dir. Works headless with
+  #                  no keyring; cache_dir is chmod 700, keep it that way.
+  #   pass        -- the Unix `pass` store, GPG-backed and headless-friendly.
+  credentials_store: unsafe_file
+  # Proton's own root folder is /my-files. Run
+  #   proton-drive filesystem list /
+  # to see the top-level sections and find the phone's photo backup folder.
+  roots:
+    - /my-files
+  timeout_sec: 900
+  max_depth: 25
+  extensions:
+    - .jpg
+    - .jpeg
+    - .png
+    - .heic
+    - .heif
+    - .dng
+    - .mp4
+    - .mov
+  exclude_globs:
+    - .*
+    - "*/.trash/*"
+  # There is no `auth status` subcommand; listing this path is the session probe.
+  auth_probe_path: "/"
+  # Argument templates, verified against cli-drive@0.6.0.
+  # {path} = remote path, {dest_dir} = local destination FOLDER (the CLI takes
+  # a folder and picks the filename itself). "-c skip" is required: without a
+  # conflict strategy the CLI prompts, which would hang an unattended run.
+  cmd:
+    list:
+      - filesystem
+      - list
+      - "{path}"
+      - --json
+    download:
+      - filesystem
+      - download
+      - -c
+      - skip
+      - "{path}"
+      - "{dest_dir}"
+  rclone:
+    binary: rclone
+    remote: "protondrive:"
+
+immich:
+  # MUST include the /api suffix.
+  url: http://127.0.0.1:2283/api
+  # Leave empty and set IMMICH_API_KEY in the environment instead.
+  api_key: ""
+  # "cli" = docker run immich-cli (the build plan's route).
+  # "api" = direct REST multipart upload, no docker needed.
+  upload_mode: cli
+  image: ghcr.io/immich-app/immich-cli:latest
+  concurrency: 4
+  # "flat" -> one album_name for everything. "folder" -> album per source
+  # folder. "none" -> no album. Decide before the first real push.
+  album_strategy: flat
+  album_name: Proton Import
+  batch_mode: hardlink
+
+limits:
+  max_files: 500
+  max_bytes: 20000000000
+  max_attempts: 5
+  backoff_base_sec: 300
+
+backfill:
+  max_files: 5000
+  max_bytes: 60000000000
+
+reap:
+  # Keep verified originals in staging this long. 0 = purge right after verify.
+  keep_days: 7
+  scratch_max_age_hours: 48
+
+report:
+  # Defaults to <staging.root>/.state/status.json.
+  status_path: /mnt/immich/staging/.state/status.json
+  stale_success_hours: 48
+
+mqtt:
+  enabled: false
+  host: 127.0.0.1
+  port: 1883
+  username: ""
+  password: ""
+  discovery_prefix: homeassistant
+  node_id: proton_immich_sync
+  state_topic: proton_immich_sync/state
+
+logging:
+  json: true
+  verbose: false

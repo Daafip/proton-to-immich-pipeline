@@ -1,0 +1,4 @@
+{"ok": true, "data": {"nodes": [
+  {"uid": "u-1", "filename": "IMG_0004.png", "fileSize": 4096, "mtime": "2026-08-05T00:00:00Z", "kind": "file"},
+  {"uid": "u-2", "filename": "Trip", "kind": "folder"}
+]}}

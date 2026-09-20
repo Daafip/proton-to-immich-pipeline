@@ -1,0 +1,325 @@
+# proton-immich-sync
+
+One-way, incremental, resumable sync: **Proton Drive → staging → Immich**.
+Python 3.11+, standard library only. Runs unattended under systemd and reports
+its health to Home Assistant.
+
+Built from `proton-immich-sync-build-plan.md`. Phases 1–6 are implemented;
+**Phase 0 (Proton sign-in on the headless VM) is the part you still have to do
+by hand**, and section [Phase 0](#phase-0-proton-sign-in) below is now a lot
+shorter than the plan assumed — see [What changed](#what-changed-against-the-plan).
+
+---
+
+## How it works
+
+```
+ phone ─► Proton Drive ─► [pull] ─► [download] ─► staging/ready ─► [push] ─► Immich
+                             │           │                          │
+                             └────► state.sqlite ◄──────────────────┘
+                                         │
+                                   [verify] → [reap] purges staged files
+                                         │
+                                   status.json ─► Home Assistant
+```
+
+Nothing is deleted locally until the asset is confirmed **server-side by
+checksum**, and nothing is transferred twice: every node is tracked by its
+Proton node id in SQLite.
+
+| Subcommand | What it does |
+|---|---|
+| `pull` | Walk the configured roots, record new/changed nodes. No transfers. |
+| `download` | Fetch `discovered` nodes into `staging/ready/<yyyy-mm>/`, sha1-checked. |
+| `push` | Upload to Immich, record asset ids, flag server-side duplicates. |
+| `verify` | Confirm each asset exists server-side and its checksum matches. |
+| `reap` | Delete verified local files once past the retention grace period. |
+| `run` | All of the above, in order. This is what the timer runs. |
+| `status` | Print pipeline health (`--json` for machine output). |
+| `requeue` | Put `failed` / `quarantined` rows back in play. |
+
+Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** lock held.
+
+---
+
+## Install on the VM
+
+```bash
+sudo install -d -o immich -g immich /opt/proton-immich-sync
+sudo cp -r sync.py src systemd config.example.yaml /opt/proton-immich-sync/
+
+sudo install -d /etc/proton-immich-sync
+sudo cp config.example.yaml /etc/proton-immich-sync/config.yaml
+sudo cp systemd/proton-immich-sync-env.example /etc/proton-immich-sync/env
+sudo chown root:immich /etc/proton-immich-sync/env
+sudo chmod 640 /etc/proton-immich-sync/env      # holds IMMICH_API_KEY
+```
+
+PyYAML is used if present but is **not required** — a built-in parser handles
+the config format. No other dependencies.
+
+Get the Immich API key from **Account Settings → API Keys** and put it in
+`/etc/proton-immich-sync/env`. Keep it out of `config.yaml`.
+
+---
+
+## Phase 0: Proton sign-in
+
+The one genuinely uncertain step, and the likeliest thing to stall the pipeline
+later. Install the CLI from proton.me/download/drive/cli (check `grep avx2
+/proc/cpuinfo`; use the `linux/x64-baseline` build if absent).
+
+**Credentials do not have to go through a keyring.** `cli-drive@0.6.0` reads
+`PROTON_DRIVE_CREDENTIALS_STORE`, which accepts exactly:
+
+| Value | Where the session lives | Headless? |
+|---|---|---|
+| `keychain` (default) | libsecret / Secret Service | needs an unlocked keyring |
+| `unsafe_file` | plaintext file in the cache dir | **yes — no keyring at all** |
+| `pass` | the Unix `pass` store (GPG) | yes |
+
+`config.example.yaml` ships `credentials_store: unsafe_file`, so you should not
+need `gnome-keyring` on the VM. The session token is then a plaintext file in
+`staging/.proton`, which the tool creates `chmod 700` — leave it that way, and
+remember it is a live credential when you back that disk up.
+
+Sign in (the callback is a loopback listener, so forward the port):
+
+```bash
+ssh -L 8080:localhost:8080 you@vm
+export PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton
+export PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file
+proton-drive auth login -v          # paste the printed URL into your browser
+```
+
+**Acceptance:** this must work from a *non-interactive* SSH command, and still
+work after `sudo reboot`:
+
+```bash
+ssh you@vm 'PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton \
+  PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file \
+  proton-drive filesystem list / --json'
+```
+
+### Find the photo backup root
+
+Proton's own root is `/my-files`, and `/` lists the top-level sections:
+
+```bash
+proton-drive filesystem list /            # sections
+proton-drive filesystem list /my-files    # then walk down to the phone's folder
+```
+
+Put the folder the phone backs up into in `proton.roots`. This is open
+decision 2 from the plan and the pipeline cannot guess it.
+
+### If Phase 0 fights back
+
+Switch to rclone rather than drifting: set `proton.backend: rclone` and
+configure an `rclone.conf` remote. Credentials live in that file, no keyring is
+involved, and everything downstream (state, dedupe, verify, reap) is unchanged.
+
+---
+
+## Configure
+
+Everything in `config.example.yaml` is optional; omitted keys fall back to the
+defaults in `src/config.py`. The three you must set:
+
+```yaml
+proton:
+  roots: [/my-files/...]     # the phone's backup folder
+immich:
+  url: http://<vm-ip>:2283/api   # the /api suffix is mandatory
+  api_key: ""                    # leave empty; use IMMICH_API_KEY instead
+```
+
+Worth a look before the first real run:
+
+- `immich.album_strategy` — `flat` (one `album_name`), `folder` (album per
+  source folder) or `none`. **Decide before Phase 3**; changing it later means
+  re-tagging. This is open decision 1.
+- `reap.keep_days` — how long verified originals linger in staging. Starts at
+  7; set it to 0 once you trust the pipeline. This is open decision 4.
+- `limits.max_files` / `max_bytes` — per-run caps. Staging shares the SSD with
+  Immich, so a backfill must not be allowed to fill it.
+- `staging.min_free_gb` — hard floor; downloads abort below it.
+- `immich.upload_mode` — `cli` runs the immich-cli container (the plan's
+  route); `api` uploads over REST with no Docker involved.
+
+---
+
+## Run it
+
+Work through the phases in order, checking each before moving on:
+
+```bash
+cd /opt/proton-immich-sync
+export PIS_CONFIG=/etc/proton-immich-sync/config.yaml
+export IMMICH_API_KEY=...
+
+python3 sync.py pull --dry-run      # counts only, writes nothing
+python3 sync.py pull
+python3 sync.py download --limit 20
+python3 sync.py push
+python3 sync.py verify
+python3 sync.py status
+```
+
+Then hand it to systemd:
+
+```bash
+sudo cp systemd/proton-immich-sync.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now proton-immich-sync.timer
+sudo systemctl start proton-immich-sync.service    # run once, now
+journalctl -u proton-immich-sync -f
+```
+
+The timer fires nightly at 03:15 with a 30-minute jitter and `Persistent=true`,
+so a run missed while the VM was off happens at next boot.
+
+### The backfill (Phase 7)
+
+Only once the nightly cycle has been green for a few days:
+
+```bash
+python3 sync.py run --backfill      # uses backfill.max_files / max_bytes
+watch df -h /mnt/immich             # and keep an eye on dmesg for USB resets
+```
+
+---
+
+## Home Assistant
+
+Every run writes `staging/.state/status.json`:
+
+```json
+{"last_run": "...", "last_success": "...", "new": 12, "uploaded": 12,
+ "failed": 0, "backlog": 0, "auth_ok": true, "stale": false, ...}
+```
+
+Set `mqtt.enabled: true` to publish MQTT discovery messages (via `paho-mqtt` if
+installed, otherwise `mosquitto_pub`). You get sensors for backlog, uploaded,
+new, failed, quarantined, staging free space, last run and last success, plus
+two `problem` binary sensors:
+
+- **Proton auth** — on when `auth_ok` is false. This is the failure most likely
+  to stall the pipeline silently; alert on it.
+- **Sync stale** — on when the last success is older than
+  `report.stale_success_hours` (48 by default).
+
+Without MQTT, point a `command_line` sensor at `sync.py status --json`.
+
+---
+
+## How state works
+
+SQLite at `staging/.state/state.sqlite`.
+
+```
+discovered ─► downloading ─► downloaded ─► uploading ─► uploaded ─► verified ─► purged
+                   │                            │
+                   └──────────► failed ◄────────┘   attempts++, exponential backoff
+                                  │
+                                  └─► quarantined (attempts >= 5)
+```
+
+- **Resume:** on startup every `-ing` state is reset to the previous stable
+  state. In-flight state from a crashed run is never trusted.
+- **Retry stage** is derived, not stored: a `failed` row with no `sha1` never
+  finished downloading and retries there; one with a `sha1` retries at upload.
+- **Duplicates** are recorded (`is_duplicate`), never retried. Immich dedupes
+  server-side by hash, so a re-upload is safe but wasteful — `push` asks the
+  server what it already has *before* sending anything.
+- **`last_attempt`** doubles as the time of the last state change; the reaper's
+  grace period is measured from it.
+
+Useful queries:
+
+```bash
+sqlite3 /mnt/immich/staging/.state/state.sqlite \
+  "SELECT status, COUNT(*) FROM assets GROUP BY status;"
+sqlite3 /mnt/immich/staging/.state/state.sqlite \
+  "SELECT remote_path, attempts, last_error FROM assets WHERE status='quarantined';"
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| exit 2, `auth.failed` | Proton session gone. Re-run `proton-drive auth login`. |
+| exit 3, `lock.held` | A previous run is still going. Normal during a backfill. |
+| `cannot create /mnt/immich/...` | The SSD is not mounted. The unit has `RequiresMountsFor` for exactly this. |
+| `download.aborted_low_space` | Free space below `staging.min_free_gb`. Reap, or lower the caps. |
+| `immich.url_missing_api_suffix` | Add `/api`. It is appended automatically, but fix the config. |
+| Rows stuck in `quarantined` | `sync.py requeue` after fixing the cause; `--now` also ignores backoff. |
+| USB resets under load | ASMedia bridge. Boot with `usb-storage.quirks=174c:225c:u` to disable UAS. |
+
+Logs are one JSON object per line, one per state transition. `--human-logs`
+makes them readable interactively; `-v` adds the executed commands.
+
+---
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -t . -v
+```
+
+106 tests, no network and no Docker: the Proton backend and Immich server are
+faked in-process, so `pull → download → push → verify → reap` runs end to end,
+including the failure paths (truncated transfers, checksum mismatches, expired
+sessions mid-run, killed runs resuming, quarantine after repeated failures).
+`tests/fixtures/` holds captured JSON shapes.
+
+---
+
+## What changed against the plan
+
+Verified locally against `cli-drive@0.6.0` / SDK `js@0.19.2`, which settles
+several things the plan had to leave open:
+
+1. **`PROTON_DRIVE_UNSAFE_SECRETS` does not exist.** The real knob is
+   `PROTON_DRIVE_CREDENTIALS_STORE=keychain|unsafe_file|pass`, so headless
+   operation is supported outright and `gnome-keyring` should be unnecessary.
+2. **`filesystem download` takes a destination *folder*, not a file path**, and
+   prompts unless `-c skip` is given — a prompt would hang an unattended run
+   forever. Each download gets its own scratch folder so a skipped conflict can
+   never promote another node's leftover file.
+3. **There is no `auth status` subcommand.** The session probe is
+   `filesystem list /`.
+4. **An expired session prints `You need to login first`** on stdout, exit 1,
+   not JSON even under `--json`. Detecting that string is what turns a dead
+   session into `auth_ok: false` instead of a generic error.
+5. **`filesystem list` has no recursive flag**, so discovery is a breadth-first
+   walk, depth-capped by `proton.max_depth`.
+6. **Remote paths start at `/my-files`**, not `/Photos`, and `/` lists the
+   top-level sections.
+
+Two smaller departures from the plan's design:
+
+- **Asset ids come from the REST API, not from parsing CLI stdout**, which has
+  no stable machine-readable form. `push` calls `/assets/bulk-upload-check` (the
+  endpoint the CLI itself uses for dedupe) before and after uploading: before,
+  it identifies true duplicates and skips sending them; after, it confirms what
+  landed and yields the asset id. Checksums go out as sha1 and the client works
+  out whether the server wants hex or base64, then remembers.
+- **`src/` has three modules the plan did not list** — `config.py`, `log.py` and
+  `pipeline.py` — so that the orchestration can be tested against fakes.
+
+Still untested here, because it needs the real VM: the sign-in flow itself, the
+shape of `filesystem list --json` output from an authenticated session (the
+parser accepts every plausible field spelling, but only real output confirms
+it), and the immich-cli container invocation.
+
+---
+
+## Out of scope, worth scheduling separately
+
+The SSD is a single copy, and Immich's own docs are explicit that this is not a
+backup. Postgres lives on the VM disk and holds faces, embeddings and albums —
+expensive to rebuild. Plan a `pg_dump` plus a second copy of `data/` elsewhere,
+independently of this pipeline.

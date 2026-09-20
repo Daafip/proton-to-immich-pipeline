@@ -1,0 +1,46 @@
+[Unit]
+Description=Proton Drive -> Immich sync
+Documentation=file:/opt/proton-immich-sync/README.md
+After=network-online.target mnt-immich.mount docker.service
+Wants=network-online.target
+# The SSD is mounted nofail, so refuse to run if staging is not there:
+# downloading into an unmounted mountpoint would fill the VM disk.
+RequiresMountsFor=/mnt/immich
+
+[Service]
+Type=oneshot
+User=immich
+Group=immich
+WorkingDirectory=/opt/proton-immich-sync
+# Secrets stay out of the config file on the SSD.
+# IMMICH_API_KEY=... (chmod 600, root:immich)
+EnvironmentFile=/etc/proton-immich-sync/env
+Environment=PIS_CONFIG=/etc/proton-immich-sync/config.yaml
+Environment=PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton
+ExecStart=/usr/bin/python3 /opt/proton-immich-sync/sync.py run
+
+# A whole night is plenty; the flock guard stops the next timer tick from
+# overlapping if a backfill runs long.
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle
+
+# exit 1 = partial failure (some assets failed), still a completed run.
+# exit 2 = auth failure, exit 3 = another run holds the lock.
+SuccessExitStatus=0 1 3
+
+# Hardening. Loosen only if the Proton CLI's keyring access needs it.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/mnt/immich/staging
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
