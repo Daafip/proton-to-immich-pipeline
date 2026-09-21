@@ -65,9 +65,18 @@ What *has* been verified against reality: the Proton CLI interface and its
 
 ## 4. Operational assumptions
 
-- **`User=immich` in the systemd unit** must exist and own
-  `/mnt/immich/staging`. The Immich docker stack commonly runs as root, so this
-  is the most likely first-boot failure.
+- **The service account.** The unit runs as `protonsync`, created by the
+  install steps — the Immich docker stack runs as root and leaves no host user
+  to borrow. It must own `/mnt/immich/staging`, and `immich.upload_mode: cli`
+  also needs it in the `docker` group, which is root-equivalent on that host.
+  Anything run by hand as root that writes into staging or `.state` leaves
+  files the timer then cannot touch; that is the most likely first-boot
+  failure.
+- **CLI flags drift between builds.** Observed, not hypothetical: `-c` for
+  `filesystem download` works in 0.6.0 and is rejected by 0.8.0. `proton.cmd`
+  templates and the conflict-flag negotiation absorb that one; a rename of
+  `filesystem list` or its `--json` shape would not be absorbed, and would
+  surface as discovery finding nothing.
 - **Proton cache growth.** 26 MB after listing ~2,100 entries; a full library is
   plausibly a few hundred MB, living in `staging/.proton` on the shared SSD.
 - **No partial-file resume.** A 2 GB video failing at 90% restarts from zero.

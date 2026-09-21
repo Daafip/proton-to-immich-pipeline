@@ -5,7 +5,11 @@ running the binary and by replaying real `--json` output. It is recorded
 because the build plan had to guess at most of it, and several guesses were
 wrong in ways that would have broken the pipeline silently.
 
-Re-check this page if you upgrade the CLI.
+Re-check this page if you upgrade the CLI. **The flags do drift**: `0.8.0`
+rejects the `-c` alias that `0.6.0` documents for `filesystem download`, though
+it keeps the long `--conflict-strategy`. That is why the argument templates
+live in config and the backend can renegotiate the flag at runtime — see
+below.
 
 ---
 
@@ -25,8 +29,19 @@ Four things follow from that signature:
   the file itself; the caller renames afterwards. Each download therefore gets
   its own scratch folder, so a skipped conflict can never promote another
   node's leftover file.
-- **`-c skip` is mandatory for unattended use.** Without a conflict strategy
-  the CLI *prompts*, which would hang a nightly run forever.
+- **A conflict strategy matters for unattended use, and only the long
+  spelling is portable.** Without a strategy the CLI *prompts*, and a nightly
+  run must never wait on a prompt. `0.6.0` documents `-c, --conflict-strategy`;
+  **`0.8.0` rejects `-c`** (`Unknown option '-c'`) while keeping
+  `--conflict-strategy`, `--file-conflict-strategy` and
+  `--folder-conflict-strategy`. The default template therefore uses
+  `--conflict-strategy skip`, which both builds accept.
+  If some future build rejects that too, `ProtonCliBackend._run_download`
+  retries with `--conflict-strategy`, then with no flag at all, and remembers
+  the first that works — one probe per process, logged as
+  `proton.conflict_flag_fallback`. Dropping the flag is safe because every node
+  downloads into its own empty scratch folder; belt-and-braces, the CLI runs
+  with stdin on `/dev/null` so no prompt can hang a run.
 - **`download` accepts multiple paths per call.** Not yet exploited — see
   [known-issues.md](known-issues.md#1-backfill-throughput).
 - **`list` has no recursive flag**, so discovery is a breadth-first walk,

@@ -9,11 +9,16 @@ RequiresMountsFor=/mnt/immich
 
 [Service]
 Type=oneshot
-User=immich
-Group=immich
+# Own service account, created at install time: the Immich docker stack does
+# not create a host user. It only needs to own /mnt/immich/staging.
+User=protonsync
+Group=protonsync
+# immich.upload_mode: cli talks to the docker socket, which is root-equivalent.
+# Not needed for upload_mode: api.
+#SupplementaryGroups=docker
 WorkingDirectory=/opt/proton-to-immich-pipeline
 # Secrets stay out of the config file on the SSD.
-# IMMICH_API_KEY=... (chmod 600, root:immich)
+# IMMICH_API_KEY=... (chmod 640, root:protonsync)
 EnvironmentFile=/etc/proton-to-immich-pipeline/env
 Environment=PIS_CONFIG=/etc/proton-to-immich-pipeline/config.yaml
 Environment=PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton

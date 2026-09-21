@@ -282,6 +282,33 @@ class TestCliDownload(unittest.TestCase):
 
         self.backend._run = fake_run
 
+    def arm_rejecting(self, bad_flags, writes_name=None, content=b"data",
+                      always_fail=None):
+        """A CLI build that rejects `bad_flags` the way the real parser does."""
+        self.calls = []
+
+        class Result:
+            stdout = stderr = ""
+            returncode = 0
+
+        def fake_run(args, timeout=None):
+            self.calls.append(list(args))
+            if always_fail:
+                raise proton.ProtonError(always_fail)
+            hit = next((f for f in args if f in bad_flags), None)
+            if hit:
+                raise proton.ProtonError(
+                    f"proton-drive {' '.join(args)} exited 1: "
+                    f"Unknown option '{hit}'. To specify a positional argument "
+                    "starting with a '-', place it at the end of the command")
+            folder = Path(args[-1])
+            folder.mkdir(parents=True, exist_ok=True)
+            if writes_name:
+                (folder / writes_name).write_bytes(content)
+            return Result()
+
+        self.backend._run = fake_run
+
     def test_file_is_renamed_to_the_requested_path(self):
         self.arm(writes_name="IMG_1.jpg")
         dest = Path(self.tmp.name) / "scratch" / "wanted-name.jpg"
@@ -294,8 +321,66 @@ class TestCliDownload(unittest.TestCase):
         dest = Path(self.tmp.name) / "scratch" / "IMG_1.jpg"
         self.backend.download(self.node, dest)
         self.assertEqual(self.calls[0][-1], str(dest.parent))
-        self.assertIn("-c", self.calls[0])
+        self.assertIn("--conflict-strategy", self.calls[0],
+                      "0.8.0 rejects -c; the long form works on both builds")
         self.assertIn("skip", self.calls[0], "unattended runs must not prompt")
+
+    def pin_legacy_template(self):
+        """A config.yaml still carrying the 0.6.0 `-c skip` spelling."""
+        self.backend.cmd = dict(self.backend.cmd)
+        self.backend.cmd["download"] = ["filesystem", "download", "-c", "skip",
+                                        "{path}", "{dest_dir}"]
+
+    def test_a_config_pinned_to_the_dead_alias_still_downloads(self):
+        """cli-drive 0.8.0 rejects `-c`; an old config must not kill the run."""
+        self.pin_legacy_template()
+        self.arm_rejecting({"-c"}, writes_name="IMG_1.jpg")
+        dest = Path(self.tmp.name) / "scratch" / "IMG_1.jpg"
+        self.backend.download(self.node, dest)
+        self.assertTrue(dest.exists())
+        self.assertIn("-c", self.calls[0])
+        self.assertIn("--conflict-strategy", self.calls[1])
+        self.assertEqual(self.calls[1][-1], str(dest.parent),
+                         "the destination folder must survive the rewrite")
+
+    def test_falls_back_to_no_conflict_flag_at_all(self):
+        self.pin_legacy_template()
+        self.arm_rejecting({"-c", "--conflict-strategy"}, writes_name="IMG_1.jpg")
+        dest = Path(self.tmp.name) / "scratch" / "IMG_1.jpg"
+        self.backend.download(self.node, dest)
+        self.assertTrue(dest.exists())
+        self.assertEqual(len(self.calls), 3)
+        self.assertNotIn("-c", self.calls[2])
+        self.assertNotIn("skip", self.calls[2])
+        self.assertEqual(self.calls[2][:2], ["filesystem", "download"])
+
+    def test_the_default_template_needs_no_probe(self):
+        """The shipped default is the spelling both builds accept."""
+        self.arm_rejecting({"-c"}, writes_name="IMG_1.jpg")
+        dest = Path(self.tmp.name) / "scratch" / "IMG_1.jpg"
+        self.backend.download(self.node, dest)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("--conflict-strategy", self.calls[0])
+
+    def test_the_working_variant_is_remembered(self):
+        self.pin_legacy_template()
+        self.arm_rejecting({"-c"}, writes_name="IMG_1.jpg")
+        for name in ("a.jpg", "b.jpg"):
+            node = proton.RemoteNode("n", f"/my-files/{name}", "IMG_1.jpg",
+                                     4, None, False)
+            self.backend.download(node, Path(self.tmp.name) / name / "IMG_1.jpg")
+        self.assertEqual(len(self.calls), 3, "must probe once, not per file")
+        self.assertNotIn("-c", self.calls[2])
+        self.assertIn("--conflict-strategy", self.calls[2])
+
+    def test_a_real_error_is_not_retried(self):
+        self.arm_rejecting(set(), writes_name="IMG_1.jpg",
+                           always_fail="network unreachable")
+        dest = Path(self.tmp.name) / "scratch" / "IMG_1.jpg"
+        with self.assertRaises(proton.ProtonError) as ctx:
+            self.backend.download(self.node, dest)
+        self.assertIn("network unreachable", str(ctx.exception))
+        self.assertEqual(len(self.calls), 1)
 
     def test_missing_output_raises_with_folder_contents(self):
         self.arm(writes_name="something-else.jpg")

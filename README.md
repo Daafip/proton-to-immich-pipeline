@@ -40,7 +40,7 @@ Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** loc
 | | |
 |---|---|
 | [docs/operations.md](docs/operations.md) | Install, configure, sign in, run the phases, systemd, backfill, Home Assistant, state model, troubleshooting. |
-| [docs/proton-drive-cli.md](docs/proton-drive-cli.md) | How `cli-drive@0.6.0` actually behaves: command surface, environment, sign-in, the `--json` schema and its four traps. |
+| [docs/proton-drive-cli.md](docs/proton-drive-cli.md) | How `cli-drive` actually behaves (verified on 0.6.0, flags re-checked on 0.8.0): command surface, environment, sign-in, the `--json` schema and its four traps. |
 | [docs/known-issues.md](docs/known-issues.md) | What is not solved, and what has never run against live services. |
 | `proton-to-immich-pipeline-build-plan.md` | The original plan this was built from. |
 
@@ -87,7 +87,7 @@ src/immich.py           REST client + docker immich-cli uploader
 src/pipeline.py         phase orchestration (backends injected, so testable)
 src/report.py           status.json + MQTT discovery
 systemd/                service + nightly timer
-tests/                  167 tests, no network, no Docker
+tests/                  172 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -101,7 +101,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-167 tests, no network and no Docker. The Proton backend and Immich server are
+172 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap` runs end to end,
 including the failure paths: truncated transfers, checksum mismatches, sessions
 expiring mid-run, killed runs resuming, quarantine after repeated failures.

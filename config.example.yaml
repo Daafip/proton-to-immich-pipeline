@@ -58,10 +58,13 @@ proton:
   # The CLI defaults to DEBUG and writes proton-drive.log into cache_dir with
   # no rotation. DEBUG | INFO | WARNING | ERROR.
   cli_log_level: WARNING
-  # Argument templates, verified against cli-drive@0.6.0.
+  # Argument templates, verified against cli-drive@0.6.0 and 0.8.0.
   # {path} = remote path, {dest_dir} = local destination FOLDER (the CLI takes
-  # a folder and picks the filename itself). "-c skip" is required: without a
-  # conflict strategy the CLI prompts, which would hang an unattended run.
+  # a folder and picks the filename itself).
+  # The conflict flag stops the CLI prompting. Long form on purpose: 0.6.0
+  # accepts "-c" or "--conflict-strategy", 0.8.0 dropped "-c" and errors on
+  # it. If a future build rejects this one too, the backend retries with no
+  # flag and logs proton.conflict_flag_fallback -- pin the working form here.
   cmd:
     list:
       - filesystem
@@ -71,7 +74,7 @@ proton:
     download:
       - filesystem
       - download
-      - -c
+      - --conflict-strategy
       - skip
       - "{path}"
       - "{dest_dir}"

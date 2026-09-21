@@ -312,6 +312,49 @@ class Backend:
         raise NotImplementedError
 
 
+# `filesystem download` conflict flags are not stable across CLI builds:
+# 0.6.0 documents `-c/--conflict-strategy`, 0.8.0 rejects `-c` outright. The
+# backend tries these in order and remembers the first the binary accepts.
+CONFLICT_FALLBACKS: list[list[str]] = [
+    ["--conflict-strategy", "skip"],
+    [],
+]
+
+_CONFLICT_FLAGS = {
+    "-c", "--conflict-strategy",
+    "-f", "--file-conflict-strategy",
+    "-d", "--folder-conflict-strategy",
+}
+
+
+def looks_like_unknown_option(blob: str) -> bool:
+    low = blob.lower()
+    return ("unknown option" in low or "unrecognized option" in low
+            or "unknown flag" in low)
+
+
+def _set_conflict_args(args: list[str], variant: list[str]) -> list[str]:
+    """Strip whatever conflict flag the template carried and splice in
+    `variant` after the `download` verb. Returns args unchanged if the
+    template is custom enough that `download` is not in it."""
+    if "download" not in args:
+        return args
+    out: list[str] = []
+    drop_value = False
+    for tok in args:
+        if drop_value:
+            drop_value = False
+            continue
+        if tok in _CONFLICT_FLAGS:
+            drop_value = True
+            continue
+        if any(tok.startswith(f + "=") for f in _CONFLICT_FLAGS):
+            continue
+        out.append(tok)
+    at = out.index("download") + 1
+    return out[:at] + list(variant) + out[at:]
+
+
 class ProtonCliBackend(Backend):
     name = "proton-cli"
 
@@ -324,6 +367,8 @@ class ProtonCliBackend(Backend):
         self.credentials_store = cfg.get("proton.credentials_store")
         self.log_level = cfg.get("proton.cli_log_level")
         self.auth_probe_path = cfg.get("proton.auth_probe_path", "/")
+        # None = the configured template is still believed to work.
+        self._conflict_args: list[str] | None = None
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -356,7 +401,7 @@ class ProtonCliBackend(Backend):
         log.debug("proton.exec", argv=" ".join(argv))
         try:
             proc = subprocess.run(
-                argv, capture_output=True, text=True,
+                argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                 timeout=timeout or self.timeout, env=self._env(), check=False,
             )
         except FileNotFoundError as exc:
@@ -480,22 +525,62 @@ class ProtonCliBackend(Backend):
                 else:
                     yield node
 
+    def _run_download(self, args: list[str]) -> None:
+        """Run the download, negotiating the conflict flag if this build
+        rejects the configured one -- the same remember-what-worked trick the
+        Immich client uses for its checksum encoding.
+
+        Dropping the flag entirely is the last resort and is safe here: the
+        pipeline hands every node its own empty scratch folder, so there is
+        nothing to conflict with, and stdin is /dev/null so a prompt cannot
+        hang the run.
+        """
+        if self._conflict_args is not None:
+            args = _set_conflict_args(args, self._conflict_args)
+        try:
+            self._run(args)
+            return
+        except ProtonError as exc:
+            if self._conflict_args is not None or not looks_like_unknown_option(str(exc)):
+                raise
+            first_error = exc
+
+        for variant in CONFLICT_FALLBACKS:
+            candidate = _set_conflict_args(args, variant)
+            if candidate == args:
+                continue
+            try:
+                self._run(candidate)
+            except ProtonError as retry_exc:
+                if looks_like_unknown_option(str(retry_exc)):
+                    continue
+                raise
+            self._conflict_args = variant
+            log.warn("proton.conflict_flag_fallback",
+                     using=" ".join(variant) or "(no conflict flag)",
+                     detail="pin proton.cmd.download in config to skip this probe")
+            return
+        raise first_error
+
     def download(self, node: RemoteNode, dest: Path) -> None:
         """`filesystem download path... localFolder` -- the destination is a
         FOLDER, so the CLI decides the filename. The caller still names the
         file it wants; we rename afterwards.
 
-        -c skip matters: without a conflict strategy the CLI prompts, which
-        would hang an unattended run forever.
+        A conflict strategy is passed where the build accepts one: without it
+        a CLI that hits a conflict prompts, and an unattended run must never
+        wait on a prompt. Which flag spells it depends on the build, so
+        _run_download negotiates.
         """
         dest_dir = dest.parent
         dest_dir.mkdir(parents=True, exist_ok=True)
         args = self._template(
             "download",
-            ["filesystem", "download", "-c", "skip", "{path}", "{dest_dir}"],
+            ["filesystem", "download", "--conflict-strategy", "skip",
+             "{path}", "{dest_dir}"],
             path=node.path, dest=str(dest), dest_dir=str(dest_dir),
         )
-        self._run(args)
+        self._run_download(args)
         produced = dest_dir / node.name
         if not dest.exists() and produced.exists():
             produced.replace(dest)

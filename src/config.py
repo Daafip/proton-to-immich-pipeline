@@ -59,12 +59,14 @@ DEFAULTS: dict[str, Any] = {
         # a phone can reach it. Deliberately not Immich's 2283.
         "login_redirect_port": 8399,
         "login_timeout_sec": 300,
-        # Argument templates, verified against cli-drive@0.6.0. Overridable so
-        # a future flag change needs a config edit, not a code change.
+        # Argument templates, verified against cli-drive@0.6.0 and 0.8.0.
+        # Overridable so a flag change needs a config edit, not a code change.
         # {path} = remote path, {dest_dir} = local destination FOLDER.
+        # Long-form --conflict-strategy deliberately: 0.6.0 takes either
+        # spelling, 0.8.0 dropped the -c alias and errors on it.
         "cmd": {
             "list": ["filesystem", "list", "{path}", "--json"],
-            "download": ["filesystem", "download", "-c", "skip",
+            "download": ["filesystem", "download", "--conflict-strategy", "skip",
                          "{path}", "{dest_dir}"],
         },
         "rclone": {
