@@ -4,6 +4,28 @@ Install, sign in, work through the phases, then hand it to systemd.
 
 ---
 
+## Verified on
+
+This ran end to end on **2026-09-21**, real photos out of Proton Drive and
+into Immich:
+
+| | |
+|---|---|
+| VM | Debian on Proxmox, bridged to the LAN |
+| Proton CLI | `cli-drive@0.8.0`, `linux-x64` build at `/usr/bin/proton-drive` |
+| Immich | `ghcr.io/immich-app/immich-server:v3` in Docker, `0.0.0.0:2283->2283/tcp` |
+| Uploader | `ghcr.io/immich-app/immich-cli:latest`, `upload_mode: cli`, `--network host` |
+| Service account | `protonsync` |
+
+`login`, `pull`, `download` and `push` all completed against those services.
+What that run did **not** cover — `verify`, `reap`, the REST upload path, MQTT
+— is listed in
+[known-issues.md](known-issues.md#3-what-has-and-has-not-run-live). Every
+version-specific detail below is what that stack actually wanted, not what the
+documentation of any single release claims.
+
+---
+
 ## Install on the VM
 
 The unit runs as an unprivileged service account of its own. **The Immich
@@ -36,8 +58,29 @@ the config format. No other dependencies. For MQTT you want
 `apt install mosquitto-clients` (or `paho-mqtt`); without either, reporting
 degrades to writing `status.json` only.
 
-Install the Proton CLI from [proton.me/download/drive/cli/index.html](https://proton.me/download/drive/cli/index.html)— check
-`grep avx2 /proc/cpuinfo` and use the [`linux/x64-baseline`](https://proton.me/download/drive/cli/0.8.0/linux-x64/proton-drive) build if absent. Install in /usr/bin after using wget to download. -> This was tested using 0.8.0.
+Install the Proton CLI from
+[proton.me/download/drive/cli](https://proton.me/download/drive/cli/index.html).
+Run `grep avx2 /proc/cpuinfo` first and take the
+[`linux/x64-baseline`](https://proton.me/download/drive/cli/0.8.0/linux-x64/proton-drive)
+build if that comes back empty. **0.8.0 is the version this was run against:**
+
+```bash
+sudo wget -O /usr/bin/proton-drive \
+  https://proton.me/download/drive/cli/0.8.0/linux-x64/proton-drive
+sudo chmod 755 /usr/bin/proton-drive   # wget leaves it 644 -- exec fails even for root
+proton-drive --version
+```
+
+Flags are not stable between CLI releases; 0.6.0 and 0.8.0 already disagree.
+[proton-drive-cli.md](proton-drive-cli.md) records the differences and how the
+backend absorbs them.
+
+With `upload_mode: cli`, pulling the uploader image once keeps it out of the
+first push, where a registry failure is reported as an upload failure:
+
+```bash
+sudo -u protonsync docker pull ghcr.io/immich-app/immich-cli:latest
+```
 
 Get the Immich API key from **Account Settings → API Keys** and put it in
 `/etc/proton-to-immich-pipeline/env`. Keep it out of `config.yaml`.
@@ -217,6 +260,17 @@ success, plus two `problem` binary sensors:
 - **Sync stale** — on when the last success is older than
   `report.stale_success_hours` (48 by default).
 
+`mqtt.host` defaults to `127.0.0.1`, which is the VM itself — point it at the
+broker (the Home Assistant host, if you run the Mosquitto add-on) and prove it
+is reachable before trusting it, because a broken publish is only a warning:
+
+```bash
+mosquitto_pub -d -h <broker> -p 1883 -u USER -P PASS -t proton_immich_sync/test -m hello
+```
+
+Publishing happens at the end of any non-dry-run phase, not from
+`sync.py status`. None of this has been tested against a real broker yet.
+
 Without MQTT, point a `command_line` sensor at `sync.py status --json`.
 
 ---
@@ -256,6 +310,10 @@ sqlite3 /mnt/immich/staging/.state/state.sqlite \
 | Symptom | Cause / fix |
 |---|---|
 | `217/USER` at unit start | The `User=` account does not exist. Create it, or point the unit at one that does. |
+| `Permission denied` running `proton-drive` | Missing execute bit — a download arrives `644`, and exec fails for root too. `sudo chmod 755 /usr/bin/proton-drive`. |
+| `Cannot autolaunch D-Bus without X11 $DISPLAY` | The CLI fell back to its `keychain` credentials store. Use `sync.py login`, which sets `PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file`, or export that before calling `proton-drive` by hand. |
+| Files under staging owned by `root` | A phase was run as root. `sudo chown -R protonsync:protonsync /mnt/immich/staging` — that also catches `.state/*-wal` and the `.proton` session, which fail separately. |
+| `Unable to find image ... locally` then exit 1 | The first push pulls immich-cli and the pull failed (DNS, registry, disk). Pre-pull it as the service account to see the real error. |
 | exit 2, `auth.failed` | Proton session gone. Re-run `sync.py login`. Signing in as the wrong user looks identical — `staging/.proton` is mode 700. |
 | exit 3, `lock.held` | A previous run is still going. Normal during a backfill. |
 | exit 4, `config.invalid` | Setup is wrong and every run will fail the same way. No attempts are charged, so just fix it and re-run — no `requeue` needed. |

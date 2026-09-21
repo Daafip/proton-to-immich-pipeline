@@ -5,6 +5,10 @@ running the binary and by replaying real `--json` output. It is recorded
 because the build plan had to guess at most of it, and several guesses were
 wrong in ways that would have broken the pipeline silently.
 
+**`cli-drive@0.8.0` is what the pipeline has actually been run on** — sign-in,
+discovery and downloads all against live Proton Drive on 2026-09-21. The
+differences found are called out below; the `--json` shape was unchanged.
+
 Re-check this page if you upgrade the CLI. **The flags do drift**: `0.8.0`
 rejects the `-c` alias that `0.6.0` documents for `filesystem download`, though
 it keeps the long `--conflict-strategy`. That is why the argument templates

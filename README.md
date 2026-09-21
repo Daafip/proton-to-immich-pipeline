@@ -18,6 +18,11 @@ Nothing is deleted locally until the asset is confirmed **server-side by
 checksum**, and nothing is transferred twice: every node is tracked by its
 Proton node id in SQLite.
 
+**Status:** `login → pull → download → push` has run end to end on a Debian VM
+against `cli-drive@0.8.0` and `immich-server:v3` (2026-09-21). `verify`, `reap`,
+the REST upload mode and MQTT have not yet run against live services — see
+[docs/known-issues.md](docs/known-issues.md#3-what-has-and-has-not-run-live).
+
 | Subcommand | What it does |
 |---|---|
 | `login` | Sign in to Proton, serving a phone-friendly redirect link. |
@@ -42,7 +47,7 @@ Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** loc
 |---|---|
 | [docs/operations.md](docs/operations.md) | Install, configure, sign in, run the phases, systemd, backfill, Home Assistant, state model, troubleshooting. |
 | [docs/proton-drive-cli.md](docs/proton-drive-cli.md) | How `cli-drive` actually behaves (verified on 0.6.0, flags re-checked on 0.8.0): command surface, environment, sign-in, the `--json` schema and its four traps. |
-| [docs/known-issues.md](docs/known-issues.md) | What is not solved, and what has never run against live services. |
+| [docs/known-issues.md](docs/known-issues.md) | What is not solved, and what has and has not run against live services. |
 | `proton-to-immich-pipeline-build-plan.md` | The original plan this was built from. |
 
 ---
