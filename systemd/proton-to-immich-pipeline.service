@@ -32,6 +32,8 @@ IOSchedulingClass=idle
 
 # exit 1 = partial failure (some assets failed), still a completed run.
 # exit 2 = auth failure, exit 3 = another run holds the lock.
+# exit 4 (config fault) is deliberately absent: it must show as failed,
+# because every future run fails identically until someone edits the config.
 SuccessExitStatus=0 1 3
 
 # Hardening. Loosen only if the Proton CLI's keyring access needs it.

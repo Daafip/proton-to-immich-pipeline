@@ -22,12 +22,15 @@ from src import log, report, state  # noqa: E402
 from src.config import ConfigError, load  # noqa: E402
 from src.pipeline import AuthFailure, Pipeline  # noqa: E402
 from src.proton import ProtonError  # noqa: E402
-from src.immich import ImmichError  # noqa: E402
+from src.immich import ImmichConfigError, ImmichError  # noqa: E402
 
 EXIT_OK = 0
 EXIT_PARTIAL = 1
 EXIT_AUTH = 2
 EXIT_LOCKED = 3
+# Setup is wrong and every run will fail the same way until someone fixes it.
+# Deliberately outside the unit's SuccessExitStatus, so systemd shows failed.
+EXIT_CONFIG = 4
 
 CONFIG_CANDIDATES = [
     os.environ.get("PIS_CONFIG"),
@@ -310,8 +313,11 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("auth.failed", detail=str(exc)[:500])
                 pipeline.auth_ok = False
                 code = EXIT_AUTH
+            except ImmichConfigError as exc:
+                log.error("config.invalid", detail=log.condense(str(exc)))
+                code = EXIT_CONFIG
             except (ProtonError, ImmichError) as exc:
-                log.error("run.failed", detail=str(exc)[:500])
+                log.error("run.failed", detail=log.condense(str(exc)))
                 code = EXIT_PARTIAL
             except KeyboardInterrupt:
                 log.warn("run.interrupted")

@@ -263,6 +263,53 @@ class TestPush(PipelineTest):
         self.assertEqual(state.get(self.conn, "node-1")["status"], state.UPLOADED)
 
 
+class TestConfigFaultsDoNotBurnAttempts(PipelineTest):
+    """A broken setup is not a flaky asset: retrying cannot help, and five
+    such runs would quarantine a whole library over a typo."""
+
+    class BrokenUploader:
+        def __init__(self):
+            self.calls = 0
+
+        def upload_dir(self, import_dir, dry_run=False):
+            from src.immich import ImmichConfigError
+            self.calls += 1
+            raise ImmichConfigError("immich.url is http://127.0.0.1:2283/api")
+
+    def prepared(self):
+        pipeline = self.pipe(run_id="r1")
+        pipeline.pull()
+        pipeline.download()
+        pipeline._uploader = self.BrokenUploader()
+        return pipeline
+
+    def test_rows_keep_their_attempt_budget(self):
+        self.seed(3)
+        pipeline = self.prepared()
+        from src.immich import ImmichConfigError
+        with self.assertRaises(ImmichConfigError):
+            pipeline.push()
+        rows = self.conn.execute("SELECT * FROM assets").fetchall()
+        self.assertEqual([r["attempts"] for r in rows], [0, 0, 0])
+        self.assertTrue(all(r["status"] != state.FAILED for r in rows),
+                        "nothing was sent, so nothing failed")
+
+    def test_the_rows_are_rewound_by_resume(self):
+        self.seed(2)
+        pipeline = self.prepared()
+        from src.immich import ImmichConfigError
+        with self.assertRaises(ImmichConfigError):
+            pipeline.push()
+        state.resume(self.conn)
+        rows = self.conn.execute("SELECT * FROM assets").fetchall()
+        self.assertTrue(all(r["status"] == state.DOWNLOADED for r in rows),
+                        "a fixed config must let the next run pick them up")
+
+    def test_it_is_still_an_immich_error_for_older_handlers(self):
+        from src.immich import ImmichConfigError, ImmichError
+        self.assertTrue(issubclass(ImmichConfigError, ImmichError))
+
+
 class TestPrecheck(PipelineTest):
     """Skip downloading what Immich already holds, using Proton's claimed sha1."""
 

@@ -35,6 +35,11 @@ class ImmichError(Exception):
     pass
 
 
+class ImmichConfigError(ImmichError):
+    """The run cannot work until a human edits the config. Never charged to an
+    asset's attempt budget -- nothing was attempted."""
+
+
 class ImmichAuthError(ImmichError):
     pass
 
@@ -354,7 +359,7 @@ class ImmichCliUploader:
     def upload_dir(self, import_dir: Path, dry_run: bool = False) -> CliRun:
         trap = self.unreachable_from_container()
         if trap:
-            raise ImmichError(trap)
+            raise ImmichConfigError(trap)
         argv = self.build_argv(import_dir, dry_run=dry_run)
         printable = [("IMMICH_API_KEY=***" if a.startswith("IMMICH_API_KEY=") else a)
                      for a in argv]

@@ -258,6 +258,7 @@ sqlite3 /mnt/immich/staging/.state/state.sqlite \
 | `217/USER` at unit start | The `User=` account does not exist. Create it, or point the unit at one that does. |
 | exit 2, `auth.failed` | Proton session gone. Re-run `sync.py login`. Signing in as the wrong user looks identical — `staging/.proton` is mode 700. |
 | exit 3, `lock.held` | A previous run is still going. Normal during a backfill. |
+| exit 4, `config.invalid` | Setup is wrong and every run will fail the same way. No attempts are charged, so just fix it and re-run — no `requeue` needed. |
 | `Unknown option '-c'` on every download | A config pinned to the old alias. 0.8.0 wants `--conflict-strategy skip`; fix `proton.cmd.download` in `config.yaml`, then `sync.py requeue`. |
 | `cannot create /mnt/immich/...` | The SSD is not mounted. The unit has `RequiresMountsFor` for exactly this. |
 | `download.aborted_low_space` | Free space below `staging.min_free_gb`. Reap, or lower the caps. |

@@ -31,7 +31,8 @@ Proton node id in SQLite.
 | `status` | Print pipeline health (`--json` for machine output). |
 | `requeue` | Put `failed` / `quarantined` rows back in play. |
 
-Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** lock held.
+Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** lock held ·
+**4** config fault (nothing was attempted; fix the config and re-run).
 
 ---
 
@@ -87,7 +88,7 @@ src/immich.py           REST client + docker immich-cli uploader
 src/pipeline.py         phase orchestration (backends injected, so testable)
 src/report.py           status.json + MQTT discovery
 systemd/                service + nightly timer
-tests/                  179 tests, no network, no Docker
+tests/                  182 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -101,7 +102,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-179 tests, no network and no Docker. The Proton backend and Immich server are
+182 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap` runs end to end,
 including the failure paths: truncated transfers, checksum mismatches, sessions
 expiring mid-run, killed runs resuming, quarantine after repeated failures.

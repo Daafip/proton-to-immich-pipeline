@@ -18,7 +18,8 @@ from typing import Any, Iterable
 
 from . import immich as immich_mod
 from . import log, proton, state
-from .immich import ImmichAuthError, ImmichClient, ImmichCliUploader, ImmichError, sha1_file
+from .immich import (ImmichAuthError, ImmichClient, ImmichCliUploader,
+                     ImmichConfigError, ImmichError, sha1_file)
 from .proton import AuthError, ProtonError, RemoteNode
 
 
@@ -474,6 +475,11 @@ class Pipeline:
                 run = self.uploader.upload_dir(batch)
                 log.debug("push.cli_output", stdout=run.stdout[-1500:],
                           stderr=run.stderr[-500:])
+            except ImmichConfigError:
+                # Nothing was sent, and no number of retries will fix it.
+                # Charging attempts here would quarantine the library over a
+                # typo. Rows stay `uploading` and resume() rewinds them.
+                raise
             except ImmichAuthError as exc:
                 raise AuthFailure(f"immich: {exc}") from exc
             except ImmichError as exc:
