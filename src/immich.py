@@ -21,6 +21,7 @@ import mimetypes
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -294,8 +295,17 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds")
 
 
+# Inside a container these all mean the container, never the host.
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
 class ImmichCliUploader:
-    """`docker run --rm ghcr.io/immich-app/immich-cli upload --recursive /import`."""
+    """`docker run --rm ghcr.io/immich-app/immich-cli upload --recursive /import`.
+
+    The container has its own network namespace, so a loopback immich.url --
+    which is exactly what works for upload_mode: api, and what the example
+    config ships -- resolves to the container itself and is refused.
+    """
 
     def __init__(self, cfg):
         self.docker = cfg.get("immich.docker_binary", "docker")
@@ -330,7 +340,21 @@ class ImmichCliUploader:
         argv += [a for a in self.extra_args if a != "--delete"]
         return argv
 
+    def unreachable_from_container(self) -> str | None:
+        """The loopback trap, named before a run instead of after 20 failures."""
+        host = urllib.parse.urlsplit(self.url).hostname or ""
+        if host.strip("[]").lower() in LOOPBACK_HOSTS:
+            return (
+                f"immich.url is {self.url}, and inside the immich-cli container "
+                f"{host} is the container itself -- point immich.url at the "
+                "host's LAN IP, or set immich.upload_mode: api to upload from "
+                "this process instead of a container")
+        return None
+
     def upload_dir(self, import_dir: Path, dry_run: bool = False) -> CliRun:
+        trap = self.unreachable_from_container()
+        if trap:
+            raise ImmichError(trap)
         argv = self.build_argv(import_dir, dry_run=dry_run)
         printable = [("IMMICH_API_KEY=***" if a.startswith("IMMICH_API_KEY=") else a)
                      for a in argv]

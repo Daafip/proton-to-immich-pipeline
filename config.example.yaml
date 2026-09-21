@@ -84,6 +84,10 @@ proton:
 
 immich:
   # MUST include the /api suffix.
+  # 127.0.0.1 is only correct for upload_mode: api, which uploads from this
+  # process. The immich-cli container has its own network namespace, so with
+  # upload_mode: cli this must be the host's LAN IP or a resolvable name --
+  # a loopback address there means the container itself (ECONNREFUSED).
   url: http://127.0.0.1:2283/api
   # Leave empty and set IMMICH_API_KEY in the environment instead.
   api_key: ""

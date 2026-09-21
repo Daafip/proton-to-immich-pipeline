@@ -81,6 +81,41 @@ class TestCliArgv(unittest.TestCase):
         self.assertIn("--dry-run", argv)
 
 
+class TestContainerLoopbackGuard(unittest.TestCase):
+    """127.0.0.1 is right for upload_mode: api and fatal for the container."""
+
+    def uploader(self, url):
+        cfg = load(None)
+        cfg.set("immich.url", url)
+        return immich.ImmichCliUploader(cfg)
+
+    def test_loopback_urls_are_refused_before_docker_runs(self):
+        for url in ("http://127.0.0.1:2283/api", "http://localhost:2283/api",
+                    "http://[::1]:2283/api", "http://0.0.0.0:2283/api"):
+            with self.subTest(url=url):
+                trap = self.uploader(url).unreachable_from_container()
+                self.assertIsNotNone(trap)
+                self.assertIn("upload_mode: api", trap,
+                              "the message must name the way out")
+
+    def test_a_routable_host_passes(self):
+        self.assertIsNone(
+            self.uploader("http://192.168.68.52:2283/api").unreachable_from_container())
+        self.assertIsNone(
+            self.uploader("http://immich.lan:2283/api").unreachable_from_container())
+
+    def test_upload_dir_raises_instead_of_spawning_docker(self):
+        up = self.uploader("http://127.0.0.1:2283/api")
+
+        def explode(*a, **k):
+            raise AssertionError("docker must not be spawned")
+
+        up.build_argv = explode
+        with self.assertRaises(immich.ImmichError) as ctx:
+            up.upload_dir(Path("/tmp/does-not-matter"))
+        self.assertIn("container itself", str(ctx.exception))
+
+
 class TestErrorCondensing(unittest.TestCase):
     """A failing `docker run` buries the cause under pull progress."""
 

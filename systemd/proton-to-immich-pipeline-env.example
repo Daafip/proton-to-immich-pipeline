@@ -1,5 +1,6 @@
 # Install to /etc/proton-to-immich-pipeline/env  (chmod 640, owned root:protonsync)
 # Immich API key: Account Settings -> API Keys
 IMMICH_API_KEY=replace-me
-# Optional: override the config's immich.url
+# Optional: override the config's immich.url. Loopback works for
+# upload_mode: api only -- the immich-cli container cannot reach it.
 #IMMICH_INSTANCE_URL=http://127.0.0.1:2283/api
