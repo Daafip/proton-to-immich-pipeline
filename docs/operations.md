@@ -7,14 +7,14 @@ Install, sign in, work through the phases, then hand it to systemd.
 ## Install on the VM
 
 ```bash
-sudo install -d -o immich -g immich /opt/proton-immich-sync
-sudo cp -r sync.py src systemd config.example.yaml /opt/proton-immich-sync/
+sudo install -d -o immich -g immich /opt/proton-to-immich-pipeline
+sudo cp -r sync.py src systemd config.example.yaml /opt/proton-to-immich-pipeline/
 
-sudo install -d /etc/proton-immich-sync
-sudo cp config.example.yaml /etc/proton-immich-sync/config.yaml
-sudo cp systemd/proton-immich-sync-env.example /etc/proton-immich-sync/env
-sudo chown root:immich /etc/proton-immich-sync/env
-sudo chmod 640 /etc/proton-immich-sync/env      # holds IMMICH_API_KEY
+sudo install -d /etc/proton-to-immich-pipeline
+sudo cp config.example.yaml /etc/proton-to-immich-pipeline/config.yaml
+sudo cp systemd/proton-to-immich-pipeline-env.example /etc/proton-to-immich-pipeline/env
+sudo chown root:immich /etc/proton-to-immich-pipeline/env
+sudo chmod 640 /etc/proton-to-immich-pipeline/env      # holds IMMICH_API_KEY
 ```
 
 PyYAML is used if present but is **not required** — a built-in parser handles
@@ -26,7 +26,7 @@ Install the Proton CLI from proton.me/download/drive/cli — check
 `grep avx2 /proc/cpuinfo` and use the `linux/x64-baseline` build if absent.
 
 Get the Immich API key from **Account Settings → API Keys** and put it in
-`/etc/proton-immich-sync/env`. Keep it out of `config.yaml`.
+`/etc/proton-to-immich-pipeline/env`. Keep it out of `config.yaml`.
 
 ---
 
@@ -108,8 +108,8 @@ downstream — state, dedupe, verify, reap — is unchanged.
 Check each before moving on:
 
 ```bash
-cd /opt/proton-immich-sync
-export PIS_CONFIG=/etc/proton-immich-sync/config.yaml
+cd /opt/proton-to-immich-pipeline
+export PIS_CONFIG=/etc/proton-to-immich-pipeline/config.yaml
 export IMMICH_API_KEY=...
 
 python3 sync.py pull --dry-run      # counts only, writes nothing
@@ -127,11 +127,11 @@ tree is human-readable; use it.
 Then hand it to systemd:
 
 ```bash
-sudo cp systemd/proton-immich-sync.{service,timer} /etc/systemd/system/
+sudo cp systemd/proton-to-immich-pipeline.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now proton-immich-sync.timer
-sudo systemctl start proton-immich-sync.service    # run once, now
-journalctl -u proton-immich-sync -f
+sudo systemctl enable --now proton-to-immich-pipeline.timer
+sudo systemctl start proton-to-immich-pipeline.service    # run once, now
+journalctl -u proton-to-immich-pipeline -f
 ```
 
 The timer fires nightly at 03:15 with 30 minutes of jitter and

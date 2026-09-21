@@ -68,7 +68,7 @@ class CliTest(unittest.TestCase):
 
     def test_status_on_a_fresh_db(self):
         proc = self.run_sync("status")
-        self.assertIn("proton-immich-sync", proc.stdout)
+        self.assertIn("proton-to-immich-pipeline", proc.stdout)
         self.assertIn("never", proc.stdout)
 
     def test_status_json_is_machine_readable(self):

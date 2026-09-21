@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""proton-immich-sync -- one-way Proton Drive -> staging -> Immich.
+"""proton-to-immich-pipeline -- one-way Proton Drive -> staging -> Immich.
 
     sync.py pull | download | push | verify | reap | run | status
 
@@ -32,7 +32,7 @@ EXIT_LOCKED = 3
 CONFIG_CANDIDATES = [
     os.environ.get("PIS_CONFIG"),
     "./config.yaml",
-    "/etc/proton-immich-sync/config.yaml",
+    "/etc/proton-to-immich-pipeline/config.yaml",
     str(Path(__file__).resolve().parent / "config.yaml"),
 ]
 
@@ -158,7 +158,7 @@ def print_human_status(status: dict) -> None:
     def row(label, value):
         print(f"  {label:<20} {value}")
 
-    print("proton-immich-sync")
+    print("proton-to-immich-pipeline")
     row("last run", status.get("last_run") or "never")
     row("last success", status.get("last_success") or "never")
     row("exit code", status.get("last_run_exit_code"))

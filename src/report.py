@@ -105,7 +105,7 @@ def discovery_payloads(cfg) -> list[tuple[str, dict[str, Any]]]:
     device = {
         "identifiers": [node],
         "name": "Proton to Immich sync",
-        "manufacturer": "proton-immich-sync",
+        "manufacturer": "proton-to-immich-pipeline",
         "model": "pipeline",
     }
     out: list[tuple[str, dict[str, Any]]] = []

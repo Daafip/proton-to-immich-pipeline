@@ -1,4 +1,4 @@
-# proton-immich-sync
+# proton-to-immich-pipeline
 
 One-way, incremental, resumable sync: **Proton Drive → staging → Immich**.
 Python 3.11+, standard library only. Runs unattended under systemd and reports
@@ -42,15 +42,15 @@ Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** loc
 | [docs/operations.md](docs/operations.md) | Install, configure, sign in, run the phases, systemd, backfill, Home Assistant, state model, troubleshooting. |
 | [docs/proton-drive-cli.md](docs/proton-drive-cli.md) | How `cli-drive@0.6.0` actually behaves: command surface, environment, sign-in, the `--json` schema and its four traps. |
 | [docs/known-issues.md](docs/known-issues.md) | What is not solved, and what has never run against live services. |
-| `proton-immich-sync-build-plan.md` | The original plan this was built from. |
+| `proton-to-immich-pipeline-build-plan.md` | The original plan this was built from. |
 
 ---
 
 ## Quick start
 
 ```bash
-sudo cp config.example.yaml /etc/proton-immich-sync/config.yaml
-export PIS_CONFIG=/etc/proton-immich-sync/config.yaml
+sudo cp config.example.yaml /etc/proton-to-immich-pipeline/config.yaml
+export PIS_CONFIG=/etc/proton-to-immich-pipeline/config.yaml
 export IMMICH_API_KEY=...            # Immich → Account Settings → API Keys
 
 python3 sync.py login                # open the printed link on any device

@@ -1,6 +1,6 @@
 """Structured logging.
 
-One JSON line per event on stdout so `journalctl -u proton-immich-sync` stays
+One JSON line per event on stdout so `journalctl -u proton-to-immich-pipeline` stays
 greppable. Human mode is for interactive use.
 """
 

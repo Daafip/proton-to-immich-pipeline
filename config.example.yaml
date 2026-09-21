@@ -1,4 +1,4 @@
-# proton-immich-sync -- copy to config.yaml and edit.
+# proton-to-immich-pipeline -- copy to config.yaml and edit.
 # Every key here is optional; anything omitted falls back to src/config.py DEFAULTS.
 
 staging:

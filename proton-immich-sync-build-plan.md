@@ -1,4 +1,4 @@
-# proton-immich-sync — build plan (final)
+# proton-to-immich-pipeline — build plan (final)
 
 Handoff document for a coding session. Environment below is live and verified;
 everything under "Phases" is still to build.
@@ -138,7 +138,7 @@ state. Never trust in-flight state from a crashed run.
 ## 6. Layout
 
 ```
-proton-immich-sync/
+proton-to-immich-pipeline/
 ├── README.md
 ├── config.example.yaml
 ├── sync.py                 # pull | download | push | verify | reap | run | status
@@ -148,8 +148,8 @@ proton-immich-sync/
 │   ├── immich.py           # docker-run CLI wrapper + REST verify
 │   └── report.py           # status.json / MQTT
 ├── systemd/
-│   ├── proton-immich-sync.service
-│   └── proton-immich-sync.timer
+│   ├── proton-to-immich-pipeline.service
+│   └── proton-to-immich-pipeline.timer
 └── tests/                  # fixtures of captured --json output, no network
 ```
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=Nightly Proton Drive -> Immich sync
-Documentation=file:/opt/proton-immich-sync/README.md
+Documentation=file:/opt/proton-to-immich-pipeline/README.md
 
 [Timer]
 # Nightly, after the phone has had all day to back up to Proton.
@@ -9,7 +9,7 @@ OnCalendar=*-*-* 03:15:00
 RandomizedDelaySec=30m
 # If the VM was off at 03:15, run once it comes back.
 Persistent=true
-Unit=proton-immich-sync.service
+Unit=proton-to-immich-pipeline.service
 
 [Install]
 WantedBy=timers.target

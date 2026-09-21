@@ -99,7 +99,7 @@ class ImmichClient:
         self.base_url = url
         self.api_key = str(cfg.get("immich.api_key", ""))
         self.timeout = int(cfg.get("immich.http_timeout_sec", 120))
-        self.device_id = str(cfg.get("immich.device_id", "proton-immich-sync"))
+        self.device_id = str(cfg.get("immich.device_id", "proton-to-immich-pipeline"))
         self._checksum_format: str | None = None
 
     # -- transport ---------------------------------------------------------

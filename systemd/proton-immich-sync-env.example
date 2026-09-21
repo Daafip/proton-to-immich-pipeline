@@ -1,4 +1,4 @@
-# Install to /etc/proton-immich-sync/env  (chmod 600, owned root:immich)
+# Install to /etc/proton-to-immich-pipeline/env  (chmod 600, owned root:immich)
 # Immich API key: Account Settings -> API Keys
 IMMICH_API_KEY=replace-me
 # Optional: override the config's immich.url
