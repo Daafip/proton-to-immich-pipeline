@@ -101,7 +101,8 @@ class Pipeline:
         self.stats.failed += 1
         if status == state.QUARANTINED:
             self.stats.quarantined += 1
-        log.transition(node_id, previous, status, stage=stage, error=error[:300])
+        log.transition(node_id, previous, status, stage=stage,
+                       error=log.condense(error, 300))
 
     # -- Phase 1: pull -----------------------------------------------------
     def pull(self, dry_run: bool | None = None) -> Stats:

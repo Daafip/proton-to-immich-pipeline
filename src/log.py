@@ -7,9 +7,37 @@ greppable. Human mode is for interactive use.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from typing import Any
+
+# Docker pull chatter. A failing `docker run` emits screenfuls of it before
+# the line that says what actually went wrong, so a head-only truncation
+# reports the pull and hides the cause.
+_NOISE = re.compile(
+    r"^(?:[0-9a-f]{8,}: (?:Pulling fs layer|Waiting|Downloading|Verifying Checksum"
+    r"|Download complete|Extracting|Pull complete|Already exists).*"
+    r"|Unable to find image .* locally"
+    r"|[\w.-]+: Pulling from .*"
+    r"|Digest: sha256:[0-9a-f]+"
+    r"|Status: (?:Downloaded newer image|Image is up to date).*)$")
+
+
+def condense(blob: str, limit: int = 500) -> str:
+    """Squeeze subprocess output down to something that fits one log line.
+
+    Drops pull progress, then keeps BOTH ends: an argument error puts the
+    cause first (`Unknown option '-c'`), a docker failure puts it last.
+    """
+    kept = [ln.strip() for ln in (blob or "").splitlines()
+            if ln.strip() and not _NOISE.match(ln.strip())]
+    text = " | ".join(kept) if kept else (blob or "").strip()
+    if len(text) <= limit:
+        return text
+    head = max(limit // 3, 1)
+    tail = max(limit - head - 5, 1)
+    return f"{text[:head]} ... {text[-tail:]}"
 
 _JSON = True
 _VERBOSE = False

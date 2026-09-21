@@ -345,7 +345,8 @@ class ImmichCliUploader:
         run = CliRun(proc.returncode, proc.stdout or "", proc.stderr or "", printable)
         if run.returncode != 0:
             blob = f"{run.stderr}\n{run.stdout}".strip()
+            detail = log.condense(blob)
             if "401" in blob or "403" in blob or "unauthorized" in blob.lower():
-                raise ImmichAuthError(blob[:500])
-            raise ImmichError(f"immich-cli exited {run.returncode}: {blob[:500]}")
+                raise ImmichAuthError(detail)
+            raise ImmichError(f"immich-cli exited {run.returncode}: {detail}")
         return run

@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import immich  # noqa: E402
+from src import immich, log  # noqa: E402
 from src.config import load  # noqa: E402
 
 
@@ -79,6 +79,39 @@ class TestCliArgv(unittest.TestCase):
         argv = immich.ImmichCliUploader(cfg_with()).build_argv(Path("/b"), dry_run=True)
         self.assertIn("/b:/import:ro", argv)
         self.assertIn("--dry-run", argv)
+
+
+class TestErrorCondensing(unittest.TestCase):
+    """A failing `docker run` buries the cause under pull progress."""
+
+    PULL_NOISE = """Unable to find image 'ghcr.io/immich-app/immich-cli:latest' locally
+latest: Pulling from immich-app/immich-cli
+9392944252ce: Pulling fs layer
+3953cba099bd: Pulling fs layer
+1a92ea7b0383: Downloading  12.4MB/58.2MB
+a8e022530465: Pull complete
+Digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+Status: Downloaded newer image for ghcr.io/immich-app/immich-cli:latest
+Error: connect ECONNREFUSED 10.0.0.9:2283"""
+
+    def test_the_real_error_survives_the_pull_progress(self):
+        out = log.condense(self.PULL_NOISE)
+        self.assertIn("ECONNREFUSED", out)
+        self.assertNotIn("Pulling fs layer", out)
+        self.assertNotIn("Digest:", out)
+
+    def test_both_ends_are_kept_when_still_too_long(self):
+        out = log.condense("HEAD-MARKER " + ("x" * 4000) + " TAIL-MARKER", limit=120)
+        self.assertIn("HEAD-MARKER", out)
+        self.assertIn("TAIL-MARKER", out)
+        self.assertLessEqual(len(out), 120)
+
+    def test_short_output_is_returned_intact(self):
+        self.assertEqual(log.condense("Unknown option '-c'."), "Unknown option '-c'.")
+
+    def test_progress_only_output_does_not_vanish(self):
+        out = log.condense("latest: Pulling from immich-app/immich-cli")
+        self.assertTrue(out.strip(), "an empty error message explains nothing")
 
 
 class TestBulkUploadCheck(unittest.TestCase):

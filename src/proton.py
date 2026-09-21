@@ -411,9 +411,9 @@ class ProtonCliBackend(Backend):
         if proc.returncode != 0:
             blob = f"{proc.stderr}\n{proc.stdout}"
             if looks_like_auth_failure(blob):
-                raise AuthError(blob.strip()[:500])
+                raise AuthError(log.condense(blob))
             raise ProtonError(
-                f"{' '.join(argv)} exited {proc.returncode}: {blob.strip()[:500]}")
+                f"{' '.join(argv)} exited {proc.returncode}: {log.condense(blob)}")
         return proc
 
     def auth_ok(self) -> bool:
@@ -616,8 +616,9 @@ class RcloneBackend(Backend):
         if proc.returncode != 0:
             blob = f"{proc.stderr}\n{proc.stdout}"
             if looks_like_auth_failure(blob):
-                raise AuthError(blob.strip()[:500])
-            raise ProtonError(f"rclone exited {proc.returncode}: {blob.strip()[:500]}")
+                raise AuthError(log.condense(blob))
+            raise ProtonError(
+                f"rclone exited {proc.returncode}: {log.condense(blob)}")
         return proc
 
     def auth_ok(self) -> bool:
