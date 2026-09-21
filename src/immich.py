@@ -307,9 +307,10 @@ LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 class ImmichCliUploader:
     """`docker run --rm ghcr.io/immich-app/immich-cli upload --recursive /import`.
 
-    The container has its own network namespace, so a loopback immich.url --
-    which is exactly what works for upload_mode: api, and what the example
-    config ships -- resolves to the container itself and is refused.
+    The container gets its own network namespace, so a loopback immich.url --
+    correct for upload_mode: api, and what the example config ships -- would
+    resolve to the container itself. `--network host` is added in that case so
+    the same URL means the same machine in both modes.
     """
 
     def __init__(self, cfg):
@@ -323,11 +324,35 @@ class ImmichCliUploader:
         self.album_strategy = cfg.get("immich.album_strategy", "flat")
         self.album_name = cfg.get("immich.album_name", "Proton Import")
         self.extra_args = list(cfg.get("immich.extra_args", []) or [])
+        self.docker_args = list(cfg.get("immich.docker_args", []) or [])
         self.timeout = int(cfg.get("immich.timeout_sec", 3600))
+
+    def loopback_host(self) -> str | None:
+        host = urllib.parse.urlsplit(self.url).hostname or ""
+        return host if host.strip("[]").lower() in LOOPBACK_HOSTS else None
+
+    def configured_network(self) -> str | None:
+        """--network from immich.docker_args, in either spelling."""
+        for i, arg in enumerate(self.docker_args):
+            if arg == "--network" and i + 1 < len(self.docker_args):
+                return self.docker_args[i + 1]
+            if arg.startswith("--network="):
+                return arg.split("=", 1)[1]
+        return None
+
+    def docker_run_args(self) -> list[str]:
+        """Host networking when, and only when, the URL needs it. Immich
+        publishes 2283 on the host, so sharing that namespace makes a loopback
+        URL mean the host -- no LAN IP to hardcode, nothing to break on a new
+        DHCP lease."""
+        if self.loopback_host() and self.configured_network() is None:
+            return [*self.docker_args, "--network", "host"]
+        return list(self.docker_args)
 
     def build_argv(self, import_dir: Path, dry_run: bool = False) -> list[str]:
         argv = [
             self.docker, "run", "--rm",
+            *self.docker_run_args(),
             "-v", f"{import_dir}:/import:ro",
             "-e", f"IMMICH_INSTANCE_URL={self.url}",
             "-e", f"IMMICH_API_KEY={self.api_key}",
@@ -346,14 +371,16 @@ class ImmichCliUploader:
         return argv
 
     def unreachable_from_container(self) -> str | None:
-        """The loopback trap, named before a run instead of after 20 failures."""
-        host = urllib.parse.urlsplit(self.url).hostname or ""
-        if host.strip("[]").lower() in LOOPBACK_HOSTS:
+        """Only reachable is the configuration host networking cannot save:
+        a loopback URL with some other --network pinned by hand."""
+        host = self.loopback_host()
+        network = self.configured_network()
+        if host and network not in (None, "host"):
             return (
-                f"immich.url is {self.url}, and inside the immich-cli container "
-                f"{host} is the container itself -- point immich.url at the "
-                "host's LAN IP, or set immich.upload_mode: api to upload from "
-                "this process instead of a container")
+                f"immich.url is {self.url} but immich.docker_args pins "
+                f"--network {network}; in that namespace {host} is the "
+                "container itself -- use --network host, give immich.url the "
+                "host's address, or set immich.upload_mode: api")
         return None
 
     def upload_dir(self, import_dir: Path, dry_run: bool = False) -> CliRun:

@@ -81,39 +81,59 @@ class TestCliArgv(unittest.TestCase):
         self.assertIn("--dry-run", argv)
 
 
-class TestContainerLoopbackGuard(unittest.TestCase):
-    """127.0.0.1 is right for upload_mode: api and fatal for the container."""
+class TestContainerNetworking(unittest.TestCase):
+    """Immich publishes 2283 on the host; the container must share that
+    namespace for a loopback url to mean the same machine in both modes."""
 
-    def uploader(self, url):
+    def uploader(self, url, docker_args=None):
         cfg = load(None)
         cfg.set("immich.url", url)
+        if docker_args is not None:
+            cfg.set("immich.docker_args", docker_args)
         return immich.ImmichCliUploader(cfg)
 
-    def test_loopback_urls_are_refused_before_docker_runs(self):
+    def test_loopback_urls_get_host_networking(self):
         for url in ("http://127.0.0.1:2283/api", "http://localhost:2283/api",
                     "http://[::1]:2283/api", "http://0.0.0.0:2283/api"):
             with self.subTest(url=url):
-                trap = self.uploader(url).unreachable_from_container()
-                self.assertIsNotNone(trap)
-                self.assertIn("upload_mode: api", trap,
-                              "the message must name the way out")
+                argv = self.uploader(url).build_argv(Path("/batch"))
+                self.assertIn("--network", argv)
+                self.assertEqual(argv[argv.index("--network") + 1], "host")
+                self.assertLess(argv.index("--network"), argv.index(self.uploader(url).image),
+                                "docker flags must precede the image name")
 
-    def test_a_routable_host_passes(self):
-        self.assertIsNone(
-            self.uploader("http://192.168.68.52:2283/api").unreachable_from_container())
-        self.assertIsNone(
-            self.uploader("http://immich.lan:2283/api").unreachable_from_container())
+    def test_a_routable_host_is_left_on_the_default_bridge(self):
+        argv = self.uploader("http://192.168.68.52:2283/api").build_argv(Path("/batch"))
+        self.assertNotIn("--network", argv)
 
-    def test_upload_dir_raises_instead_of_spawning_docker(self):
-        up = self.uploader("http://127.0.0.1:2283/api")
+    def test_an_explicit_network_is_never_overridden(self):
+        up = self.uploader("http://127.0.0.1:2283/api",
+                           docker_args=["--network", "immich_default"])
+        self.assertEqual(up.configured_network(), "immich_default")
+        self.assertNotIn("host", up.docker_run_args())
 
-        def explode(*a, **k):
-            raise AssertionError("docker must not be spawned")
+    def test_equals_spelling_is_understood(self):
+        up = self.uploader("http://127.0.0.1:2283/api",
+                           docker_args=["--network=immich_default"])
+        self.assertEqual(up.configured_network(), "immich_default")
 
-        up.build_argv = explode
-        with self.assertRaises(immich.ImmichError) as ctx:
-            up.upload_dir(Path("/tmp/does-not-matter"))
-        self.assertIn("container itself", str(ctx.exception))
+    def test_docker_args_are_passed_through(self):
+        argv = self.uploader("http://vm:2283/api",
+                             docker_args=["--dns", "10.0.0.1"]).build_argv(Path("/batch"))
+        self.assertEqual(argv[:5], ["docker", "run", "--rm", "--dns", "10.0.0.1"])
+
+    def test_only_an_unfixable_combination_still_raises(self):
+        """Loopback plus a hand-pinned foreign network cannot be saved."""
+        up = self.uploader("http://127.0.0.1:2283/api",
+                           docker_args=["--network", "immich_default"])
+        trap = up.unreachable_from_container()
+        self.assertIsNotNone(trap)
+        self.assertIn("immich_default", trap)
+        with self.assertRaises(immich.ImmichConfigError):
+            up.upload_dir(Path("/batch"))
+
+    def test_the_shipped_default_needs_no_edit(self):
+        self.assertIsNone(immich.ImmichCliUploader(load(None)).unreachable_from_container())
 
 
 class TestErrorCondensing(unittest.TestCase):

@@ -84,10 +84,9 @@ proton:
 
 immich:
   # MUST include the /api suffix.
-  # 127.0.0.1 is only correct for upload_mode: api, which uploads from this
-  # process. The immich-cli container has its own network namespace, so with
-  # upload_mode: cli this must be the host's LAN IP or a resolvable name --
-  # a loopback address there means the container itself (ECONNREFUSED).
+  # Loopback is fine in both upload modes: "api" uploads from this process,
+  # and for "cli" the container is given --network host so 127.0.0.1 still
+  # means this machine. Point it elsewhere for an Immich on another host.
   url: http://127.0.0.1:2283/api
   # Leave empty and set IMMICH_API_KEY in the environment instead.
   api_key: ""
@@ -100,6 +99,10 @@ immich:
   # folder. "none" -> no album. Decide before the first real push.
   album_strategy: flat
   album_name: Proton Import
+  # docker flags for upload_mode: cli, inserted after `docker run --rm`.
+  # Empty is right for almost everyone: a loopback url gets --network host
+  # added for you. Set --network explicitly here to override that.
+  docker_args: []
   batch_mode: hardlink
   # Ask Immich whether it already holds a file -- matching Proton's reported
   # sha1 against Immich's own dedupe index -- and skip downloading it if so.

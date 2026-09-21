@@ -88,7 +88,7 @@ src/immich.py           REST client + docker immich-cli uploader
 src/pipeline.py         phase orchestration (backends injected, so testable)
 src/report.py           status.json + MQTT discovery
 systemd/                service + nightly timer
-tests/                  182 tests, no network, no Docker
+tests/                  186 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -102,7 +102,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-182 tests, no network and no Docker. The Proton backend and Immich server are
+186 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap` runs end to end,
 including the failure paths: truncated transfers, checksum mismatches, sessions
 expiring mid-run, killed runs resuming, quarantine after repeated failures.

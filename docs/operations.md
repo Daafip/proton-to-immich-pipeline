@@ -65,7 +65,7 @@ Worth a look before the first real run:
 | `reap.keep_days` | How long verified originals linger in staging. Starts at 7; set to 0 once you trust it. |
 | `limits.max_files` / `max_bytes` | Per-run caps. Staging shares the SSD with Immich. |
 | `staging.min_free_gb` | Hard floor; downloads abort below it. |
-| `immich.upload_mode` | `cli` runs the immich-cli container; `api` uploads over REST with no Docker. `cli` also needs `immich.url` to be routable *from a container* — no loopback — and the service account in the `docker` group. |
+| `immich.upload_mode` | `cli` runs the immich-cli container (needs the service account in the `docker` group); `api` uploads over REST with no Docker. A loopback `immich.url` works in both: the container is run with `--network host`. |
 | `immich.precheck_claimed_digests` | See [below](#skipping-what-immich-already-has). |
 
 Finding the right `roots` is covered in
@@ -263,7 +263,7 @@ sqlite3 /mnt/immich/staging/.state/state.sqlite \
 | `cannot create /mnt/immich/...` | The SSD is not mounted. The unit has `RequiresMountsFor` for exactly this. |
 | `download.aborted_low_space` | Free space below `staging.min_free_gb`. Reap, or lower the caps. |
 | `immich.url_missing_api_suffix` | Add `/api`. It is appended automatically, but fix the config. |
-| `ECONNREFUSED 127.0.0.1:2283` from immich-cli | Loopback inside the container is the container. Set `immich.url` to the host's LAN IP, or switch to `upload_mode: api`. |
+| `ECONNREFUSED 127.0.0.1:2283` from immich-cli | A loopback URL now gets `--network host` automatically; you see this only if `immich.docker_args` pins a different `--network`. |
 | `download.digest_mismatch` | The downloaded bytes differ from Proton's claimed sha1. Unverified claims make this possible; the local digest is used regardless. |
 | Rows stuck in `quarantined` | `sync.py requeue` after fixing the cause; `--now` also ignores backoff. |
 | USB resets under load | ASMedia bridge. Boot with `usb-storage.quirks=174c:225c:u` to disable UAS. |

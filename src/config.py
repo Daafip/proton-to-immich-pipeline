@@ -90,6 +90,10 @@ DEFAULTS: dict[str, Any] = {
         "album_strategy": "flat",
         "album_name": "Proton Import",
         "extra_args": [],
+        # docker-level flags, inserted after `docker run --rm`. Left empty,
+        # a loopback immich.url gets `--network host` added automatically so
+        # the container can reach Immich on the host.
+        "docker_args": [],
         "timeout_sec": 3600,
         "http_timeout_sec": 120,
         # Hardlink each batch into its own dir so a push only touches the rows
