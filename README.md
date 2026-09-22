@@ -164,7 +164,7 @@ web/index.html          the whole frontend: one file, no build step
 Dockerfile              one image, two roles: agent and serve
 docker-compose.yml      one container per pipeline + one for the UI
 systemd/                templated per-account units, nightly timers, web service
-tests/                  426 tests, no network, no Docker
+tests/                  443 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -178,7 +178,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-426 tests, no network and no Docker. The Proton backend and Immich server are
+443 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap → reconcile` runs
 end to end, including the failure paths: truncated transfers, checksum
 mismatches, sessions expiring mid-run, killed runs resuming, quarantine after
@@ -204,6 +204,9 @@ it than anything else:
   database, to drop an account nobody mentioned.
 - **`tests/test_agent.py`** — the container loop: an agent runs its own jobs
   from its own database and nobody else's.
+- **`tests/test_report.py`** — the MQTT publish path, with both paho-mqtt
+  generations and `mosquitto_pub` injected rather than installed, so it runs
+  offline with neither package present.
 - **`tests/test_throughput.py`** — batched downloads and the circuit breaker:
   that a batch never spans two folders or repeats a filename, that a batch
   which dies halfway keeps what landed, that one bad file does not charge an

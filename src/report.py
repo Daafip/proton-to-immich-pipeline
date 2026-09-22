@@ -213,7 +213,14 @@ class MqttPublisher:
             import paho.mqtt.client as mqtt  # type: ignore
         except ImportError:
             return False
-        client = mqtt.Client()
+
+        # paho-mqtt 2.0 made `callback_api_version` a required first argument;
+        # 1.x has no such parameter. Calling Client() bare on 2.x raises
+        # "Unsupported callback API version", which used to take the whole
+        # publish down with it -- including the mosquitto_pub fallback.
+        api = getattr(mqtt, "CallbackAPIVersion", None)
+        client = mqtt.Client(api.VERSION1) if api is not None else mqtt.Client()
+
         if self.username:
             client.username_pw_set(self.username, self.password)
         client.connect(self.host, self.port, keepalive=30)
@@ -223,40 +230,74 @@ class MqttPublisher:
                 info = client.publish(topic, payload, retain=self.retain, qos=1)
                 info.wait_for_publish(timeout=10)
         finally:
-            client.loop_stop()
-            client.disconnect()
+            # disconnect *then* stop: the DISCONNECT packet is written by the
+            # network loop, so stopping first leaves the broker seeing an
+            # unclean disconnect.
+            try:
+                client.disconnect()
+            finally:
+                client.loop_stop()
         return True
 
     def _publish_mosquitto(self, messages: list[tuple[str, str]]) -> bool:
-        if not shutil.which(self.binary):
+        binary = shutil.which(self.binary)
+        if not binary:
             return False
-        for topic, payload in messages:
-            argv = [self.binary, "-h", self.host, "-p", str(self.port),
+        for index, (topic, payload) in enumerate(messages, 1):
+            argv = [binary, "-h", self.host, "-p", str(self.port),
                     "-t", topic, "-m", payload]
             if self.retain:
                 argv.append("-r")
             if self.username:
+                # NOTE: mosquitto_pub takes the password as an argument, so it
+                # is visible in `ps` to anyone on this host for the moment the
+                # call runs. Prefer paho-mqtt, or a broker listener that does
+                # not need a password from localhost.
                 argv += ["-u", self.username, "-P", self.password]
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
             if proc.returncode != 0:
-                raise RuntimeError(proc.stderr.strip()[:200])
+                raise RuntimeError(
+                    f"message {index}/{len(messages)} to {topic!r}: "
+                    f"exit {proc.returncode}: {proc.stderr.strip()[:200]}")
         return True
 
     def publish(self, status: dict[str, Any], with_discovery: bool = True) -> bool:
+        """Send the state topic, and the discovery payloads with it.
+
+        The two transports are tried independently. They used to share one
+        `try`, so anything paho raised -- a broker that was down, or simply
+        paho 2.x rejecting the old constructor -- skipped the mosquitto_pub
+        fallback entirely and reported one warning. Publishing then failed on
+        a box where `mosquitto_pub` worked perfectly well by hand.
+        """
         messages: list[tuple[str, str]] = []
         if with_discovery:
             messages += [(topic, json.dumps(payload))
                          for topic, payload in discovery_payloads(self.cfg)]
-        messages.append((mqtt_identity(self.cfg)[2], json.dumps(status)))
-        try:
-            if self._publish_paho(messages):
-                return True
-            if self._publish_mosquitto(messages):
-                return True
-        except Exception as exc:  # noqa: BLE001 - reporting must never fail a run
-            log.warn("mqtt.publish_failed", detail=str(exc)[:200])
-            return False
-        log.warn("mqtt.no_client", detail="install paho-mqtt or mosquitto-clients")
+        state_topic = mqtt_identity(self.cfg)[2]
+        messages.append((state_topic, json.dumps(status)))
+
+        attempts: list[str] = []
+        for name, sender in (("paho-mqtt", self._publish_paho),
+                             ("mosquitto_pub", self._publish_mosquitto)):
+            try:
+                if sender(messages):
+                    # Success needs a log line too: without one there is no
+                    # way to tell "published" from "quietly did nothing".
+                    log.info("mqtt.published", transport=name,
+                             messages=len(messages), host=self.host,
+                             port=self.port, topic=state_topic,
+                             retain=self.retain)
+                    return True
+                attempts.append(f"{name}: not installed")
+            except Exception as exc:  # noqa: BLE001 - reporting never fails a run
+                attempts.append(f"{name}: {log.condense(str(exc), 200)}")
+                log.warn("mqtt.transport_failed", transport=name,
+                         host=self.host, port=self.port,
+                         detail=log.condense(str(exc), 300))
+        log.warn("mqtt.publish_failed", host=self.host, port=self.port,
+                 detail=" | ".join(attempts) or
+                 "no client: install paho-mqtt or mosquitto-clients")
         return False
 
 
@@ -269,4 +310,9 @@ def publish(conn: sqlite3.Connection, cfg, auth_ok: bool | None = None,
         log.debug("report.status_written", path=str(path))
     if cfg.get("mqtt.enabled"):
         MqttPublisher(cfg).publish(status)
+    else:
+        # Worth a line: "nothing arrived at the broker" and "MQTT is off" look
+        # identical from the outside, and this is the more common cause.
+        log.debug("mqtt.disabled",
+                  detail="mqtt.enabled is false; set it to publish")
     return status

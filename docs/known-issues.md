@@ -113,10 +113,21 @@ in [operations.md](operations.md#verified-on).
   green push does not prove it worked — grep the run for that event.
 - **The REST upload path** (`immich.upload_mode: api`) and its multipart body.
 - **The rclone fallback backend**, entirely.
-- **MQTT discovery payloads.** Built to the Home Assistant spec and unit-tested
-  for shape, but never sent to a broker. Neither `paho-mqtt` nor
-  `mosquitto_pub` is installed by default — without one, reporting quietly
-  degrades to `status.json` only.
+- **MQTT against a real broker.** The payloads are built to the Home Assistant
+  spec and the publish path is now properly tested — both paho-mqtt 1.x and
+  2.x constructors, the `mosquitto_pub` fallback, retain/QoS on the state
+  topic, and the failure logging — but all against injected clients, never a
+  live broker. Neither client is installed by default on bare metal (the
+  container image ships `paho-mqtt`); without one, reporting degrades to
+  `status.json` only and says so (`mqtt.publish_failed`).
+
+  Three bugs lived here until 2026-09-22, all silent: paho-mqtt 2.x could not
+  be constructed at all (it made `callback_api_version` required), its failure
+  took the `mosquitto_pub` fallback down with it because both shared one
+  `try`, and nothing was logged on success — so a broker receiving nothing
+  looked exactly like one receiving everything. `sync.py status --probe` also
+  wrote `status.json` without publishing, which made it useless for testing a
+  broker.
 
 ## 4. Operational assumptions
 

@@ -288,10 +288,13 @@ def _status_for(cfg, conn, args) -> dict:
         except ImmichError:
             immich_ok = False
 
-    status = report.build_status(conn, cfg, auth_ok=auth_ok, immich_ok=immich_ok)
     if args.probe:
-        report.write_status(cfg.status_path, status)
-    return status
+        # --probe is the "refresh everything downstream" command: it checks
+        # the services, rewrites status.json *and* publishes to MQTT. It used
+        # to write the file and stop, which made it useless for testing a
+        # broker -- the only thing that published was a full `run`.
+        return report.publish(conn, cfg, auth_ok=auth_ok, immich_ok=immich_ok)
+    return report.build_status(conn, cfg, auth_ok=auth_ok, immich_ok=immich_ok)
 
 
 def _status_exit(status: dict) -> int:

@@ -1101,15 +1101,49 @@ success, plus two `problem` binary sensors:
   `report.stale_success_hours` (48 by default).
 
 `mqtt.host` defaults to `127.0.0.1`, which is the VM itself — point it at the
-broker (the Home Assistant host, if you run the Mosquitto add-on) and prove it
-is reachable before trusting it, because a broken publish is only a warning:
+broker (the Home Assistant host, if you run the Mosquitto add-on).
+
+### Testing it
 
 ```bash
-mosquitto_pub -d -h <broker> -p 1883 -u USER -P PASS -t proton_immich_sync/test -m hello
+python3 sync.py status --probe -v
 ```
 
-Publishing happens at the end of any non-dry-run phase, not from
-`sync.py status`. None of this has been tested against a real broker yet.
+`--probe` checks Proton and Immich, rewrites `status.json` **and publishes to
+MQTT** — it is the one-shot way to test a broker without waiting for a
+nightly run. Publishing otherwise happens at the end of any non-dry-run phase.
+
+The journal tells you what happened. One of these appears every time:
+
+| Event | Means |
+|---|---|
+| `mqtt.published` | Sent. Names the transport (`paho-mqtt` or `mosquitto_pub`), the message count and the topic. |
+| `mqtt.transport_failed` | That transport failed; the other one is tried next. |
+| `mqtt.publish_failed` | Both failed, or neither is installed. `detail` says which and why. |
+| `mqtt.disabled` | `mqtt.enabled` is false. Only shown with `-v`. |
+
+If nothing publishes, work down this list:
+
+1. **`mqtt.enabled: true`?** Run with `-v` and look for `mqtt.disabled`. This
+   is the commonest answer.
+2. **Is a client installed *for the Python running the pipeline*?**
+   `apt install mosquitto-clients` or `pip install paho-mqtt` — and under
+   systemd that means the interpreter named in `ExecStart`, which is not
+   necessarily the one on your `$PATH`. The container image ships
+   `paho-mqtt` already.
+3. **Is the broker reachable from the service account, not just from your
+   shell?** `sudo -u protonsync mosquitto_pub -d -h <broker> -p 1883 -t test -m hi`
+4. **Watch the other end** while you run `status --probe`:
+   `mosquitto_sub -h <broker> -v -t 'proton_immich_sync/#' -t 'homeassistant/#'`
+
+Both transports are tried independently, so a broken `paho-mqtt` no longer
+prevents the `mosquitto_pub` fallback from running — that bug made publishing
+fail on hosts where `mosquitto_pub` worked perfectly by hand.
+
+**paho-mqtt 2.x** changed its constructor: `Client()` now requires a
+`callback_api_version`. Both 1.x and 2.x are handled.
+
+Still untested against a real broker.
 
 Without MQTT, point a `command_line` sensor at `sync.py status --json`.
 
@@ -1186,6 +1220,10 @@ everything, restore the relevant file, and downgrade the code.
 | `Unknown option '-c'` on every download | A config pinned to the old alias. 0.8.0 wants `--conflict-strategy skip`; fix `proton.cmd.download` in `config.yaml`, then `sync.py requeue`. |
 | `cannot create /mnt/immich/...` | The SSD is not mounted. The unit has `RequiresMountsFor` for exactly this. |
 | `download.aborted_low_space` | Free space below `staging.min_free_gb`. Reap, or lower the caps. |
+| `mqtt.publish_failed` | Both transports failed or neither is installed — `detail` says which. `sync.py status --probe -v` reproduces it on demand. |
+| `mqtt.transport_failed`, then `mqtt.published` | Normal: the first transport was unavailable and the second worked. |
+| Nothing at all about MQTT in the journal | `mqtt.enabled` is false. `-v` shows `mqtt.disabled`. |
+| `Unsupported callback API version` | paho-mqtt 2.x with an older build of this pipeline. Fixed — both 1.x and 2.x are handled now. |
 | `circuit.tripped` | Too many consecutive failures — usually Proton or Immich being down, not your files. The pass stopped on purpose; rows it never reached kept their attempts. Fix the cause and re-run. |
 | `download.batch_failed_retrying_singly` | One file in a batch failed, so the rest were retried individually. Normal and self-correcting; only worrying if it happens on every batch. |
 | Downloads suddenly much slower than expected | `proton.download_batch_size: 1` somewhere, or every batch failing and falling back to single calls — grep for `download.batch_failed_retrying_singly`. |

@@ -25,12 +25,15 @@ ARG PROTON_DRIVE_ARCH=linux-x64
 ARG PROTON_DRIVE_URL=https://proton.me/download/drive/cli/${PROTON_DRIVE_VERSION}/${PROTON_DRIVE_ARCH}/proton-drive
 
 # ca-certificates for TLS to Proton and Immich; curl only to fetch the binary.
-# PyYAML is the one optional dependency the project has, and it is what makes
-# an `accounts:` list readable -- in an image there is no reason to go without.
+#
+# PyYAML and paho-mqtt are the project's two optional dependencies. Both are
+# tiny and both are silently-degrading when absent -- no PyYAML means an
+# `accounts:` list will not parse, no MQTT client means Home Assistant gets
+# nothing -- so an image has no reason to go without either.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
- && pip install --no-cache-dir "PyYAML==6.0.2"
+ && pip install --no-cache-dir "PyYAML==6.0.2" "paho-mqtt==2.1.0"
 
 # chmod 755 explicitly: a download arrives 644 and exec then fails even for
 # root, which is the first-boot failure the bare-metal install warns about.
