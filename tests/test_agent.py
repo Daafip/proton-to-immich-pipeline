@@ -210,6 +210,42 @@ class TestTakeJob(AgentTest):
         self.assertEqual(job["state"], state.JOB_FAILED)
         self.assertIn("rejected", job["detail"])
 
+    def run_for_real(self, returncode, output):
+        """Exercise Agent.execute() itself, stubbing only the subprocess.
+
+        Stubbing `execute` would remove the very logging under test.
+        """
+        import types
+        from src import agent as agent_mod
+        from src import log
+        events = []
+        original_run, original_emit = agent_mod.subprocess.run, log._emit
+        agent_mod.subprocess.run = lambda argv, **kw: types.SimpleNamespace(
+            returncode=returncode, stdout=output, stderr="")
+        log._emit = lambda level, event, fields: events.append(
+            (level, event, fields))
+        try:
+            Agent(self.accounts["david"]).execute(["true"])
+        finally:
+            agent_mod.subprocess.run = original_run
+            log._emit = original_emit
+        return [(lvl, f) for lvl, ev, f in events if ev == "agent.done"]
+
+    def test_a_failing_run_logs_why_not_just_the_exit_code(self):
+        """`agent.done exit_code=1` with no reason is useless: the detail used
+        to go only into the jobs table, and the logs are where people look."""
+        done = self.run_for_real(1, "pull.failed: no such root /Photos")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0][0], "warn", "a non-zero exit is not info")
+        self.assertIn("no such root", done[0][1]["detail"])
+
+    def test_a_clean_run_stays_quiet(self):
+        done = self.run_for_real(0, "lots of routine output")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0][0], "info")
+        self.assertNotIn("detail", done[0][1],
+                         "do not dump a successful run's output every night")
+
     def test_a_failing_run_is_recorded_not_swallowed(self):
         state.create_job(self.conns["david"], "david", "sync")
         agent = self.agent()

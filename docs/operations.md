@@ -142,6 +142,77 @@ the host — the containers do not run as root.
 device. There is no loopback callback, so nothing needs forwarding — see
 [Signing in](#signing-in) for what that flow actually does.
 
+### Where the secrets live
+
+Three different things are secret, and they are kept in three different ways.
+That is the bit that trips people up, so:
+
+| | What it is | Where it lives | How it gets in |
+|---|---|---|---|
+| **Immich API key** | one per person | a plain file, `secrets/<account>.key` on the host | bind-mounted read-only at `/secrets`; the config points at it |
+| **Proton session** | one per person | `<staging>/<account>/.proton/` | written by `login`, never by you |
+| **Web password** | one, shared | an scrypt *hash* in `.env` | `PIS_WEB_PASSWORD_HASH` env var |
+
+These are **not** Docker "secrets" in the Swarm sense — that needs a swarm.
+They are ordinary files with ordinary permissions, which is all a single-host
+setup needs.
+
+#### The Immich key, step by step
+
+```
+  HOST                              CONTAINER "mirjam"
+  /mnt/immich/pis/secrets/
+      default.key   ──┐
+      mirjam.key    ──┼── bind mount, :ro ──►  /secrets/
+                      │                            default.key
+                      │                            mirjam.key
+                      │                                 ▲
+  config.yaml         │                                 │
+    immich:           │                                 │
+      api_key_file: /secrets/{account}.key  ────────────┘
+                                   │
+                    PIS_ACCOUNT=mirjam resolves {account}
+                        → reads /secrets/mirjam.key
+```
+
+1. You write each person's key into its own file on the host. One line, no
+   newline needed, no quoting, no escaping:
+
+   ```bash
+   printf '%s' 'THE-KEY' > /mnt/immich/pis/secrets/mirjam.key
+   chmod 600 /mnt/immich/pis/secrets/mirjam.key
+   ```
+
+2. `docker-compose.yml` mounts that whole directory **read-only** into every
+   pipeline container, at `/secrets`.
+
+3. `config.yaml` names the file with the account token —
+   `api_key_file: /secrets/{account}.key` — written once for everyone.
+
+4. Each container sets `PIS_ACCOUNT`, which is what `{account}` resolves to.
+   The `mirjam` container reads `/secrets/mirjam.key`; the `default`
+   container reads `/secrets/default.key`.
+
+5. The key is read from that file **when it is needed**, never copied into
+   the config in memory, so it cannot be logged with it.
+
+The **UI container gets no `/secrets` mount at all** — it never talks to
+Immich, so it has no business holding anyone's key.
+
+#### Why files rather than environment variables
+
+- `.env` then contains nothing named after a person, so adding a fifth is one
+  line and no new variables (see [Adding a person](#adding-a-person)).
+- An env var is visible to anything that can read `/proc/<pid>/environ` and
+  shows up in `docker inspect`. A file has an owner and a mode.
+- Compose interpolates `.env`, so a value containing `$` is silently mangled —
+  the same trap that bites the password hash.
+
+The trade, stated plainly: every pipeline container can read every key in that
+directory, because the whole directory is mounted. They all run as the same
+uid on the same host anyway. `docker-compose.yml` has a commented alternative
+that mounts one key per service if you want the stricter version.
+
 ### Day to day
 
 Every CLI command in the rest of this page works in a container; put
@@ -1355,6 +1426,8 @@ everything, restore the relevant file, and downgrade the code.
 | `mqtt.transport_failed`, then `mqtt.published` | Normal: the first transport was unavailable and the second worked. |
 | Nothing at all about MQTT in the journal | `mqtt.enabled` is false. `-v` shows `mqtt.disabled`. |
 | `Unsupported callback API version` | paho-mqtt 2.x with an older build of this pipeline. Fixed — both 1.x and 2.x are handled now. |
+| `agent.done` with a non-zero `exit_code` | The `detail` field on that same line carries the run's output — that is where the reason is. `exit 1` = some or all assets failed; `exit 2` = Proton session gone, run `login` again; `exit 3` = a run was already in progress; `exit 4` = config fault. |
+| "It runs, but nothing happens" | Run it in the foreground and watch: `docker compose run --rm <account> run`. Most often the Proton roots in `config.yaml` do not match the real folder names — `docker compose run --rm <account> pull --dry-run` reports zero discovered, and `proton-drive filesystem list /my-files` shows what is actually there. |
 | `circuit.tripped` | Too many consecutive failures — usually Proton or Immich being down, not your files. The pass stopped on purpose; rows it never reached kept their attempts. Fix the cause and re-run. |
 | `download.batch_failed_retrying_singly` | One file in a batch failed, so the rest were retried individually. Normal and self-correcting; only worrying if it happens on every batch. |
 | Downloads suddenly much slower than expected | `proton.download_batch_size: 1` somewhere, or every batch failing and falling back to single calls — grep for `download.batch_failed_retrying_singly`. |

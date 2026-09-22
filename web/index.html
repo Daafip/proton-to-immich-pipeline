@@ -378,11 +378,18 @@ function renderCards() {
       kids.push(el("div", { class: "note bad", text:
         `${s.delete_failed} row(s) could not be trashed in Proton — see the table below.` }));
     }
+    // Any non-zero exit is worth showing, not just `failed`. Exit 1 is
+    // "partial" -- a few files failed out of many, or every single one did,
+    // and the exit code cannot tell those apart. It is recorded as `done`,
+    // so keying off the state alone hid the reason completely.
     const job = s.last_job;
-    if (!busy && job && job.state === "failed") {
+    if (!busy && job && job.exit_code !== null && job.exit_code !== 0) {
+      const fatal = job.state === "failed";
       kids.push(el("div", { class: "note bad" }, [
-        el("strong", { text: `last ${job.type} job failed. ` }),
-        el("span", { class: "mono", text: (job.detail || "").slice(0, 400) }),
+        el("strong", { text: fatal
+          ? `last ${job.type} job failed (exit ${job.exit_code}). `
+          : `last ${job.type} job finished with problems (exit ${job.exit_code}). ` }),
+        el("span", { class: "mono", text: (job.detail || "").slice(0, 600) }),
       ]));
     }
     host.appendChild(el("section", { class: "panel" }, kids));

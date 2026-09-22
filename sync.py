@@ -363,27 +363,27 @@ def permission_help(directory: Path, problem: str) -> str:
     inside = log.in_container()
     if inside and str(directory).startswith(HOST_LOOKING):
         return head + (
-            f"\n"
-            f"That looks like a HOST path, and this is a container -- so the\n"
-            f"mounted config.yaml is almost certainly the bare-metal one.\n"
-            f"The container config uses /state, /staging and /secrets:\n"
-            f"\n"
+            "\n"
+            "That looks like a HOST path, and this is a container -- so the\n"
+            "mounted config.yaml is almost certainly the bare-metal one.\n"
+            "The container config uses /state, /staging and /secrets:\n"
+            "\n"
             "    cp config.docker.yaml config.yaml\n"
-            f"\n"
-            f"Chowning anything will not fix this one.")
+            "\n"
+            "Chowning anything will not fix this one.")
     if inside:
         return head + (
-            f"\n"
-            f"Inside a container this is almost always a bind mount whose host\n"
-            f"directory did not exist, so the daemon created it as root. Fix\n"
-            f"it on the HOST, at the path behind that mount, using the uid in\n"
-            f"PIS_UID -- NOT `$(id -u)`, which is 0 if you are already root:\n"
-            f"\n"
+            "\n"
+            "Inside a container this is almost always a bind mount whose host\n"
+            "directory did not exist, so the daemon created it as root. Fix\n"
+            "it on the HOST, at the path behind that mount, using the uid in\n"
+            "PIS_UID -- NOT `$(id -u)`, which is 0 if you are already root:\n"
+            "\n"
             f"    sudo chown -R {os.getuid()}:{os.getgid()} /path/behind/the/mount")
     return head + (
-        f"\n"
-        f"The account running this must own it:\n"
-        f"\n"
+        "\n"
+        "The account running this must own it:\n"
+        "\n"
         f"    sudo chown -R $(whoami) {existing}")
 
 

@@ -151,8 +151,17 @@ class Agent:
             code, detail = 4, f"{argv[0]} not found: {exc}"
         except subprocess.TimeoutExpired:
             code, detail = 1, f"timed out after {self.timeout}s"
-        log.info("agent.done", account=self.account, exit_code=code,
-                 seconds=round(time.monotonic() - started, 1))
+        seconds = round(time.monotonic() - started, 1)
+        if code == 0:
+            log.info("agent.done", account=self.account, exit_code=code,
+                     seconds=seconds)
+        else:
+            # The reason used to go only into the jobs table, so the logs --
+            # which is where anyone actually looks -- showed `exit_code: 1`
+            # and nothing else. A run in which every file failed was
+            # indistinguishable from a clean one.
+            log.warn("agent.done", account=self.account, exit_code=code,
+                     seconds=seconds, detail=log.condense(detail, 1200))
         return code, detail
 
     def take_job(self, conn) -> bool:
