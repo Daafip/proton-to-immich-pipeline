@@ -67,9 +67,15 @@ against live services — see
 Every command works on one account (`--account`, or `$PIS_ACCOUNT`, implicit
 when there is one). `status` and `serve` span all of them.
 
-**Two people = two independent pipelines** — separate Proton account, staging
+**Each person is an independent pipeline** — separate Proton account, staging
 tree, database and Immich API key. They share the VM and, normally, one Immich
 instance with a user each; separate instances work too.
+
+Adding one is a single config line plus a key file, whether they are the
+second or the fifth: the per-account paths are written once with `{account}`
+and resolved per name, so nothing is named after anyone and the things that
+must differ cannot be copy-pasted wrong. See
+[Adding a person](docs/operations.md#adding-a-person).
 [Docker](docs/operations.md#install-with-docker) is the easy way to run that: one container
 per pipeline plus one for the UI.
 
@@ -164,7 +170,7 @@ web/index.html          the whole frontend: one file, no build step
 Dockerfile              one image, two roles: agent and serve
 docker-compose.yml      one container per pipeline + one for the UI
 systemd/                templated per-account units, nightly timers, web service
-tests/                  443 tests, no network, no Docker
+tests/                  456 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -178,7 +184,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-443 tests, no network and no Docker. The Proton backend and Immich server are
+456 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap → reconcile` runs
 end to end, including the failure paths: truncated transfers, checksum
 mismatches, sessions expiring mid-run, killed runs resuming, quarantine after

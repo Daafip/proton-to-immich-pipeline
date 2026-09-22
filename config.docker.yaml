@@ -8,10 +8,19 @@
 #
 # NEEDS PyYAML for the accounts list -- the image already has it.
 
+# `{account}` is replaced with each pipeline's own name when its settings are
+# resolved. Writing the per-account paths once, here, is what keeps a fifth
+# person to a single line further down -- and makes it impossible for two of
+# them to share a staging directory or a key by copy-paste.
 state:
   # The shared volume. One <account>.sqlite per pipeline lives here, and this
-  # is the only directory the UI container needs.
+  # is the only directory the UI container needs. NOT templated: the UI reads
+  # them all from one place.
   dir: /state
+
+staging:
+  root: /staging/{account}
+  min_free_gb: 20
 
 proton:
   backend: proton-cli
@@ -24,6 +33,10 @@ proton:
   download_batch_size: 25
 
 immich:
+  # Resolved per account: /secrets/default.key, /secrets/mirjam.key, ...
+  # One key per person, issued by that person's own Immich user -- the key is
+  # what decides whose library an upload lands in.
+  api_key_file: /secrets/{account}.key
   # upload_mode: api, not cli. The "cli" mode shells out to `docker run
   # immich-cli`, which inside a container needs the docker socket -- a
   # root-equivalent mount for an upload. The REST path needs nothing.
@@ -31,16 +44,9 @@ immich:
   # Note this is the less-travelled route: see docs/known-issues.md item 3.
   upload_mode: api
   album_strategy: flat
-  # immich.url and immich.api_key come from the environment, per container
-  # (IMMICH_INSTANCE_URL / IMMICH_API_KEY in docker-compose.yml).
-  #
-  # Normally one Immich instance shared by both, with a separate USER and so a
-  # separate API key per person -- the key is what decides whose library an
-  # upload lands in. Two separate instances work too: set DAVID_IMMICH_URL /
-  # MIRJAM_IMMICH_URL in .env.
-  #
-  # One container is one account, so there is no shared environment for a key
-  # to leak through.
+  # immich.url comes from IMMICH_INSTANCE_URL in docker-compose.yml -- one
+  # instance shared by everyone, overridable per service for someone on a
+  # different one.
 
 limits:
   max_files: 500
@@ -84,16 +90,31 @@ web:
 # A fresh install can call it anything. Renaming an existing one is a real
 # migration -- see docs/operations.md, "Going from one account to two".
 accounts:
+  # One line per person. Everything above that mentions `{account}` is
+  # resolved with this name, so nothing here has to repeat a path:
+  #
+  #   database   /state/<name>.sqlite
+  #   staging    /staging/<name>        (and .proton inside it)
+  #   key file   /secrets/<name>.key
+  #   lock       sync-<name>.lock       (plain sync.lock for "default")
+  #   status     status-<name>.json     (plain status.json for "default")
+  #   MQTT       proton_immich_sync/<name>/state
+  #
+  # A fifth person is a fifth entry. Add anything that genuinely differs --
+  # a different Immich, different roots, a different delete_action -- under
+  # their own name; leave it out and they inherit the shared settings.
   - name: default
-    staging_dir: /staging/default
     proton_roots:
       - /my-files/Photos
-    album_name: "Proton Import"
     delete_action: execute
 
   - name: mirjam
-    staging_dir: /staging/mirjam
     proton_roots:
       - /my-files/Camera
-    album_name: "Proton Import"
     delete_action: mark_only
+
+  # - name: alice
+  #   proton_roots: ["/my-files/Photos"]
+  #
+  # - name: bob
+  #   immich_url: http://other-immich:2283/api    # a different instance

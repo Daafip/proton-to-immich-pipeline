@@ -72,19 +72,28 @@ schedule and the job queue. No cron container, no host timer.
 ### Setting it up
 
 ```bash
-cp .env.example .env               # uid/gid, keys, paths, web password
-cp config.docker.yaml config.yaml  # accounts, roots, schedule
+cp .env.example .env               # uid/gid, paths, Immich URL, web password
+cp config.docker.yaml config.yaml  # the accounts, roots, schedule
 $EDITOR .env config.yaml
+
+# One key file per person, from that person's own Immich user.
+mkdir -p secrets && chmod 700 secrets
+printf '%s' 'THE-KEY' > secrets/default.key
+printf '%s' 'HER-KEY' > secrets/mirjam.key
+chmod 600 secrets/*.key
 
 docker compose build
 docker compose run --rm ui web-password    # prints the PIS_WEB_PASSWORD_HASH line
 
-docker compose run --rm david  login       # once per pipeline
-docker compose run --rm mirjam login
+docker compose run --rm default login      # once per pipeline
+docker compose run --rm mirjam  login
 
 docker compose up -d
 docker compose logs -f
 ```
+
+`.env` contains nothing named after a person — see
+[Adding a person](#adding-a-person).
 
 `PIS_UID`/`PIS_GID` must own the bind-mounted state and staging directories on
 the host — the containers do not run as root.
@@ -128,7 +137,8 @@ a `git pull` + `docker compose build` is the whole upgrade loop.
 | Four systemd units + `daemon-reload` | `docker compose up -d` |
 | A sudoers entry for force-sync | not needed — the UI only enqueues |
 | `IMMICH_API_KEY` leaking to every account | impossible: one container, one account, one key in *its* environment |
-| Remembering which key belongs to whom | the service name is the account name |
+| Remembering which key belongs to whom | the service name is the account name, and the key is `secrets/<name>.key` |
+| Inventing a variable per person | none: everything is derived from the account name |
 
 ### The upload mode
 
@@ -644,7 +654,65 @@ photos into the other's library, so three things must differ per account and
 
 `immich_url` deliberately is *not* on that list: sharing it is the normal
 case. Sharing a **key** is refused —
-`accounts 'david' and 'mirjam' share one Immich API key`.
+`accounts 'default' and 'mirjam' share one Immich API key`.
+
+### Adding a person
+
+Those three things are derived from the account name rather than written out
+per person, so they cannot be copy-pasted wrong. Write them once in the shared
+part of the config, using `{account}`:
+
+```yaml
+state:
+  dir: /mnt/immich/staging/.state          # shared, never templated
+staging:
+  root: /mnt/immich/staging/{account}
+immich:
+  url: http://127.0.0.1:2283/api           # shared
+  api_key_file: /etc/proton-to-immich-pipeline/{account}.key
+
+accounts:
+  - name: default
+  - name: mirjam
+  - name: alice
+  - name: bob
+  - name: kid
+```
+
+Each account resolves the token with its own name:
+
+| | derived from the name |
+|---|---|
+| database | `<state.dir>/<name>.sqlite` |
+| staging | `/mnt/immich/staging/<name>`, with `.proton` inside it |
+| key file | `/etc/proton-to-immich-pipeline/<name>.key` |
+| lock | `sync-<name>.lock` — plain `sync.lock` for `default` |
+| status | `status-<name>.json` — plain `status.json` for `default` |
+| MQTT | `proton_immich_sync/<name>/state` |
+
+So adding someone is **one line plus a key file**, whether they are the second
+or the fifth. An entry can still override anything — a different Immich,
+different roots, a different `delete_action` — by naming it under that person.
+
+`state.dir` is deliberately *not* templated: every database lives in one
+directory so the UI finds them all with a single read-only mount.
+
+`{account}` is a literal substitution, not `str.format`, so the `{path}` and
+`{dest_dir}` templates in `proton.cmd` are left alone.
+
+**Under Docker** it is the same one line, plus a service block that names only
+the account:
+
+```yaml
+  alice:
+    <<: *pipeline
+    environment:
+      <<: *pipeline-env
+      PIS_ACCOUNT: alice
+```
+
+and `secrets/alice.key`. There are no `ALICE_*` variables to invent —
+`.env` holds nothing named after a person.
 
 ### One database per pipeline
 

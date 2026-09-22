@@ -108,6 +108,90 @@ class TestConfig(unittest.TestCase):
             del os.environ["IMMICH_API_KEY"]
 
 
+class TestAccountToken(unittest.TestCase):
+    """`{account}` in the shared config, so a fifth person is one line."""
+
+    def build(self, names, **shared):
+        data = copy.deepcopy(DEFAULTS)
+        data["immich"]["url"] = "http://vm:2283/api"
+        data["immich"]["api_key_file"] = "/secrets/{account}.key"
+        data["staging"]["root"] = "/staging/{account}"
+        for dotted, value in shared.items():
+            node = data
+            parts = dotted.replace("__", ".").split(".")
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value
+        data["accounts"] = [{"name": n} for n in names]
+        return Config(data)
+
+    def test_five_accounts_from_five_one_line_entries(self):
+        cfg = self.build(["default", "mirjam", "alice", "bob", "kid"])
+        self.assertEqual(cfg.validate(), [])
+        for account in cfg.accounts:
+            name = account.account_name
+            self.assertEqual(str(account.staging), f"/staging/{name}")
+            self.assertEqual(account.get("immich.api_key_file"),
+                             f"/secrets/{name}.key")
+            self.assertEqual(account.db_path.name, f"{name}.sqlite")
+
+    def test_the_three_things_that_must_differ_cannot_collide(self):
+        """Derived from the name, so copy-paste cannot make two people share
+        a staging directory or a key."""
+        cfg = self.build(["a", "b", "c", "d", "e"])
+        self.assertEqual(len({str(x.staging) for x in cfg.accounts}), 5)
+        self.assertEqual(len({str(x.proton_cache_dir) for x in cfg.accounts}), 5)
+        self.assertEqual(
+            len({x.get("immich.api_key_file") for x in cfg.accounts}), 5)
+
+    def test_the_token_works_in_the_single_account_shape_too(self):
+        data = copy.deepcopy(DEFAULTS)
+        data["immich"]["url"] = "http://vm:2283/api"
+        data["immich"]["api_key_file"] = "/secrets/{account}.key"
+        data["staging"]["root"] = "/staging/{account}"
+        data["account"] = {"name": "solo"}
+        account = Config(data).account(None)
+        self.assertEqual(str(account.staging), "/staging/solo")
+        self.assertEqual(account.get("immich.api_key_file"), "/secrets/solo.key")
+
+    def test_the_state_directory_is_never_templated(self):
+        """It is shared on purpose: the UI reads every database from one
+        place. A `{account}` there would split them."""
+        cfg = self.build(["a", "b"], state__dir="/state/{account}")
+        self.assertEqual(len({str(x.state_dir) for x in cfg.accounts}), 1)
+
+    def test_cmd_templates_are_left_alone(self):
+        """`proton.cmd` carries {path} and {dest_dir}; a str.format() pass
+        over the config would raise on them."""
+        cfg = self.build(["a"])
+        self.assertIn("{path}", cfg.accounts[0].get("proton.cmd.download"))
+        self.assertIn("{dest_dir}", cfg.accounts[0].get("proton.cmd.download"))
+
+    def test_the_token_expands_inside_lists_and_nested_maps(self):
+        cfg = self.build(["alice"], proton__roots=["/my-files/{account}",
+                                                   "/other/{account}/raw"])
+        self.assertEqual(cfg.accounts[0].get("proton.roots"),
+                         ["/my-files/alice", "/other/alice/raw"])
+
+    def test_an_account_entry_can_still_override_anything(self):
+        data = copy.deepcopy(DEFAULTS)
+        data["immich"]["url"] = "http://vm:2283/api"
+        data["immich"]["api_key_file"] = "/secrets/{account}.key"
+        data["staging"]["root"] = "/staging/{account}"
+        data["accounts"] = [
+            {"name": "alice"},
+            {"name": "bob", "immich_url": "http://other:2283/api",
+             "staging_dir": "/elsewhere/bob"},
+        ]
+        cfg = Config(data)
+        self.assertEqual(cfg.validate(), [])
+        self.assertEqual(cfg.account("bob").get("immich.url"),
+                         "http://other:2283/api")
+        self.assertEqual(str(cfg.account("bob").staging), "/elsewhere/bob")
+        self.assertEqual(cfg.account("alice").get("immich.url"),
+                         "http://vm:2283/api")
+
+
 class TestAccountsExample(unittest.TestCase):
     def test_the_shipped_two_account_example_is_valid(self):
         try:

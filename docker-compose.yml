@@ -1,30 +1,43 @@
 # One VM, one UI, one container per pipeline. One Immich instance with a user
-# per person -- or two instances, if that is what you have; only the URL
-# differs.
+# per person -- or several instances, if that is what you have.
 #
-#   cp .env.example .env            # keys and the web password go here
+#   cp .env.example .env               # shared settings only, nobody's name
 #   cp config.docker.yaml config.yaml
+#   mkdir -p secrets && chmod 700 secrets
+#   printf '%s' 'THE-KEY' > secrets/default.key    # one file per person
 #   docker compose build
-#   docker compose run --rm default login   # once per pipeline, prints a link
-#   docker compose run --rm mirjam login
+#   docker compose run --rm default login          # once per pipeline
 #   docker compose up -d
 #   docker compose logs -f
 #
-# Adding a third person is a third service plus a third entry in config.yaml.
-# Nothing else changes: not the schema, not the UI, not the other pipelines.
+# ── ADDING A PERSON ────────────────────────────────────────────────────────
+# Three things, none of which is a variable you have to invent:
 #
-# The first service is called "default" because that is what an existing
+#   1. config.yaml      - name: alice
+#   2. this file        alice:
+#                         <<: *pipeline
+#                         environment:
+#                           <<: *pipeline-env
+#                           PIS_ACCOUNT: alice
+#   3. secrets/alice.key
+#
+# Her database, staging subtree, Proton session, lock, status file and MQTT
+# topic all follow from the name, because config.yaml writes them once with
+# `{account}`. There are no ALICE_* entries anywhere, and the three things
+# that must differ per account cannot be copy-pasted wrong. It reads the same
+# for the fifth person as for the second.
+#
+# The first pipeline is called "default" because that is what an existing
 # single-account install already has in its database -- keeping the name means
 # no migration and no renamed Home Assistant entities. A fresh install can
-# call it anything; rename a service, its PIS_ACCOUNT, its .env variables and
-# the matching entry in config.yaml together.
+# call it anything.
 
 x-pipeline: &pipeline
   build:
     context: .
     args:
-      # Must own the bind-mounted staging and state directories on the host.
-      #   id -u protonsync
+      # Must own the bind-mounted state, staging and secrets directories.
+      #   id -u
       UID: ${PIS_UID:-1000}
       GID: ${PIS_GID:-1000}
   image: proton-to-immich-pipeline:latest
@@ -34,72 +47,91 @@ x-pipeline: &pipeline
   security_opt: [no-new-privileges:true]
   environment: &pipeline-env
     PIS_CONFIG: /config/config.yaml
+    # One Immich instance, shared. Someone on a different one overrides
+    # IMMICH_INSTANCE_URL in their own service block.
+    IMMICH_INSTANCE_URL: ${IMMICH_URL:-http://immich-server:2283/api}
     # Local time decides when agent.at fires.
     TZ: ${TZ:-Europe/Amsterdam}
+  volumes:
+    - ./config.yaml:/config/config.yaml:ro
+    - ${PIS_STATE_DIR:-./state}:/state
+    # The whole staging tree and the whole secrets directory, mounted once so
+    # a service block needs no paths of its own. Each pipeline only ever
+    # touches /staging/<its account> and reads /secrets/<its account>.key,
+    # because that is what `{account}` resolves to for it in config.yaml.
+    #
+    # The trade: a pipeline container *could* read another's key -- they all
+    # run as the same uid on the same host anyway. Mounting one path per
+    # service is stricter and costs two lines per person:
+    #
+    #   volumes:
+    #     - ./config.yaml:/config/config.yaml:ro
+    #     - ${PIS_STATE_DIR:-./state}:/state
+    #     - ./staging/alice:/staging/alice
+    #     - ./secrets/alice.key:/secrets/alice.key:ro
+    - ${PIS_STAGING_DIR:-./staging}:/staging
+    - ${PIS_SECRETS_DIR:-./secrets}:/secrets:ro
+  networks: [default, immich]
 
 services:
   # ─────────────────────────────────────────────────────────────────────────
   # The UI. Reads every pipeline's database and combines them; writes only
   # `jobs` rows, which each pipeline's own agent picks up. It never executes
-  # a sync itself, so it needs no docker socket, no sudo and no access to
-  # anyone's Proton session or staging tree.
+  # a sync, so it needs no docker socket and no sudo.
+  #
+  # It overrides `volumes` and `networks` rather than inheriting them: the UI
+  # holds no Proton session, no staging tree and no Immich key, and mounting
+  # /secrets into it would quietly undo that.
   # ─────────────────────────────────────────────────────────────────────────
   ui:
     <<: *pipeline
     command: ["serve"]
     environment:
       <<: *pipeline-env
-      # From `docker compose run --rm ui web-password`.
+      # `docker compose run --rm ui web-password` prints this line.
       PIS_WEB_PASSWORD_HASH: ${PIS_WEB_PASSWORD_HASH:?set this in .env - serve refuses a non-loopback bind without it}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${PIS_STATE_DIR:-./state}:/state
+    networks: [default]
     ports:
       # Bind to the LAN only once a password is set, which the line above
       # enforces. Put a reverse proxy in front of it for TLS.
       - "${PIS_WEB_PORT:-8080}:8080"
-    depends_on: [default, mirjam]
 
   # ─────────────────────────────────────────────────────────────────────────
-  # One pipeline per person. Each owns:
-  #   - its own <account>.sqlite in the shared state volume
-  #   - its own staging tree, so the reaper never touches anyone else's files
-  #   - its own Proton session, in .proton inside that staging tree
-  #   - its own Immich API KEY, issued by that person's own Immich user
-  #
-  # One Immich instance, two users. The key is what decides whose library an
-  # upload lands in, and it lives in this container's environment only -- so
-  # the shared-key mistake the bare-metal install has to warn about is not
-  # reachable here: there is no shared environment to leak it through.
-  #
-  # Two separate Immich instances work just as well: give each service its own
-  # DEFAULT_IMMICH_URL / MIRJAM_IMMICH_URL in .env.
+  # The pipelines. One block per person, identical but for the account name.
+  # Each owns its own database, staging subtree, Proton session and Immich
+  # API key -- the key is what decides whose library an upload lands in.
   # ─────────────────────────────────────────────────────────────────────────
   default:
     <<: *pipeline
     environment:
       <<: *pipeline-env
       PIS_ACCOUNT: default
-      IMMICH_INSTANCE_URL: ${DEFAULT_IMMICH_URL:-${IMMICH_URL:-http://immich-server:2283/api}}
-      IMMICH_API_KEY: ${DEFAULT_IMMICH_API_KEY:?set this in .env}
-    volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      - ${PIS_STATE_DIR:-./state}:/state
-      - ${DEFAULT_STAGING:-./staging/default}:/staging/default
-    networks: [default, immich]
 
   mirjam:
     <<: *pipeline
     environment:
       <<: *pipeline-env
       PIS_ACCOUNT: mirjam
-      IMMICH_INSTANCE_URL: ${MIRJAM_IMMICH_URL:-${IMMICH_URL:-http://immich-server:2283/api}}
-      IMMICH_API_KEY: ${MIRJAM_IMMICH_API_KEY:?set this in .env}
-    volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      - ${PIS_STATE_DIR:-./state}:/state
-      - ${MIRJAM_STAGING:-./staging/mirjam}:/staging/mirjam
-    networks: [default, immich]
+
+  # A third, and a fifth, look exactly like those:
+  #
+  # alice:
+  #   <<: *pipeline
+  #   environment:
+  #     <<: *pipeline-env
+  #     PIS_ACCOUNT: alice
+  #
+  # Someone on a different Immich adds one line:
+  #
+  # bob:
+  #   <<: *pipeline
+  #   environment:
+  #     <<: *pipeline-env
+  #     PIS_ACCOUNT: bob
+  #     IMMICH_INSTANCE_URL: http://other-immich:2283/api
 
 networks:
   default:
@@ -108,11 +140,8 @@ networks:
   # you find out at `up`, not at 03:15.
   #
   # Find it with:  docker network ls
-  # If Immich is reachable on the host instead, drop this, drop the
-  # `networks:` lines above, and point IMMICH_URL at the host address.
-  #
-  # Two separate instances: add a second external network here and give each
-  # service its own.
+  # If Immich is reachable on the host instead, drop this and the `networks:`
+  # line in the anchor above, and point IMMICH_URL at the host address.
   immich:
     external: true
     name: ${IMMICH_NETWORK:-immich_default}

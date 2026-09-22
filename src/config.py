@@ -265,6 +265,18 @@ JOB_RUNNERS = ("subprocess", "systemd", "queue")
 # Shorthand keys accepted in an `accounts:` entry, mapped onto the dotted
 # config paths they stand for. The plan writes accounts this way; the long
 # nested form works too and both merge into the same thing.
+# Anything an account's settings can be written in terms of its own name.
+# Expanded once, when the Account is built, so the shared config can say the
+# per-account paths a single time:
+#
+#   staging:  {root: /staging/{account}}
+#   immich:   {api_key_file: /secrets/{account}.key}
+#   accounts: [{name: david}, {name: mirjam}, {name: alice}]
+#
+# Adding a person is then one line, and the three things that must differ per
+# account cannot be copy-pasted wrong.
+ACCOUNT_TOKEN = "{account}"
+
 ACCOUNT_SHORTHAND = {
     "proton_cache_dir": "proton.cache_dir",
     "proton_secrets": "proton.secrets_file",
@@ -715,6 +727,22 @@ class Account(Config):
         return f"<Account {self.account_name} staging={self.staging}>"
 
 
+def expand_account_token(value: Any, name: str) -> Any:
+    """Replace the literal `{account}` in every string, recursively.
+
+    A plain replace rather than str.format: `proton.cmd` carries `{path}` and
+    `{dest_dir}` templates that format() would raise on, and a filesystem path
+    is not a format string.
+    """
+    if isinstance(value, str):
+        return value.replace(ACCOUNT_TOKEN, name)
+    if isinstance(value, dict):
+        return {k: expand_account_token(v, name) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_account_token(v, name) for v in value]
+    return value
+
+
 def _expand_shorthand(entry: dict[str, Any]) -> dict[str, Any]:
     """Turn an `accounts:` entry into an ordinary nested config overlay."""
     overlay: dict[str, Any] = {}
@@ -754,11 +782,14 @@ def build_accounts(cfg: Config) -> list[Account]:
 
     entries = cfg.get("accounts")
     if not entries:
+        name = str(cfg.get("account.name") or DEFAULT_ACCOUNT)
         data = copy.deepcopy(cfg.data)
         data.pop("accounts", None)
+        data = expand_account_token(data, name)
+        # After expansion: the state directory is shared, so a `{account}` in
+        # it would split the database the UI is meant to read as one set.
         data.setdefault("state", {})["dir"] = shared_state_dir
-        return [Account(data, str(cfg.get("account.name") or DEFAULT_ACCOUNT),
-                        cfg.path)]
+        return [Account(data, name, cfg.path)]
 
     if not isinstance(entries, list):
         raise ConfigError("accounts: must be a list of account entries")
@@ -779,7 +810,8 @@ def build_accounts(cfg: Config) -> list[Account]:
         if name in seen:
             raise ConfigError(f"duplicate account name {name!r}")
         seen.add(name)
-        data = deep_merge(base, _expand_shorthand(entry))
+        data = expand_account_token(deep_merge(base, _expand_shorthand(entry)),
+                                    name)
         data.setdefault("state", {})["dir"] = shared_state_dir
         # A per-account status.json, unless the entry named one itself.
         out.append(Account(data, name, cfg.path, explicit=True))
