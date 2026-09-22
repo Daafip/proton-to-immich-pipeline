@@ -116,12 +116,26 @@ class CliTest(unittest.TestCase):
         self.assertIn(proc.returncode, (1, 2))
         self.assertNotIn("Traceback", proc.stderr)
 
-    def test_an_unwritable_state_dir_is_one_line_not_a_traceback(self):
-        """The first thing that goes wrong under Docker: a bind mount whose
-        source did not exist is created by the daemon as root, and the
-        container is not root."""
+    def assert_permission_message(self, proc, path):
+        """A setup fault, reported so someone can act on it.
+
+        This is the commonest first-run failure under Docker: a bind mount
+        whose host directory did not exist is created by the daemon as root,
+        and the containers do not run as root.
+        """
+        self.assertEqual(proc.returncode, 4,
+                         "a permissions fault is a config fault -- every "
+                         "future run fails identically, so not exit 1")
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertIn(str(path), proc.stderr, "name the directory")
+        self.assertIn("uid", proc.stderr, "name the uid it needs")
+        self.assertIn("chown", proc.stderr, "give the command")
+
+    def test_an_unwritable_state_dir_is_actionable(self):
         import os
         import stat
+        if os.getuid() == 0:
+            self.skipTest("root can write to anything")
         state_dir = self.staging / ".state"
         self.run_sync("status")            # create the layout
         mode = state_dir.stat().st_mode
@@ -130,12 +144,42 @@ class CliTest(unittest.TestCase):
             proc = self.run_sync("pull")
         finally:
             state_dir.chmod(mode)
+        self.assert_permission_message(proc, state_dir)
+
+    def test_an_unwritable_staging_tree_is_actionable(self):
+        """What `docker compose run --rm <account> login` hits when the
+        staging bind mount is root-owned: /staging exists and is readable, but
+        the account's subdirectories cannot be created inside it.
+
+        The state directory is put somewhere writable so this isolates the
+        staging failure rather than tripping the state check first.
+        """
+        import os
+        import stat
         if os.getuid() == 0:
             self.skipTest("root can write to anything")
-        self.assertEqual(proc.returncode, 4)
-        self.assertNotIn("Traceback", proc.stderr)
-        self.assertIn("cannot write to", proc.stderr)
-        self.assertIn(str(state_dir), proc.stderr)
+        elsewhere = Path(self.tmp.name) / "state"
+        elsewhere.mkdir()
+        self.staging.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(
+            f"staging:\n  root: {self.staging}\n  min_free_gb: 0\n"
+            f"state:\n  dir: {elsewhere}\n"
+            f"immich:\n  url: http://127.0.0.1:1/api\n  api_key: test\n"
+            f"proton:\n  roots:\n    - /Photos\n", encoding="utf-8")
+        mode = self.staging.stat().st_mode
+        self.staging.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            proc = self.run_sync("pull")
+        finally:
+            self.staging.chmod(mode)
+        self.assert_permission_message(proc, self.staging)
+        self.assertIn("ready", proc.stderr,
+                      "name the subdirectory it could not create")
+
+    def test_a_writable_layout_says_nothing_about_permissions(self):
+        proc = self.run_sync("status")
+        self.assertNotIn("chown", proc.stderr)
+        self.assertNotIn("not_writable", proc.stderr)
 
     def test_logs_are_one_json_object_per_line(self):
         proc = self.run_sync("status", "--probe")

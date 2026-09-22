@@ -110,7 +110,7 @@ printf '%s' 'THE-KEY' > /mnt/immich/pis/secrets/default.key   # one per person
 
 docker compose build
 docker compose run --rm ui web-password      # → paste into .env
-docker compose run --rm default login        # once per pipeline
+docker compose run --rm -p 8399:8399 default login   # once per pipeline
 docker compose up -d
 ```
 
@@ -175,7 +175,7 @@ web/index.html          the whole frontend: one file, no build step
 Dockerfile              one image, two roles: agent and serve
 docker-compose.yml      one container per pipeline + one for the UI
 systemd/                templated per-account units, nightly timers, web service
-tests/                  458 tests, no network, no Docker
+tests/                  460 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -189,7 +189,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-458 tests, no network and no Docker. The Proton backend and Immich server are
+460 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap → reconcile` runs
 end to end, including the failure paths: truncated transfers, checksum
 mismatches, sessions expiring mid-run, killed runs resuming, quarantine after

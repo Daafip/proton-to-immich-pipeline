@@ -104,12 +104,20 @@ docker compose build
 docker compose run --rm ui web-password    # prints the PIS_WEB_PASSWORD_HASH line
 $EDITOR .env                               # paste it in
 
-docker compose run --rm default login      # once per pipeline
-docker compose run --rm mirjam  login
+# Sign each pipeline in. -p publishes the redirect page so a phone on the
+# LAN can reach it; without it the link printed is container-internal.
+docker compose run --rm -p 8399:8399 default login
+docker compose run --rm -p 8399:8399 mirjam  login
 
 docker compose up -d
 docker compose logs -f
 ```
+
+`login` prints a LAN link *and* the full Proton URL. The URL works from any
+device with no port published at all — the sign-in has no loopback callback,
+so nothing has to reach back into the container. The `-p` is only there to
+make the short link usable. Do the two logins one at a time; they would
+otherwise both want port 8399.
 
 Every command works with `PIS_WEB_PASSWORD_HASH` still empty — `web-password`
 in particular, which is the one that produces it. `serve` is what refuses to
@@ -1366,7 +1374,8 @@ everything, restore the relevant file, and downgrade the code.
 | An account shows as `pending` in the UI | It has no database yet, so it has never run. Normal for a pipeline you just added; run it once. |
 | `web.layout_migration_required` from `serve` | Same as above — the UI refuses to start against an unsplit install rather than showing half a picture. |
 | A container exits with `config.invalid` about a shared Immich key | Two accounts resolving to the same key. In the container layout each pipeline has its own `IMMICH_API_KEY`; check you did not put one in a shared `env` block in compose. |
-| `cannot write to /state: Permission denied` | The bind-mount source did not exist, so docker created it as **root**. `sudo chown -R $(id -u):$(id -g)` the host path, or create the directories before the first `up`. The message names the uid it needs. |
+| `cannot use /state/...` or `/staging/...: Permission denied` | The bind-mount source did not exist, so docker created it as **root**. The message names the uid it needs and the nearest existing directory — that last one is what has the wrong owner. `sudo chown -R $(id -u):$(id -g) /mnt/immich/pis`, or create the directories before the first `up`. |
+| The login link is `172.x.x.x` and the phone cannot reach it | That is the container's own address. Re-run with `-p 8399:8399` and use the host's address, or just paste the full Proton URL the same output prints — it works from anywhere. |
 | `Permission denied` on the state volume in Docker | `PIS_UID`/`PIS_GID` in `.env` do not match the owner of the bind-mounted directories. `ls -ln` the host path. |
 | `network immich_default declared as external, but could not be found` | `IMMICH_NETWORK` in `.env` does not match a real network. `docker network ls`. Or drop the `networks:` blocks and point `IMMICH_URL` at a host address. |
 | `required variable PIS_WEB_PASSWORD_HASH is missing a value` | An older compose file. It made *every* command fail — including the `run ... web-password` that generates the hash. Pull the current `docker-compose.yml`. |

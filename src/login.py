@@ -17,6 +17,7 @@ import socket
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 from . import log
@@ -79,6 +80,22 @@ def make_handler(url: str):
     return RedirectHandler
 
 
+def in_container() -> bool:
+    """Whether we are inside a container, for the sign-in hint only.
+
+    `/.dockerenv` is the cheap, long-standing marker; the cgroup check covers
+    podman and the rest. Being wrong either way costs a line of advice, so a
+    heuristic is fine here.
+    """
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        return "docker" in Path("/proc/1/cgroup").read_text() or \
+               Path("/run/.containerenv").exists()
+    except OSError:
+        return False
+
+
 def serve_redirect(url: str, bind: str, port: int) -> HTTPServer:
     httpd = HTTPServer((bind, port), make_handler(url))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -129,6 +146,14 @@ def run_login(cfg, port: int | None = None, bind: str = "0.0.0.0",
         if ip:
             print(f"      http://{ip}:{port}/          <-- phone-friendly")
         print(f"      http://localhost:{port}/")
+        if in_container():
+            # That address is the container's, which nothing on the LAN can
+            # reach. Saying so beats letting someone try it on their phone
+            # and conclude the sign-in is broken.
+            print()
+            print(f"      ^ container-internal. Re-run with -p {port}:{port}")
+            print("        and use the HOST's address, or just paste the URL")
+            print("        below -- it works from any device either way.")
         print()
     print("  Or paste the full URL directly:")
     print()

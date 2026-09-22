@@ -12,7 +12,7 @@
 #
 #   docker compose build
 #   docker compose run --rm ui web-password        # paste into .env
-#   docker compose run --rm default login          # once per pipeline
+#   docker compose run --rm -p 8399:8399 default login   # once per pipeline
 #   docker compose up -d
 #   docker compose logs -f
 #

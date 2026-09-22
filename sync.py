@@ -312,6 +312,55 @@ def cmd_status(cfg, conn, args) -> int:
     return _status_exit(status)
 
 
+def ensure_writable(directory: Path) -> str | None:
+    """Create a directory and prove we can write in it.
+
+    Returns None on success, or the reason as a string. `mkdir` succeeding is
+    not enough: a bind mount can be traversable but not writable, and the
+    failure would then surface several frames deep inside sqlite or the Proton
+    CLI instead of here.
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return str(exc)
+    probe = directory / ".write-probe"
+    try:
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def permission_help(directory: Path, problem: str) -> str:
+    """The message that actually gets someone unstuck.
+
+    Under Docker this is the commonest first-run failure by a distance: a bind
+    mount whose source did not exist is created by the daemon as **root**, and
+    the containers do not run as root. Naming the uid and the command is worth
+    more than naming the errno.
+    """
+    # The mount point is what has the wrong owner; the path we tried to create
+    # is usually a subdirectory of it that does not exist yet.
+    existing = directory
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    return (
+        f"cannot use {directory}: {problem}\n"
+        f"\n"
+        f"It must be writable by uid {os.getuid()}:{os.getgid()}. The nearest\n"
+        f"existing directory is {existing}.\n"
+        f"\n"
+        f"Under Docker this is almost always a bind mount whose host directory\n"
+        f"did not exist, so the daemon created it as root. Fix it on the HOST\n"
+        f"(not in the container), at the path behind that mount:\n"
+        f"\n"
+        f"    sudo chown -R {os.getuid()}:{os.getgid()} /mnt/immich/pis\n"
+        f"\n"
+        f"Bare metal: the service account must own the staging tree.")
+
+
 def cmd_migrate(base_cfg, args) -> int:
     """Print what the layout change would do, and do it with --yes.
 
@@ -575,31 +624,12 @@ def main(argv: list[str] | None = None) -> int:
             # with one clear line beats a traceback from inside a subprocess.
             required.append(cfg.proton_cache_dir)
     for directory in required:
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            print(f"cannot create {directory}: {exc}", file=sys.stderr)
-            return EXIT_PARTIAL
-
-    # The state directory has to be writable by whoever is running. Under
-    # Docker this is the first thing to go wrong: a bind mount whose source
-    # did not exist is created by the daemon as root, and the container runs
-    # as PIS_UID. Checking it here turns an sqlite traceback three frames deep
-    # into one line naming the directory.
-    probe = cfg.state_dir / ".write-probe"
-    try:
-        probe.touch()
-        probe.unlink()
-    except OSError as exc:
-        log.error("state.not_writable", path=str(cfg.state_dir),
-                  detail=str(exc))
-        print(f"cannot write to {cfg.state_dir}: {exc}\n"
-              f"It must be writable by uid {os.getuid()}. Under Docker that "
-              f"is PIS_UID/PIS_GID:\n"
-              f"    sudo chown -R {os.getuid()}:{os.getgid()} <the host path "
-              f"behind it>",
-              file=sys.stderr)
-        return EXIT_CONFIG
+        problem = ensure_writable(directory)
+        if problem:
+            log.error("directory.not_writable", path=str(directory),
+                      detail=problem)
+            print(permission_help(directory, problem), file=sys.stderr)
+            return EXIT_CONFIG
 
     # `serve` spans every account, so there is no single database for it to
     # open here -- it opens each account's own, read-only, as it needs them.
