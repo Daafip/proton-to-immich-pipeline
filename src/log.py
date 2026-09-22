@@ -24,6 +24,24 @@ _NOISE = re.compile(
     r"|Status: (?:Downloaded newer image|Image is up to date).*)$")
 
 
+def in_container() -> bool:
+    """Whether we are running inside a container.
+
+    Used only to sharpen diagnostics -- the commonest container mistakes
+    (a host path in the config, a root-owned bind mount) have very different
+    fixes from their bare-metal equivalents. `/.dockerenv` is the long-standing
+    marker; the other two cover podman. Being wrong either way costs a line of
+    advice, so a heuristic is fine.
+    """
+    from pathlib import Path
+    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+        return True
+    try:
+        return "docker" in Path("/proc/1/cgroup").read_text()
+    except OSError:
+        return False
+
+
 def condense(blob: str, limit: int = 500) -> str:
     """Squeeze subprocess output down to something that fits one log line.
 

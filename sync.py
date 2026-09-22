@@ -333,32 +333,58 @@ def ensure_writable(directory: Path) -> str | None:
     return None
 
 
+# Paths that only make sense on a host. Seeing one of these inside a container
+# means the config is the bare-metal one, not the container one -- a different
+# problem with a different fix from a badly-owned bind mount.
+HOST_LOOKING = ("/mnt/", "/srv/", "/home/", "/opt/", "/var/lib/")
+
+
 def permission_help(directory: Path, problem: str) -> str:
     """The message that actually gets someone unstuck.
 
-    Under Docker this is the commonest first-run failure by a distance: a bind
-    mount whose source did not exist is created by the daemon as **root**, and
-    the containers do not run as root. Naming the uid and the command is worth
-    more than naming the errno.
+    Two very different causes look identical as an errno, so this works out
+    which one it is before offering a fix:
+
+    * inside a container, a path like /mnt/immich/... is the *bare-metal*
+      config mounted by mistake -- chowning anything will not help;
+    * otherwise it is a bind mount whose host directory did not exist, so the
+      daemon created it as root and the container is not root.
     """
-    # The mount point is what has the wrong owner; the path we tried to create
-    # is usually a subdirectory of it that does not exist yet.
+    # The path we tried to create is usually a subdirectory that does not
+    # exist yet; the thing with the wrong owner is the nearest one that does.
     existing = directory
     while not existing.exists() and existing != existing.parent:
         existing = existing.parent
-    return (
-        f"cannot use {directory}: {problem}\n"
+
+    head = (f"cannot use {directory}: {problem}\n\n"
+            f"It must be writable by uid {os.getuid()}:{os.getgid()}. "
+            f"The nearest\nexisting directory is {existing}.\n")
+
+    inside = log.in_container()
+    if inside and str(directory).startswith(HOST_LOOKING):
+        return head + (
+            f"\n"
+            f"That looks like a HOST path, and this is a container -- so the\n"
+            f"mounted config.yaml is almost certainly the bare-metal one.\n"
+            f"The container config uses /state, /staging and /secrets:\n"
+            f"\n"
+            "    cp config.docker.yaml config.yaml\n"
+            f"\n"
+            f"Chowning anything will not fix this one.")
+    if inside:
+        return head + (
+            f"\n"
+            f"Inside a container this is almost always a bind mount whose host\n"
+            f"directory did not exist, so the daemon created it as root. Fix\n"
+            f"it on the HOST, at the path behind that mount, using the uid in\n"
+            f"PIS_UID -- NOT `$(id -u)`, which is 0 if you are already root:\n"
+            f"\n"
+            f"    sudo chown -R {os.getuid()}:{os.getgid()} /path/behind/the/mount")
+    return head + (
         f"\n"
-        f"It must be writable by uid {os.getuid()}:{os.getgid()}. The nearest\n"
-        f"existing directory is {existing}.\n"
+        f"The account running this must own it:\n"
         f"\n"
-        f"Under Docker this is almost always a bind mount whose host directory\n"
-        f"did not exist, so the daemon created it as root. Fix it on the HOST\n"
-        f"(not in the container), at the path behind that mount:\n"
-        f"\n"
-        f"    sudo chown -R {os.getuid()}:{os.getgid()} /mnt/immich/pis\n"
-        f"\n"
-        f"Bare metal: the service account must own the staging tree.")
+        f"    sudo chown -R $(whoami) {existing}")
 
 
 def cmd_migrate(base_cfg, args) -> int:

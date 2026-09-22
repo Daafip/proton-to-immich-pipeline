@@ -176,6 +176,74 @@ class CliTest(unittest.TestCase):
         self.assertIn("ready", proc.stderr,
                       "name the subdirectory it could not create")
 
+    def test_a_host_path_in_a_container_is_diagnosed_as_the_wrong_config(self):
+        """The two causes look identical as an errno but have opposite fixes.
+        A /mnt/... path inside a container is the bare-metal config mounted by
+        mistake; chowning anything is wasted effort."""
+        import sync
+        from pathlib import Path as P
+        src = P("src/log.py")
+        original = sync.log.in_container
+        sync.log.in_container = lambda: True
+        try:
+            message = sync.permission_help(P("/mnt/immich/staging/.state"),
+                                           "[Errno 13] Permission denied")
+        finally:
+            sync.log.in_container = original
+        self.assertIn("config.docker.yaml", message)
+        self.assertIn("HOST path", message)
+        self.assertNotIn("chown -R", message)
+        del src
+
+    def test_a_container_mount_problem_still_says_chown(self):
+        import sync
+        from pathlib import Path as P
+        original = sync.log.in_container
+        sync.log.in_container = lambda: True
+        try:
+            message = sync.permission_help(P("/staging/default"),
+                                           "[Errno 13] Permission denied")
+        finally:
+            sync.log.in_container = original
+        self.assertIn("chown", message)
+        self.assertNotIn("config.docker.yaml", message)
+
+    def test_no_suggested_command_uses_id_u(self):
+        """`$(id -u)` is 0 when you are already root, so following it chowns
+        everything to root -- the state it was meant to fix. Mentioning it as
+        a warning is fine; putting it in a command someone will paste is not.
+        """
+        import sync
+        from pathlib import Path as P
+        for inside in (True, False):
+            original = sync.log.in_container
+            sync.log.in_container = lambda: inside
+            try:
+                for path in ("/staging/default", "/mnt/immich/staging",
+                             "/srv/pis/state"):
+                    message = sync.permission_help(P(path), "denied")
+                    commands = [ln for ln in message.splitlines()
+                                if ln.strip().startswith(("sudo ", "chown ",
+                                                          "install ", "cp "))]
+                    for line in commands:
+                        self.assertNotIn(
+                            "id -u", line,
+                            f"pasteable command on {path} (inside={inside})")
+            finally:
+                sync.log.in_container = original
+
+    def test_the_container_advice_warns_against_id_u(self):
+        import sync
+        from pathlib import Path as P
+        original = sync.log.in_container
+        sync.log.in_container = lambda: True
+        try:
+            message = sync.permission_help(P("/staging/default"), "denied")
+        finally:
+            sync.log.in_container = original
+        self.assertIn("id -u", message, "warn about the trap explicitly")
+        self.assertIn("PIS_UID", message)
+
     def test_a_writable_layout_says_nothing_about_permissions(self):
         proc = self.run_sync("status")
         self.assertNotIn("chown", proc.stderr)

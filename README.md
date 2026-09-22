@@ -103,9 +103,10 @@ recommended path:
 ```bash
 cp .env.example .env                 # uid/gid, keys, paths, web password
 cp config.docker.yaml config.yaml    # accounts, roots, schedule
-# Create the host dirs yourself, owned by your uid -- docker would make
-# them root-owned, and the containers do not run as root.
-sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/immich/pis/{state,staging,secrets}
+# Create the host dirs yourself, owned by PIS_UID -- docker would make them
+# root-owned, and the containers do not run as root. Use the NUMERIC uid:
+# `$(id -u)` is 0 when you are already root.
+sudo install -d -o 1000 -g 1000 /mnt/immich/pis/{state,staging,secrets}
 printf '%s' 'THE-KEY' > /mnt/immich/pis/secrets/default.key   # one per person
 
 docker compose build

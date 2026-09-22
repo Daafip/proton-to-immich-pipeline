@@ -82,18 +82,26 @@ first thing that goes wrong otherwise: a bind mount whose source does not
 exist is created *by the docker daemon, as root*, and the container does not
 run as root — every service then dies on `Permission denied`.
 
+Use the **numeric uid from `.env`**, not `$(id -u)`:
+
 ```bash
-sudo install -d -o "$(id -u)" -g "$(id -g)" \
-     /mnt/immich/pis/{state,staging,secrets}
+# PIS_UID / PIS_GID in .env -- 1000:1000 unless you changed them.
+sudo install -d -o 1000 -g 1000 /mnt/immich/pis/{state,staging,secrets}
 sudo chmod 700 /mnt/immich/pis/secrets
 ```
+
+> **Do not write `sudo chown "$(id -u)"` here.** If you are already root —
+> and on a box like this you very likely are — `id -u` is **0**, so it
+> chowns everything to root: exactly the state you were trying to fix. Worse,
+> `chown -R` on a parent like `/mnt/immich` will also take ownership of
+> Immich's own `data/` and any bare-metal `staging/`. Name the uid.
 
 One key file per person, from that person's own Immich user:
 
 ```bash
 printf '%s' 'THE-KEY' | sudo tee /mnt/immich/pis/secrets/default.key >/dev/null
 printf '%s' 'HER-KEY' | sudo tee /mnt/immich/pis/secrets/mirjam.key  >/dev/null
-sudo chown "$(id -u)" /mnt/immich/pis/secrets/*.key
+sudo chown 1000:1000 /mnt/immich/pis/secrets/*.key
 sudo chmod 600 /mnt/immich/pis/secrets/*.key
 ```
 
@@ -1374,7 +1382,8 @@ everything, restore the relevant file, and downgrade the code.
 | An account shows as `pending` in the UI | It has no database yet, so it has never run. Normal for a pipeline you just added; run it once. |
 | `web.layout_migration_required` from `serve` | Same as above — the UI refuses to start against an unsplit install rather than showing half a picture. |
 | A container exits with `config.invalid` about a shared Immich key | Two accounts resolving to the same key. In the container layout each pipeline has its own `IMMICH_API_KEY`; check you did not put one in a shared `env` block in compose. |
-| `cannot use /state/...` or `/staging/...: Permission denied` | The bind-mount source did not exist, so docker created it as **root**. The message names the uid it needs and the nearest existing directory — that last one is what has the wrong owner. `sudo chown -R $(id -u):$(id -g) /mnt/immich/pis`, or create the directories before the first `up`. |
+| `cannot use /state/...` or `/staging/...: Permission denied` | The bind-mount source did not exist, so docker created it as **root**. The message names the uid it needs and the nearest existing directory — that last one is what has the wrong owner. `sudo chown -R 1000:1000 <that directory>`, using the numeric `PIS_UID` from `.env`, **not** `$(id -u)`. Scope it to the mount, never to a parent like `/mnt/immich`. |
+| `cannot use /mnt/...` inside a container | The mounted `config.yaml` is the **bare-metal** one; container paths are `/state`, `/staging`, `/secrets`. `cp config.docker.yaml config.yaml`. No amount of chowning fixes this — the message says so when it detects it. |
 | The login link is `172.x.x.x` and the phone cannot reach it | That is the container's own address. Re-run with `-p 8399:8399` and use the host's address, or just paste the full Proton URL the same output prints — it works from anywhere. |
 | `Permission denied` on the state volume in Docker | `PIS_UID`/`PIS_GID` in `.env` do not match the owner of the bind-mounted directories. `ls -ln` the host path. |
 | `network immich_default declared as external, but could not be found` | `IMMICH_NETWORK` in `.env` does not match a real network. `docker network ls`. Or drop the `networks:` blocks and point `IMMICH_URL` at a host address. |

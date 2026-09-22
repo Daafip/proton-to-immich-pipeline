@@ -7,7 +7,8 @@
 #   # Create the host directories YOURSELF, owned by PIS_UID. A bind mount
 #   # whose source does not exist is created by the daemon as root, and these
 #   # containers do not run as root.
-#   sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/immich/pis/{state,staging,secrets}
+#   sudo install -d -o 1000 -g 1000 /mnt/immich/pis/{state,staging,secrets}
+#   # ^ the numeric PIS_UID/PIS_GID. NOT $(id -u): that is 0 if you are root.
 #   printf '%s' 'THE-KEY' > /mnt/immich/pis/secrets/default.key   # one per person
 #
 #   docker compose build
