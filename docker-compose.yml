@@ -3,9 +3,15 @@
 #
 #   cp .env.example .env               # shared settings only, nobody's name
 #   cp config.docker.yaml config.yaml
-#   mkdir -p secrets && chmod 700 secrets
-#   printf '%s' 'THE-KEY' > secrets/default.key    # one file per person
+#
+#   # Create the host directories YOURSELF, owned by PIS_UID. A bind mount
+#   # whose source does not exist is created by the daemon as root, and these
+#   # containers do not run as root.
+#   sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/immich/pis/{state,staging,secrets}
+#   printf '%s' 'THE-KEY' > /mnt/immich/pis/secrets/default.key   # one per person
+#
 #   docker compose build
+#   docker compose run --rm ui web-password        # paste into .env
 #   docker compose run --rm default login          # once per pipeline
 #   docker compose up -d
 #   docker compose logs -f

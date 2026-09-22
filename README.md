@@ -103,9 +103,14 @@ recommended path:
 ```bash
 cp .env.example .env                 # uid/gid, keys, paths, web password
 cp config.docker.yaml config.yaml    # accounts, roots, schedule
+# Create the host dirs yourself, owned by your uid -- docker would make
+# them root-owned, and the containers do not run as root.
+sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt/immich/pis/{state,staging,secrets}
+printf '%s' 'THE-KEY' > /mnt/immich/pis/secrets/default.key   # one per person
+
 docker compose build
-docker compose run --rm ui web-password      # → PIS_WEB_PASSWORD_HASH
-docker compose run --rm david login          # once per pipeline
+docker compose run --rm ui web-password      # → paste into .env
+docker compose run --rm default login        # once per pipeline
 docker compose up -d
 ```
 
@@ -170,7 +175,7 @@ web/index.html          the whole frontend: one file, no build step
 Dockerfile              one image, two roles: agent and serve
 docker-compose.yml      one container per pipeline + one for the UI
 systemd/                templated per-account units, nightly timers, web service
-tests/                  456 tests, no network, no Docker
+tests/                  458 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -184,7 +189,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-456 tests, no network and no Docker. The Proton backend and Immich server are
+458 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap → reconcile` runs
 end to end, including the failure paths: truncated transfers, checksum
 mismatches, sessions expiring mid-run, killed runs resuming, quarantine after

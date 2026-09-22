@@ -75,15 +75,34 @@ schedule and the job queue. No cron container, no host timer.
 cp .env.example .env               # uid/gid, paths, Immich URL, web password
 cp config.docker.yaml config.yaml  # the accounts, roots, schedule
 $EDITOR .env config.yaml
+```
 
-# One key file per person, from that person's own Immich user.
-mkdir -p secrets && chmod 700 secrets
-printf '%s' 'THE-KEY' > secrets/default.key
-printf '%s' 'HER-KEY' > secrets/mirjam.key
-chmod 600 secrets/*.key
+**Create the host directories yourself, owned by `PIS_UID`.** This is the
+first thing that goes wrong otherwise: a bind mount whose source does not
+exist is created *by the docker daemon, as root*, and the container does not
+run as root — every service then dies on `Permission denied`.
 
+```bash
+sudo install -d -o "$(id -u)" -g "$(id -g)" \
+     /mnt/immich/pis/{state,staging,secrets}
+sudo chmod 700 /mnt/immich/pis/secrets
+```
+
+One key file per person, from that person's own Immich user:
+
+```bash
+printf '%s' 'THE-KEY' | sudo tee /mnt/immich/pis/secrets/default.key >/dev/null
+printf '%s' 'HER-KEY' | sudo tee /mnt/immich/pis/secrets/mirjam.key  >/dev/null
+sudo chown "$(id -u)" /mnt/immich/pis/secrets/*.key
+sudo chmod 600 /mnt/immich/pis/secrets/*.key
+```
+
+Then build, set the web password, sign each pipeline in, and start:
+
+```bash
 docker compose build
 docker compose run --rm ui web-password    # prints the PIS_WEB_PASSWORD_HASH line
+$EDITOR .env                               # paste it in
 
 docker compose run --rm default login      # once per pipeline
 docker compose run --rm mirjam  login
@@ -91,6 +110,11 @@ docker compose run --rm mirjam  login
 docker compose up -d
 docker compose logs -f
 ```
+
+Every command works with `PIS_WEB_PASSWORD_HASH` still empty — `web-password`
+in particular, which is the one that produces it. `serve` is what refuses to
+start without a password on a non-loopback bind (exit 4,
+`web.refusing_unauthenticated_bind`), not compose.
 
 `.env` contains nothing named after a person — see
 [Adding a person](#adding-a-person).
@@ -1342,7 +1366,10 @@ everything, restore the relevant file, and downgrade the code.
 | An account shows as `pending` in the UI | It has no database yet, so it has never run. Normal for a pipeline you just added; run it once. |
 | `web.layout_migration_required` from `serve` | Same as above — the UI refuses to start against an unsplit install rather than showing half a picture. |
 | A container exits with `config.invalid` about a shared Immich key | Two accounts resolving to the same key. In the container layout each pipeline has its own `IMMICH_API_KEY`; check you did not put one in a shared `env` block in compose. |
+| `cannot write to /state: Permission denied` | The bind-mount source did not exist, so docker created it as **root**. `sudo chown -R $(id -u):$(id -g)` the host path, or create the directories before the first `up`. The message names the uid it needs. |
 | `Permission denied` on the state volume in Docker | `PIS_UID`/`PIS_GID` in `.env` do not match the owner of the bind-mounted directories. `ls -ln` the host path. |
+| `network immich_default declared as external, but could not be found` | `IMMICH_NETWORK` in `.env` does not match a real network. `docker network ls`. Or drop the `networks:` blocks and point `IMMICH_URL` at a host address. |
+| `required variable PIS_WEB_PASSWORD_HASH is missing a value` | An older compose file. It made *every* command fail — including the `run ... web-password` that generates the hash. Pull the current `docker-compose.yml`. |
 
 Logs are one JSON object per line, one per state transition. `--human-logs`
 makes them readable interactively; `-v` adds the executed commands.

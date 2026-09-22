@@ -642,6 +642,28 @@ class TestHttpNoAuth(HttpTest):
         self.assertFalse(json.loads(body)["auth_required"])
 
 
+class TestServeNeedsNoDatabaseOfItsOwn(WebTest):
+    def test_serve_opens_no_base_account_database(self):
+        """`serve` spans every account, so there is no single database for it.
+        It used to open one named after `account.name` before dispatching --
+        wrong for a multi-account config, and fatal on a state directory it
+        could not write."""
+        import sqlite3
+        stray = self.cfg.state_dir / "default.sqlite"
+        if stray.exists():
+            stray.unlink()
+        api = web.Api(self.cfg, require_auth=False)
+        # Reading accounts is all the UI does at rest, and it must not create
+        # a database on the way.
+        api.get_accounts()
+        self.assertFalse(
+            (self.cfg.state_dir / "default.sqlite").exists()
+            and not any(a.db_path.name == "default.sqlite"
+                        for a in self.cfg.accounts),
+            "serve must not create a database for an account that has none")
+        del sqlite3
+
+
 class TestServeSchema(WebTest):
     def test_serve_creates_the_schema_on_a_fresh_install(self):
         """`serve` touches the `jobs` table at startup, so on a brand-new box

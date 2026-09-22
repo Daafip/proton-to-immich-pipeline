@@ -116,6 +116,27 @@ class CliTest(unittest.TestCase):
         self.assertIn(proc.returncode, (1, 2))
         self.assertNotIn("Traceback", proc.stderr)
 
+    def test_an_unwritable_state_dir_is_one_line_not_a_traceback(self):
+        """The first thing that goes wrong under Docker: a bind mount whose
+        source did not exist is created by the daemon as root, and the
+        container is not root."""
+        import os
+        import stat
+        state_dir = self.staging / ".state"
+        self.run_sync("status")            # create the layout
+        mode = state_dir.stat().st_mode
+        state_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            proc = self.run_sync("pull")
+        finally:
+            state_dir.chmod(mode)
+        if os.getuid() == 0:
+            self.skipTest("root can write to anything")
+        self.assertEqual(proc.returncode, 4)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertIn("cannot write to", proc.stderr)
+        self.assertIn(str(state_dir), proc.stderr)
+
     def test_logs_are_one_json_object_per_line(self):
         proc = self.run_sync("status", "--probe")
         for line in (proc.stdout + proc.stderr).splitlines():
