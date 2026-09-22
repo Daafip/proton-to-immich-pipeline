@@ -581,6 +581,33 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cannot create {directory}: {exc}", file=sys.stderr)
             return EXIT_PARTIAL
 
+    # The state directory has to be writable by whoever is running. Under
+    # Docker this is the first thing to go wrong: a bind mount whose source
+    # did not exist is created by the daemon as root, and the container runs
+    # as PIS_UID. Checking it here turns an sqlite traceback three frames deep
+    # into one line naming the directory.
+    probe = cfg.state_dir / ".write-probe"
+    try:
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        log.error("state.not_writable", path=str(cfg.state_dir),
+                  detail=str(exc))
+        print(f"cannot write to {cfg.state_dir}: {exc}\n"
+              f"It must be writable by uid {os.getuid()}. Under Docker that "
+              f"is PIS_UID/PIS_GID:\n"
+              f"    sudo chown -R {os.getuid()}:{os.getgid()} <the host path "
+              f"behind it>",
+              file=sys.stderr)
+        return EXIT_CONFIG
+
+    # `serve` spans every account, so there is no single database for it to
+    # open here -- it opens each account's own, read-only, as it needs them.
+    if args.command == "serve":
+        from src.web import serve
+        return serve(base_cfg, port=args.port, bind=args.bind,
+                     require_auth=not args.no_auth)
+
     conn = state.connect(cfg.db_path)
     try:
         notes = state.init_schema(conn, cfg.account_name)
@@ -625,12 +652,6 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_unstage(cfg, conn, args)
         finally:
             conn.close()
-
-    if args.command == "serve":
-        conn.close()
-        from src.web import serve
-        return serve(base_cfg, port=args.port, bind=args.bind,
-                     require_auth=not args.no_auth)
 
     if args.command == "agent":
         conn.close()

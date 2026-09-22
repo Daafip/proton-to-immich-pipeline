@@ -88,8 +88,15 @@ services:
     command: ["serve"]
     environment:
       <<: *pipeline-env
-      # `docker compose run --rm ui web-password` prints this line.
-      PIS_WEB_PASSWORD_HASH: ${PIS_WEB_PASSWORD_HASH:?set this in .env - serve refuses a non-loopback bind without it}
+      # `docker compose run --rm ui web-password` prints this line for .env.
+      #
+      # Deliberately NOT `${...:?}`. A required variable makes *every* compose
+      # command fail while it is unset -- build, run, ps, logs -- including
+      # the `run ... web-password` you need in order to set it. `serve`
+      # enforces this itself and better: it refuses a non-loopback bind with
+      # no password (exit 4, `web.refusing_unauthenticated_bind`) and allows a
+      # loopback one, which compose cannot tell apart.
+      PIS_WEB_PASSWORD_HASH: ${PIS_WEB_PASSWORD_HASH:-}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${PIS_STATE_DIR:-./state}:/state
