@@ -32,9 +32,15 @@ immich:
   upload_mode: api
   album_strategy: flat
   # immich.url and immich.api_key come from the environment, per container
-  # (IMMICH_INSTANCE_URL / IMMICH_API_KEY in docker-compose.yml). One
-  # container is one account, so there is no shared environment for a key to
-  # leak through.
+  # (IMMICH_INSTANCE_URL / IMMICH_API_KEY in docker-compose.yml).
+  #
+  # Normally one Immich instance shared by both, with a separate USER and so a
+  # separate API key per person -- the key is what decides whose library an
+  # upload lands in. Two separate instances work too: set DAVID_IMMICH_URL /
+  # MIRJAM_IMMICH_URL in .env.
+  #
+  # One container is one account, so there is no shared environment for a key
+  # to leak through.
 
 limits:
   max_files: 500

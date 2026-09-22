@@ -51,10 +51,14 @@ container runs `sync.py serve`.
 └──────┬───────┘
        │  state volume: david.sqlite, mirjam.sqlite
 ┌──────┴───────┬──────────────────┐
-│  david       │  mirjam          │   one container per pipeline
-│  → immich-   │  → immich-       │   each: own Proton login, own staging,
-│    david     │    mirjam        │         own database, own Immich
-└──────────────┴──────────────────┘
+│  david       │  mirjam          │   one container per pipeline: own Proton
+│              │                  │   login, own staging, own database,
+└──────┬───────┴─────────┬────────┘   own Immich API key
+       │  key: david     │  key: mirjam
+       └────────┬────────┘
+         ┌──────┴───────┐
+         │   immich     │   one instance, one user per person.
+         └──────────────┘   The key decides whose library it lands in.
 ```
 
 **The UI executes nothing.** Clicking *Sync now* writes a row into that
@@ -124,6 +128,7 @@ a `git pull` + `docker compose build` is the whole upgrade loop.
 | Four systemd units + `daemon-reload` | `docker compose up -d` |
 | A sudoers entry for force-sync | not needed — the UI only enqueues |
 | `IMMICH_API_KEY` leaking to every account | impossible: one container, one account, one key in *its* environment |
+| Remembering which key belongs to whom | the service name is the account name |
 
 ### The upload mode
 
@@ -135,10 +140,20 @@ first thing to suspect.
 
 ### Reaching Immich
 
-The compose file joins each pipeline to its own Immich's docker network by
-name (`docker network ls` to find them). If your Immich instances are
-published on the host instead, delete the `networks:` blocks and point
-`DAVID_IMMICH_URL` / `MIRJAM_IMMICH_URL` at the host address.
+Both pipelines join the Immich stack's docker network by name — `IMMICH_NETWORK`
+in `.env`, which `docker network ls` will tell you. It is declared
+`external: true`, so a wrong name fails at `up` rather than at 03:15.
+
+`IMMICH_URL` is shared; `DAVID_IMMICH_API_KEY` and `MIRJAM_IMMICH_API_KEY` are
+not. Each key comes from that person's own Immich user (their Account Settings
+→ API Keys), and that is what keeps the two libraries apart.
+
+If Immich is published on the host instead, delete the `networks:` blocks and
+point `IMMICH_URL` at the host address.
+
+For two separate Immich instances: set `DAVID_IMMICH_URL` /
+`MIRJAM_IMMICH_URL` in `.env` — they override the shared one per pipeline —
+and add a second external network.
 
 ### Pinning the CLI
 
@@ -585,9 +600,13 @@ which together with `SameSite=Strict` is the CSRF defence.
 
 ## Two pipelines
 
-**One VM is the only thing they share.** Two Proton accounts, two staging
-trees, two databases, and **two Immich instances** — or two users in one, if
-that is what you have. Nothing in the pipeline assumes a single Immich.
+Two Proton accounts, two staging trees, two databases — and **one Immich
+instance with a separate user for each person**. The API key is what decides
+whose library an upload lands in, so one key each is the thing that matters,
+not one instance each.
+
+Two separate Immich instances work equally well: give each account its own
+`immich_url`. Nothing in the pipeline assumes either shape.
 
 The plan's hard rule: **the Proton session, the staging subtree and the Immich
 API key travel as one object.** The failure mode is uploading one person's
@@ -598,7 +617,11 @@ photos into the other's library, so three things must differ per account and
 |---|---|
 | `staging_dir` | Never a shared `ready/` — the reaper works per account. |
 | `proton_cache_dir` | One Proton session per directory. `credentials_store: unsafe_file` keeps it there; the keyring path uses a single fixed service name, so two accounts sharing a keyring invalidate each other. Optional — it defaults to `<staging_dir>/.proton`, which is already per-account. |
-| `immich_api_key_file` | A separate Immich instance, or at least a separate **user**. Set `immich_url` per account too. |
+| `immich_api_key_file` | A separate Immich **user** per person, and so a separate key. One instance is fine. |
+
+`immich_url` deliberately is *not* on that list: sharing it is the normal
+case. Sharing a **key** is refused —
+`accounts 'david' and 'mirjam' share one Immich API key`.
 
 ### One database per pipeline
 

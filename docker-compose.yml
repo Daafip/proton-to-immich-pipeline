@@ -1,4 +1,6 @@
-# One VM, one UI, one container per pipeline, a separate Immich per person.
+# One VM, one UI, one container per pipeline. One Immich instance with a user
+# per person -- or two instances, if that is what you have; only the URL
+# differs.
 #
 #   cp .env.example .env            # keys and the web password go here
 #   cp config.docker.yaml config.yaml
@@ -22,7 +24,7 @@ x-pipeline: &pipeline
   image: proton-to-immich-pipeline:latest
   restart: unless-stopped
   # A pipeline is not a service anyone connects to: it reaches out to Proton
-  # and to its own Immich, and nothing reaches in.
+  # and to Immich, and nothing reaches in.
   security_opt: [no-new-privileges:true]
   environment: &pipeline-env
     PIS_CONFIG: /config/config.yaml
@@ -57,51 +59,54 @@ services:
   #   - its own <account>.sqlite in the shared state volume
   #   - its own staging tree, so the reaper never touches anyone else's files
   #   - its own Proton session, in .proton inside that staging tree
-  #   - its own Immich, named by IMMICH_INSTANCE_URL
+  #   - its own Immich API KEY, issued by that person's own Immich user
   #
-  # The Immich key is per container, so the shared-key mistake the bare-metal
-  # install has to warn about cannot happen here: there is no shared
-  # environment to leak it through.
+  # One Immich instance, two users. The key is what decides whose library an
+  # upload lands in, and it lives in this container's environment only -- so
+  # the shared-key mistake the bare-metal install has to warn about is not
+  # reachable here: there is no shared environment to leak it through.
+  #
+  # Two separate Immich instances work just as well: give each service its own
+  # DAVID_IMMICH_URL / MIRJAM_IMMICH_URL in .env.
   # ─────────────────────────────────────────────────────────────────────────
   david:
     <<: *pipeline
     environment:
       <<: *pipeline-env
       PIS_ACCOUNT: david
-      IMMICH_INSTANCE_URL: ${DAVID_IMMICH_URL:-http://immich-david:2283/api}
+      IMMICH_INSTANCE_URL: ${DAVID_IMMICH_URL:-${IMMICH_URL:-http://immich-server:2283/api}}
       IMMICH_API_KEY: ${DAVID_IMMICH_API_KEY:?set this in .env}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${PIS_STATE_DIR:-./state}:/state
       - ${DAVID_STAGING:-./staging/david}:/staging/david
-    networks: [default, immich-david]
+    networks: [default, immich]
 
   mirjam:
     <<: *pipeline
     environment:
       <<: *pipeline-env
       PIS_ACCOUNT: mirjam
-      IMMICH_INSTANCE_URL: ${MIRJAM_IMMICH_URL:-http://immich-mirjam:2283/api}
+      IMMICH_INSTANCE_URL: ${MIRJAM_IMMICH_URL:-${IMMICH_URL:-http://immich-server:2283/api}}
       IMMICH_API_KEY: ${MIRJAM_IMMICH_API_KEY:?set this in .env}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${PIS_STATE_DIR:-./state}:/state
       - ${MIRJAM_STAGING:-./staging/mirjam}:/staging/mirjam
-    networks: [default, immich-mirjam]
+    networks: [default, immich]
 
 networks:
   default:
-  # The two Immich stacks run in their own compose projects. Join their
-  # networks by name so a pipeline can reach its own Immich and not the other
-  # one. `external: true` means compose will not create them -- if the name is
-  # wrong you find out at `up`, not at 03:15.
+  # Immich runs in its own compose project, so join its network by name.
+  # `external: true` means compose will not create it -- if the name is wrong
+  # you find out at `up`, not at 03:15.
   #
-  # Find them with:  docker network ls
-  # If your Immich is reachable on the host instead, drop these, drop the
-  # `networks:` lines above, and point IMMICH_*_URL at the host address.
-  immich-david:
+  # Find it with:  docker network ls
+  # If Immich is reachable on the host instead, drop this, drop the
+  # `networks:` lines above, and point IMMICH_URL at the host address.
+  #
+  # Two separate instances: add a second external network here and give each
+  # service its own.
+  immich:
     external: true
-    name: ${DAVID_IMMICH_NETWORK:-immich-david_default}
-  immich-mirjam:
-    external: true
-    name: ${MIRJAM_IMMICH_NETWORK:-immich-mirjam_default}
+    name: ${IMMICH_NETWORK:-immich_default}

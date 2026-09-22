@@ -17,11 +17,15 @@ its health to Home Assistant.
 ```
 
 One pipeline per person, each with its own Proton account, staging tree,
-database and Immich. `sync.py serve` reads every database and combines them:
+database and **Immich API key** — normally one Immich instance with a user
+each, though separate instances work too. `sync.py serve` reads every database
+and combines them:
 
 ```
-      ui ──reads──► .state/david.sqlite   ◄──writes── david pipeline ──► immich A
-         ──reads──► .state/mirjam.sqlite  ◄──writes── mirjam pipeline ─► immich B
+  ui ──reads──► .state/david.sqlite   ◄──writes── david pipeline ──┐
+     ──reads──► .state/mirjam.sqlite  ◄──writes── mirjam pipeline ─┤
+                                                                   ▼
+                                          immich (a user, and a key, each)
 ```
 
 Nothing is deleted locally until the asset is confirmed **server-side by
@@ -64,7 +68,8 @@ Every command works on one account (`--account`, or `$PIS_ACCOUNT`, implicit
 when there is one). `status` and `serve` span all of them.
 
 **Two people = two independent pipelines** — separate Proton account, staging
-tree, database *and* Immich. One VM is all they share.
+tree, database and Immich API key. They share the VM and, normally, one Immich
+instance with a user each; separate instances work too.
 [Docker](docs/operations.md#install-with-docker) is the easy way to run that: one container
 per pipeline plus one for the UI.
 

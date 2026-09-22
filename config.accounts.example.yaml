@@ -1,9 +1,12 @@
 # proton-to-immich-pipeline -- two independent pipelines on one VM.
 #
-# One VM is the ONLY thing they share. Each pipeline has its own Proton
-# account, its own staging tree, its own database and **its own Immich** --
-# set immich_url per account below. They do not have to be two users in one
-# Immich; two separate Immich instances is the case this is built for.
+# Each pipeline has its own Proton account, its own staging tree and its own
+# database. They share the VM, and normally they share one Immich instance --
+# with a SEPARATE USER and therefore a SEPARATE API KEY for each person. The
+# key is what decides whose library an upload lands in.
+#
+# Two separate Immich instances work just as well: give each account its own
+# immich_url below. Nothing else changes.
 #
 # For the container version of exactly this, see docker-compose.yml and
 # config.docker.yaml -- one container per pipeline plus one for the UI, which
@@ -49,8 +52,8 @@ proton:
   cli_log_level: WARNING
 
 immich:
-  # Only a default. Each account below names its own instance with
-  # immich_url, because two people can have two entirely separate Immichs.
+  # Shared by both accounts: one Immich instance. Override it per account with
+  # immich_url if the two people are on different instances.
   url: http://127.0.0.1:2283/api
   upload_mode: cli
   album_strategy: flat
@@ -85,8 +88,9 @@ web:
 #   proton_cache_dir      -- one Proton session per directory. Optional: it
 #                            defaults to <staging_dir>/.proton, which is
 #                            already per-account.
-#   immich_api_key_file   -- a separate Immich instance (or at least user)
-#                            per person
+#   immich_api_key_file   -- a separate Immich USER per person. One instance is
+#                            fine; the key is what separates the libraries,
+#                            and two accounts sharing one is refused.
 #
 # Each account also gets **its own database**, <name>.sqlite, in the shared
 # state directory. One writer per file, so two pipelines -- two containers,
@@ -102,7 +106,7 @@ web:
 accounts:
   - name: david
     staging_dir: /mnt/immich/staging/david
-    immich_url: http://127.0.0.1:2283/api
+    # immich_url inherited from above: the same instance as Mirjam.
     immich_api_key_file: /etc/proton-to-immich-pipeline/david.key
     proton_roots:
       - /my-files/Photos
@@ -112,10 +116,9 @@ accounts:
 
   - name: mirjam
     staging_dir: /mnt/immich/staging/mirjam
-    # A different Immich entirely -- a second instance on the same VM, on its
-    # own port. A second user in one instance works too; just point both
-    # immich_url values at it and give each its own key.
-    immich_url: http://127.0.0.1:2284/api
+    # Same instance, her own user, her own key. If she were on a separate
+    # Immich instead, this is the one line that would change:
+    #   immich_url: http://127.0.0.1:2284/api
     immich_api_key_file: /etc/proton-to-immich-pipeline/mirjam.key
     proton_roots:
       - /my-files/Camera
