@@ -20,6 +20,13 @@ status-*.json
 web-secret
 *.key
 
+# Docker: .env holds every API key and the web password hash, and the bind
+# mounts land here if you leave the defaults in docker-compose.yml.
+.env
+/state/
+*.sqlite.pre-split-*
+*.sqlite.split-*
+
 __pycache__/
 *.pyc
 .venv/
