@@ -99,15 +99,23 @@ web:
 # combines them.
 #
 # Each key file is chmod 640 root:protonsync and holds just the key:
-#   install -o root -g protonsync -m 640 /dev/null /etc/proton-to-immich-pipeline/david.key
-#   printf '%s' 'the-key' | sudo tee /etc/proton-to-immich-pipeline/david.key
+#   install -o root -g protonsync -m 640 /dev/null /etc/proton-to-immich-pipeline/default.key
+#   printf '%s' 'the-key' | sudo tee /etc/proton-to-immich-pipeline/default.key
 # ---------------------------------------------------------------------------
 
+# The first account is called "default" because that is what an existing
+# single-account install already has stamped on every row in its database, and
+# because `default` is special-cased: it keeps sync.lock, status.json and the
+# original MQTT node and topic, so Home Assistant entities do not move.
+#
+# Keeping it is the zero-migration path. Renaming it is a real migration --
+# see docs/operations.md, "Going from one account to two". A fresh install can
+# use any name.
 accounts:
-  - name: david
-    staging_dir: /mnt/immich/staging/david
+  - name: default
+    staging_dir: /mnt/immich/staging/default
     # immich_url inherited from above: the same instance as Mirjam.
-    immich_api_key_file: /etc/proton-to-immich-pipeline/david.key
+    immich_api_key_file: /etc/proton-to-immich-pipeline/default.key
     proton_roots:
       - /my-files/Photos
     album_name: "Proton Import"
@@ -145,14 +153,14 @@ accounts:
 # ---------------------------------------------------------------------------
 # Running it
 #
-#   sync.py --account david login        # once per account, per session
-#   sync.py --account david run
+#   sync.py --account default login      # once per account, per session
+#   sync.py --account default run
 #   sync.py status                       # no --account: reports on both
 #
 # Nightly, one templated timer per account, staggered so they never download
 # at the same time -- each holds only its own lock:
 #
-#   systemctl enable --now proton-to-immich-pipeline@david.timer
+#   systemctl enable --now proton-to-immich-pipeline@default.timer
 #   systemctl enable --now proton-to-immich-pipeline@mirjam.timer
 #   systemctl edit proton-to-immich-pipeline@mirjam.timer
 #     [Timer]

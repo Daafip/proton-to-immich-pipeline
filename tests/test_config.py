@@ -117,7 +117,19 @@ class TestAccountsExample(unittest.TestCase):
         cfg = load(ACCOUNTS_EXAMPLE)
         self.assertEqual(cfg.validate(), [])
         names = [a.account_name for a in cfg.accounts]
-        self.assertEqual(names, ["david", "mirjam"])
+        self.assertEqual(names, ["default", "mirjam"])
+
+        # The first account is `default` on purpose: it is what an existing
+        # single-account install already has stamped on every row, so keeping
+        # it means no database rename. And `default` is special-cased, so its
+        # lock, status.json and MQTT identity keep their v1 names and Home
+        # Assistant entities do not move.
+        first = cfg.account("default")
+        self.assertEqual(first.lock_path.name, "sync.lock")
+        self.assertEqual(first.status_path.name, "status.json")
+        second = cfg.account("mirjam")
+        self.assertEqual(second.lock_path.name, "sync-mirjam.lock")
+        self.assertEqual(second.status_path.name, "status-mirjam.json")
         # The three things that must never collide.
         self.assertEqual(len({str(a.staging) for a in cfg.accounts}), 2)
         self.assertEqual(len({str(a.proton_cache_dir) for a in cfg.accounts}), 2)

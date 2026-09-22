@@ -5,13 +5,19 @@
 #   cp .env.example .env            # keys and the web password go here
 #   cp config.docker.yaml config.yaml
 #   docker compose build
-#   docker compose run --rm david login     # once per pipeline, prints a link
+#   docker compose run --rm default login   # once per pipeline, prints a link
 #   docker compose run --rm mirjam login
 #   docker compose up -d
 #   docker compose logs -f
 #
 # Adding a third person is a third service plus a third entry in config.yaml.
 # Nothing else changes: not the schema, not the UI, not the other pipelines.
+#
+# The first service is called "default" because that is what an existing
+# single-account install already has in its database -- keeping the name means
+# no migration and no renamed Home Assistant entities. A fresh install can
+# call it anything; rename a service, its PIS_ACCOUNT, its .env variables and
+# the matching entry in config.yaml together.
 
 x-pipeline: &pipeline
   build:
@@ -52,7 +58,7 @@ services:
       # Bind to the LAN only once a password is set, which the line above
       # enforces. Put a reverse proxy in front of it for TLS.
       - "${PIS_WEB_PORT:-8080}:8080"
-    depends_on: [david, mirjam]
+    depends_on: [default, mirjam]
 
   # ─────────────────────────────────────────────────────────────────────────
   # One pipeline per person. Each owns:
@@ -67,19 +73,19 @@ services:
   # reachable here: there is no shared environment to leak it through.
   #
   # Two separate Immich instances work just as well: give each service its own
-  # DAVID_IMMICH_URL / MIRJAM_IMMICH_URL in .env.
+  # DEFAULT_IMMICH_URL / MIRJAM_IMMICH_URL in .env.
   # ─────────────────────────────────────────────────────────────────────────
-  david:
+  default:
     <<: *pipeline
     environment:
       <<: *pipeline-env
-      PIS_ACCOUNT: david
-      IMMICH_INSTANCE_URL: ${DAVID_IMMICH_URL:-${IMMICH_URL:-http://immich-server:2283/api}}
-      IMMICH_API_KEY: ${DAVID_IMMICH_API_KEY:?set this in .env}
+      PIS_ACCOUNT: default
+      IMMICH_INSTANCE_URL: ${DEFAULT_IMMICH_URL:-${IMMICH_URL:-http://immich-server:2283/api}}
+      IMMICH_API_KEY: ${DEFAULT_IMMICH_API_KEY:?set this in .env}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${PIS_STATE_DIR:-./state}:/state
-      - ${DAVID_STAGING:-./staging/david}:/staging/david
+      - ${DEFAULT_STAGING:-./staging/default}:/staging/default
     networks: [default, immich]
 
   mirjam:

@@ -74,9 +74,18 @@ web:
   # From PIS_WEB_PASSWORD_HASH in .env.
   password_hash: ""
 
+# WHY THE FIRST ACCOUNT IS CALLED "default"
+#
+# An existing single-account install already has every row in its database
+# stamped `default`, and `default` is special-cased throughout: it keeps
+# sync.lock, status.json and the original MQTT node and topic, so Home
+# Assistant entities do not move. Keeping the name is the zero-migration path.
+#
+# A fresh install can call it anything. Renaming an existing one is a real
+# migration -- see docs/operations.md, "Going from one account to two".
 accounts:
-  - name: david
-    staging_dir: /staging/david
+  - name: default
+    staging_dir: /staging/default
     proton_roots:
       - /my-files/Photos
     album_name: "Proton Import"
