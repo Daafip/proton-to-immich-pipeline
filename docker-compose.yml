@@ -1,0 +1,107 @@
+# One VM, one UI, one container per pipeline, a separate Immich per person.
+#
+#   cp .env.example .env            # keys and the web password go here
+#   cp config.docker.yaml config.yaml
+#   docker compose build
+#   docker compose run --rm david login     # once per pipeline, prints a link
+#   docker compose run --rm mirjam login
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Adding a third person is a third service plus a third entry in config.yaml.
+# Nothing else changes: not the schema, not the UI, not the other pipelines.
+
+x-pipeline: &pipeline
+  build:
+    context: .
+    args:
+      # Must own the bind-mounted staging and state directories on the host.
+      #   id -u protonsync
+      UID: ${PIS_UID:-1000}
+      GID: ${PIS_GID:-1000}
+  image: proton-to-immich-pipeline:latest
+  restart: unless-stopped
+  # A pipeline is not a service anyone connects to: it reaches out to Proton
+  # and to its own Immich, and nothing reaches in.
+  security_opt: [no-new-privileges:true]
+  environment: &pipeline-env
+    PIS_CONFIG: /config/config.yaml
+    # Local time decides when agent.at fires.
+    TZ: ${TZ:-Europe/Amsterdam}
+
+services:
+  # ─────────────────────────────────────────────────────────────────────────
+  # The UI. Reads every pipeline's database and combines them; writes only
+  # `jobs` rows, which each pipeline's own agent picks up. It never executes
+  # a sync itself, so it needs no docker socket, no sudo and no access to
+  # anyone's Proton session or staging tree.
+  # ─────────────────────────────────────────────────────────────────────────
+  ui:
+    <<: *pipeline
+    command: ["serve"]
+    environment:
+      <<: *pipeline-env
+      # From `docker compose run --rm ui web-password`.
+      PIS_WEB_PASSWORD_HASH: ${PIS_WEB_PASSWORD_HASH:?set this in .env - serve refuses a non-loopback bind without it}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ${PIS_STATE_DIR:-./state}:/state
+    ports:
+      # Bind to the LAN only once a password is set, which the line above
+      # enforces. Put a reverse proxy in front of it for TLS.
+      - "${PIS_WEB_PORT:-8080}:8080"
+    depends_on: [david, mirjam]
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # One pipeline per person. Each owns:
+  #   - its own <account>.sqlite in the shared state volume
+  #   - its own staging tree, so the reaper never touches anyone else's files
+  #   - its own Proton session, in .proton inside that staging tree
+  #   - its own Immich, named by IMMICH_INSTANCE_URL
+  #
+  # The Immich key is per container, so the shared-key mistake the bare-metal
+  # install has to warn about cannot happen here: there is no shared
+  # environment to leak it through.
+  # ─────────────────────────────────────────────────────────────────────────
+  david:
+    <<: *pipeline
+    environment:
+      <<: *pipeline-env
+      PIS_ACCOUNT: david
+      IMMICH_INSTANCE_URL: ${DAVID_IMMICH_URL:-http://immich-david:2283/api}
+      IMMICH_API_KEY: ${DAVID_IMMICH_API_KEY:?set this in .env}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ${PIS_STATE_DIR:-./state}:/state
+      - ${DAVID_STAGING:-./staging/david}:/staging/david
+    networks: [default, immich-david]
+
+  mirjam:
+    <<: *pipeline
+    environment:
+      <<: *pipeline-env
+      PIS_ACCOUNT: mirjam
+      IMMICH_INSTANCE_URL: ${MIRJAM_IMMICH_URL:-http://immich-mirjam:2283/api}
+      IMMICH_API_KEY: ${MIRJAM_IMMICH_API_KEY:?set this in .env}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ${PIS_STATE_DIR:-./state}:/state
+      - ${MIRJAM_STAGING:-./staging/mirjam}:/staging/mirjam
+    networks: [default, immich-mirjam]
+
+networks:
+  default:
+  # The two Immich stacks run in their own compose projects. Join their
+  # networks by name so a pipeline can reach its own Immich and not the other
+  # one. `external: true` means compose will not create them -- if the name is
+  # wrong you find out at `up`, not at 03:15.
+  #
+  # Find them with:  docker network ls
+  # If your Immich is reachable on the host instead, drop these, drop the
+  # `networks:` lines above, and point IMMICH_*_URL at the host address.
+  immich-david:
+    external: true
+    name: ${DAVID_IMMICH_NETWORK:-immich-david_default}
+  immich-mirjam:
+    external: true
+    name: ${MIRJAM_IMMICH_NETWORK:-immich-mirjam_default}

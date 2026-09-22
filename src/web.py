@@ -157,30 +157,46 @@ class JobWorker(threading.Thread):
         self.config_path = config_path
         self.runner = str(cfg.get("web.job_runner", "subprocess"))
         self.timeout = int(cfg.get("web.job_timeout_sec", 28800))
-        self.db_path = cfg.db_path
         self._stop = threading.Event()
-        self.conn: sqlite3.Connection | None = None
+        # One connection per pipeline database, opened on demand and kept for
+        # the life of the thread. There is no shared queue any more: each
+        # account's jobs live in its own file, so the worker round-robins.
+        self._conns: dict[str, sqlite3.Connection] = {}
 
     def stop(self) -> None:
         self._stop.set()
 
+    def connection(self, account_name: str) -> sqlite3.Connection:
+        conn = self._conns.get(account_name)
+        if conn is None:
+            conn = state.connect(self.accounts[account_name].db_path)
+            self._conns[account_name] = conn
+        return conn
+
     def run(self) -> None:  # pragma: no cover - exercised via integration
-        self.conn = state.connect(self.db_path)
         try:
             while not self._stop.is_set():
-                try:
-                    job = state.claim_job(self.conn)
-                except sqlite3.Error as exc:
-                    log.warn("web.job_claim_failed", detail=str(exc)[:200])
-                    self._stop.wait(2.0)
-                    continue
-                if job is None:
+                worked = False
+                for name in list(self.accounts):
+                    if self._stop.is_set():
+                        break
+                    if not self.accounts[name].db_path.exists():
+                        continue
+                    try:
+                        conn = self.connection(name)
+                        job = state.claim_job(conn)
+                    except sqlite3.Error as exc:
+                        log.warn("web.job_claim_failed", account=name,
+                                 detail=str(exc)[:200])
+                        continue
+                    if job is not None:
+                        worked = True
+                        self.execute(conn, job)
+                if not worked:
                     self._stop.wait(1.0)
-                    continue
-                self.execute(job)
         finally:
-            if self.conn:
-                self.conn.close()
+            for conn in self._conns.values():
+                conn.close()
 
     def argv_for(self, job) -> list[str]:
         """The command for one job.
@@ -227,12 +243,12 @@ class JobWorker(threading.Thread):
             return argv
         raise ValueError(f"unknown job type {job_type!r}")
 
-    def execute(self, job) -> None:
+    def execute(self, conn: sqlite3.Connection, job) -> None:
         job_id = int(job["id"])
         try:
             argv = self.argv_for(job)
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
-            state.finish_job(self.conn, job_id, 4, f"rejected: {exc}")
+            state.finish_job(conn, job_id, 4, f"rejected: {exc}")
             log.error("web.job_rejected", job=job_id, detail=str(exc))
             return
 
@@ -249,7 +265,7 @@ class JobWorker(threading.Thread):
             code, detail = 4, f"{argv[0]} not found: {exc}"
         except subprocess.TimeoutExpired:
             code, detail = 1, f"timed out after {self.timeout}s"
-        state.finish_job(self.conn, job_id, code, detail)
+        state.finish_job(conn, job_id, code, detail)
         log.info("web.job_done", job=job_id, exit_code=code,
                  seconds=round(time.monotonic() - started, 1))
 
@@ -257,6 +273,14 @@ class JobWorker(threading.Thread):
 # --------------------------------------------------------------------------
 # the API
 # --------------------------------------------------------------------------
+
+class PendingPipeline(Exception):
+    """A configured account whose database does not exist yet.
+
+    Reads treat it as empty; writes that would create work are allowed, and
+    create the database on the way through.
+    """
+
 
 class Api:
     """Everything the handler needs, with no HTTP in it -- so the routes can
@@ -283,16 +307,42 @@ class Api:
         self.session_hours = int(cfg.get("web.session_hours", 168))
 
     # -- db ----------------------------------------------------------------
-    def reader(self) -> sqlite3.Connection:
-        """A fresh read-only connection per request.
+    def reader(self, account_name: str) -> sqlite3.Connection:
+        """A fresh read-only connection to one pipeline's database.
 
-        One connection per thread is the simplest way to stay inside
-        sqlite3's threading rules, and on a WAL database opening one is cheap.
+        There is one database per pipeline, so the UI's job is to combine
+        them: every read takes the account whose file it wants, and the
+        cross-account views loop. A fresh connection per request is the
+        simplest way to stay inside sqlite3's threading rules, and on a WAL
+        database opening one is cheap.
+
+        Read-only matters more now than it did with a shared file: the
+        ingesting container owns the write lock on its own database, and the
+        UI must never take it.
         """
-        return state.connect_readonly(self.cfg.db_path)
+        account = self.account(account_name)
+        if not account.db_path.exists():
+            # A configured pipeline that has never run. Not an error in
+            # itself, but there is nothing to read, and "unable to open
+            # database file" is a useless thing to put in front of someone.
+            raise PendingPipeline(
+                f"{account.account_name} has not run yet, so it has no "
+                f"database")
+        return state.connect_readonly(account.db_path)
 
-    def writer(self) -> sqlite3.Connection:
-        return state.connect(self.cfg.db_path)
+    def writer(self, account_name: str) -> sqlite3.Connection:
+        """The one thing the UI writes: that account's `jobs` table.
+
+        Creates the database if the pipeline has never run, because enqueuing
+        the very first sync is a legitimate thing to do from the UI and the
+        job row needs somewhere to live. Same schema the pipeline would
+        create, so whoever gets there first is fine.
+        """
+        account = self.account(account_name)
+        conn = state.connect(account.db_path)
+        if not state.table_exists(conn, "jobs"):
+            state.init_schema(conn, account.account_name)
+        return conn
 
     def account(self, name: str | None):
         if name is None:
@@ -321,11 +371,30 @@ class Api:
         }
 
     def get_accounts(self) -> dict[str, Any]:
-        conn = self.reader()
-        try:
-            out = []
-            for account in self.accounts.values():
-                name = account.account_name
+        """Every pipeline's status, combined into one response.
+
+        One database per account means one connection per account. A pipeline
+        whose database does not exist yet -- a person added to the config but
+        never run -- reports as `pending` rather than failing the whole page:
+        the UI is how you would notice that, so it must survive it.
+        """
+        out = []
+        for name, account in self.accounts.items():
+            if not account.db_path.exists():
+                out.append({"account": name, "pending": True,
+                            "delete_action": account.delete_action,
+                            "detail": "no database yet; this pipeline has "
+                                      "never run"})
+                continue
+            try:
+                conn = self.reader(name)
+            except sqlite3.Error as exc:
+                log.warn("web.account_unreadable", account=name,
+                         detail=str(exc)[:200])
+                out.append({"account": name, "unreadable": True,
+                            "detail": str(exc)[:200]})
+                continue
+            try:
                 status = report.build_status(conn, account)
                 # auth_ok is whatever the last run recorded: probing Proton
                 # from a page refresh would spawn a CLI process per poll.
@@ -335,9 +404,9 @@ class Api:
                 status["active_job"] = dict(job) if job else None
                 status["last_job"] = dict(last[0]) if last else None
                 out.append(status)
-            return {"accounts": out, "generated_at": state.utcnow()}
-        finally:
-            conn.close()
+            finally:
+                conn.close()
+        return {"accounts": out, "generated_at": state.utcnow()}
 
     def _cached_probe(self, account) -> dict[str, Any]:
         """auth_ok / immich_ok as of the last run that wrote status.json."""
@@ -350,7 +419,10 @@ class Api:
 
     def get_runs(self, account_name: str | None, limit: int = 20) -> dict[str, Any]:
         account = self.account(account_name)
-        conn = self.reader()
+        try:
+            conn = self.reader(account.account_name)
+        except PendingPipeline:
+            return {"account": account.account_name, "runs": [], "pending": True}
         try:
             rows = state.recent_runs(conn, account.account_name, limit=limit)
             return {"account": account.account_name,
@@ -360,7 +432,10 @@ class Api:
 
     def get_jobs(self, account_name: str | None, limit: int = 20) -> dict[str, Any]:
         account = self.account(account_name)
-        conn = self.reader()
+        try:
+            conn = self.reader(account.account_name)
+        except PendingPipeline:
+            return {"account": account.account_name, "jobs": [], "pending": True}
         try:
             return {"account": account.account_name,
                     "jobs": [dict(r) for r in state.recent_jobs(
@@ -368,8 +443,16 @@ class Api:
         finally:
             conn.close()
 
-    def get_job(self, job_id: int) -> dict[str, Any]:
-        conn = self.reader()
+    def get_job(self, job_id: int, account_name: str | None = None) -> dict[str, Any]:
+        """One job by id.
+
+        Job ids are only unique within a pipeline's own database now, so the
+        account is part of the address. With a single configured account it is
+        implied; with several the caller must say which, or two people's job 1
+        would be the same URL.
+        """
+        account = self.account(account_name)
+        conn = self.reader(account.account_name)
         try:
             row = state.get_job(conn, job_id)
             if row is None:
@@ -384,7 +467,16 @@ class Api:
         states = ((state.STAGED, state.STAGE_DELETING, state.STAGE_TRASHED,
                    state.STAGE_FAILED, state.STAGE_CANCELLED)
                   if include_all else (state.STAGED, state.STAGE_FAILED))
-        conn = self.reader()
+        empty = {
+            "account": account.account_name,
+            "delete_action": account.delete_action,
+            "batch_cap": int(self.cfg.get("delete.batch_cap", 50)),
+            "staged": [], "recent_deletions": [], "pending": True,
+        }
+        try:
+            conn = self.reader(account.account_name)
+        except PendingPipeline:
+            return empty
         try:
             rows = state.staged_deletes(conn, account.account_name, states=states)
             return {
@@ -427,7 +519,7 @@ class Api:
         account = self.account(account_name)
         if job_type not in state.JOB_TYPES:
             raise ValueError(f"type must be one of {', '.join(state.JOB_TYPES)}")
-        conn = self.writer()
+        conn = self.writer(account.account_name)
         try:
             running = state.active_job(conn, account.account_name)
             if running is not None:
@@ -471,7 +563,12 @@ class Api:
             raise ValueError(f"at most {cap} rows per execution "
                              f"(delete.batch_cap); {len(clean)} selected")
 
-        conn = self.reader()
+        try:
+            conn = self.reader(account.account_name)
+        except PendingPipeline:
+            raise ValueError(
+                f"{account.account_name} has not run yet, so nothing is "
+                f"staged for it") from None
         try:
             known = {int(r["id"]) for r in state.get_staged(
                 conn, account.account_name, clean)
@@ -492,7 +589,7 @@ class Api:
         clean = [int(i) for i in (ids or [])]
         if not clean:
             raise ValueError("no rows selected")
-        conn = self.writer()
+        conn = self.writer(account.account_name)
         try:
             count = state.unstage(conn, account.account_name, clean)
         finally:
@@ -644,6 +741,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         try:
             return self._route(api, method, path)
+        except PendingPipeline as exc:
+            return self._error(404, str(exc))
         except KeyError as exc:
             return self._error(404, str(exc).strip("'\"") or "not found")
         except ValueError as exc:
@@ -667,7 +766,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 tail = path[len("/api/jobs/"):]
                 if not tail.isdigit():
                     raise ValueError("job id must be a number")
-                return self._json(api.get_job(int(tail)))
+                return self._json(api.get_job(int(tail), account))
             if path == "/api/staged-deletes":
                 return self._json(api.get_staged(
                     account, include_all=query.get("all") == "1"))
@@ -753,6 +852,21 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
     api: Api
 
+    def handle_error(self, request, client_address) -> None:
+        """One log line, not a traceback on stderr.
+
+        A client that navigates away mid-response, or gets hung up on for
+        sending an oversized body, breaks the pipe -- which is normal and not
+        worth a stack trace in the journal. Anything else is logged as a
+        warning with its type, so a real bug still surfaces.
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            log.debug("web.client_disconnected", client=client_address[0])
+            return
+        log.warn("web.request_failed", client=client_address[0],
+                 error=type(exc).__name__, detail=str(exc)[:200])
+
 
 def build_server(cfg, bind: str, port: int, require_auth: bool = True) -> Server:
     api = Api(cfg, require_auth=require_auth)
@@ -784,28 +898,54 @@ def serve(cfg, port: int | None = None, bind: str | None = None,
         log.warn("web.no_auth", detail="no web password configured; "
                                        "localhost only")
 
-    # Create the schema if this is a fresh install, then clear anything left
-    # `running` by a process that is gone -- without that the UI would refuse
-    # every new job for that account forever.
-    #
-    # A pre-v3 database is NOT migrated here: assigning every legacy row to an
-    # account is a decision, and with a list of them there is no right answer
-    # to guess. `sync.py --account <name> status` does it deliberately.
-    owner = (next(iter(api.accounts)) if len(api.accounts) == 1 else None)
-    conn = state.connect(cfg.db_path)
-    try:
-        state.init_schema(conn, owner)
-        released = state.release_stale_jobs(conn)
-        if released:
-            log.info("web.released_stale_jobs", rows=released)
-    except state.MigrationError as exc:
-        log.error("web.schema_migration_needed", detail=str(exc))
+    # The UI reads databases it does not own, so it does not create them: an
+    # account with no database has simply never run, and `get_accounts`
+    # reports that rather than conjuring an empty one. What it does do is
+    # clear jobs left `running` by a process that is gone -- without that the
+    # UI would refuse every new job for that account forever.
+    from . import migrate as migrate_mod
+    if migrate_mod.needs_migration(cfg):
+        log.error("web.layout_migration_required",
+                  detail="the shared state.sqlite is still present and at "
+                         "least one account has no database of its own; run "
+                         "`sync.py migrate`")
         return 4
-    finally:
-        conn.close()
 
-    worker = JobWorker(cfg, api.accounts, str(cfg.path) if cfg.path else None)
-    worker.start()
+    # Clearing jobs left `running` by a dead process is the owner's job, and
+    # under `queue` the owner is the pipeline's agent -- a job it is running
+    # right now is not stale, and sweeping it would double-run the work.
+    if str(cfg.get("web.job_runner", "subprocess")) != "queue":
+        for name, account in api.accounts.items():
+            if not account.db_path.exists():
+                log.info("web.account_pending", account=name,
+                         detail="no database yet; it appears once the "
+                                "pipeline runs")
+                continue
+            conn = state.connect(account.db_path)
+            try:
+                released = state.release_stale_jobs(conn)
+                if released:
+                    log.info("web.released_stale_jobs", account=name,
+                             rows=released)
+            except sqlite3.Error as exc:
+                log.warn("web.stale_job_sweep_failed", account=name,
+                         detail=str(exc)[:200])
+            finally:
+                conn.close()
+
+    # In the container layout the UI executes nothing: it writes a job row and
+    # each pipeline's own agent picks it up. That is the only design that
+    # works across a container boundary without a docker socket.
+    runner = str(cfg.get("web.job_runner", "subprocess"))
+    worker = None
+    if runner == "queue":
+        log.info("web.queue_runner",
+                 detail="jobs are written for each pipeline's agent to run; "
+                        "no worker thread here")
+    else:
+        worker = JobWorker(cfg, api.accounts,
+                           str(cfg.path) if cfg.path else None)
+        worker.start()
 
     server = Server((bind, port), Handler)
     server.api = api  # the handler reads it off the server, one per process
@@ -819,6 +959,7 @@ def serve(cfg, port: int | None = None, bind: str | None = None,
     except KeyboardInterrupt:
         log.info("web.stopping")
     finally:
-        worker.stop()
+        if worker is not None:
+            worker.stop()
         server.server_close()
     return 0

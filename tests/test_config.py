@@ -81,7 +81,10 @@ class TestMiniYaml(unittest.TestCase):
 class TestConfig(unittest.TestCase):
     def test_defaults_and_paths(self):
         cfg = load(None)
-        self.assertTrue(str(cfg.db_path).endswith(".state/state.sqlite"))
+        self.assertTrue(str(cfg.db_path).endswith(".state/default.sqlite"),
+                        "one database per pipeline, named for the account")
+        self.assertTrue(str(cfg.legacy_db_path).endswith(".state/state.sqlite"),
+                        "the pre-split path, which only the migration reads")
         self.assertEqual(cfg.ready_dir.name, "ready")
 
     def test_deep_merge_keeps_untouched_defaults(self):
@@ -120,8 +123,9 @@ class TestAccountsExample(unittest.TestCase):
         self.assertEqual(len({str(a.proton_cache_dir) for a in cfg.accounts}), 2)
         self.assertEqual(
             len({a.get("immich.api_key_file") for a in cfg.accounts}), 2)
-        # ...and the one that must.
-        self.assertEqual(len({str(a.db_path) for a in cfg.accounts}), 1)
+        # ...and one database each, in one shared directory.
+        self.assertEqual(len({str(a.db_path) for a in cfg.accounts}), 2)
+        self.assertEqual(len({str(a.db_path.parent) for a in cfg.accounts}), 1)
 
 
 class TestAccounts(unittest.TestCase):
@@ -197,14 +201,21 @@ class TestAccounts(unittest.TestCase):
             self.assertEqual(account.get("immich.url"), "http://vm:2283/api")
             self.assertEqual(account.get("proton.backend"), "proton-cli")
 
-    def test_every_account_shares_one_database(self):
-        """Rows are scoped by an `account` column, so splitting the DB per
-        account would lose the cross-account view and the guarantee that a
-        node id is only interpreted against its own volume."""
+    def test_every_account_gets_its_own_database(self):
+        """One file per pipeline. Each ingesting process writes only its own,
+        so two pipelines never contend for a write lock and a bug in one
+        cannot reach the other's rows."""
         cfg = self.build([self.entry("david"), self.entry("mirjam")])
         paths = {str(a.db_path) for a in cfg.accounts}
-        self.assertEqual(len(paths), 1, paths)
-        self.assertEqual(paths.pop(), "/mnt/immich/staging/.state/state.sqlite")
+        self.assertEqual(paths, {"/mnt/immich/staging/.state/david.sqlite",
+                                 "/mnt/immich/staging/.state/mirjam.sqlite"})
+
+    def test_the_databases_share_one_directory(self):
+        """So the UI can combine them from a single read-only mount."""
+        cfg = self.build([self.entry("david"), self.entry("mirjam")])
+        self.assertEqual({str(a.db_path.parent) for a in cfg.accounts},
+                         {"/mnt/immich/staging/.state"})
+        self.assertEqual(sorted(cfg.db_paths()), ["david", "mirjam"])
 
     def test_each_account_gets_its_own_lock_and_status_file(self):
         cfg = self.build([self.entry("david"), self.entry("mirjam")])

@@ -125,9 +125,13 @@ DEFAULTS: dict[str, Any] = {
     },
     "accounts": None,
     "state": {
-        # One state.sqlite for every account; rows are scoped by an `account`
-        # column. Defaults to <staging.root>/.state, and per-account configs
-        # are pinned back to the shared one so they cannot fork the DB.
+        # Where the databases live: one <account>.sqlite per pipeline, all in
+        # this one directory. Defaults to <staging.root>/.state, and every
+        # account is pinned back to the same directory so the UI can find them
+        # all with a single read-only mount.
+        #
+        # Each ingesting process writes only its own file. That is what lets
+        # two pipelines run as two containers without sharing a write lock.
         "dir": None,
     },
     "reconcile": {
@@ -153,11 +157,35 @@ DEFAULTS: dict[str, Any] = {
         # Hard cap per invocation, whatever the UI asks for.
         "batch_cap": 50,
     },
+    # The loop a pipeline container runs: it owns both the schedule and the
+    # job queue, so a container needs no cron and the UI needs no way to
+    # execute anything. Unused by the systemd layout, where a timer starts
+    # `sync.py run` instead.
+    "agent": {
+        # Daily run time, local to the container (set TZ). Empty = no
+        # schedule, jobs only.
+        "at": "03:15",
+        # Spread two pipelines sharing one Proton fair-use budget.
+        "jitter_sec": 1800,
+        # How often to look for work queued by the UI.
+        "poll_sec": 5,
+        "job_timeout_sec": 28800,
+        # Run once at startup rather than waiting for the first `at`. Handy
+        # for a first backfill; noisy as a permanent setting, because every
+        # container restart triggers a run.
+        "run_on_start": False,
+    },
     "web": {
         "bind": "127.0.0.1",
         "port": 8080,
-        # "subprocess" = a jobs table plus one worker thread in this process.
-        # "systemd"    = systemctl start <unit>, via a narrow sudoers entry.
+        # How a "Sync now" click reaches a pipeline:
+        #   subprocess -- a worker thread here spawns sync.py. Bare metal.
+        #   systemd    -- systemctl start <unit>, via a narrow sudoers entry.
+        #   queue      -- write the job row and stop. The pipeline's own agent
+        #                 picks it up. The only one that works across a
+        #                 container boundary, and the one the compose file
+        #                 uses: no docker socket, no sudo, no cross-container
+        #                 exec.
         "job_runner": "subprocess",
         "systemd_unit": "proton-to-immich-pipeline@{account}.service",
         "systemctl": "systemctl",
@@ -232,7 +260,7 @@ CREDENTIALS_STORES = ("keychain", "unsafe_file", "pass")
 DEFAULT_ACCOUNT = "default"
 
 DELETE_ACTIONS = ("mark_only", "execute")
-JOB_RUNNERS = ("subprocess", "systemd")
+JOB_RUNNERS = ("subprocess", "systemd", "queue")
 
 # Shorthand keys accepted in an `accounts:` entry, mapped onto the dotted
 # config paths they stand for. The plan writes accounts this way; the long
@@ -432,7 +460,32 @@ class Config:
 
     @property
     def db_path(self) -> Path:
+        """This account's own database.
+
+        One file per pipeline, all in the shared `state.dir`. Each ingesting
+        process writes only its own file, so two pipelines -- two containers,
+        two systemd units, whatever -- never contend for a write lock and a
+        bug in one cannot reach the other's rows. The UI mounts the directory
+        read-only and combines them.
+
+        The `account` column stays inside each file even though it is now
+        redundant there: it keeps a file self-describing, and it is what makes
+        splitting and merging databases possible in either direction.
+        """
+        return self.state_dir / f"{self.account_name}.sqlite"
+
+    @property
+    def legacy_db_path(self) -> Path:
+        """The single shared database used before the per-pipeline split.
+
+        Only the migration looks at this. Its presence alongside missing
+        per-account files is what `sync.py migrate` detects.
+        """
         return self.state_dir / "state.sqlite"
+
+    def db_paths(self) -> dict[str, Path]:
+        """account name -> its database, for every configured account."""
+        return {a.account_name: a.db_path for a in self.accounts}
 
     @property
     def lock_path(self) -> Path:
@@ -521,17 +574,23 @@ class Config:
             f"unknown account {name!r}; configured: "
             f"{', '.join(a.account_name for a in found)}")
 
-    def validate(self) -> list[str]:
+    def validate(self, scope: str = "pipeline") -> list[str]:
         """Config problems, in the voice of something a human has to fix.
 
         With an `accounts:` list the per-identity checks run against each
         account's merged view, not the shared base -- an Immich key that lives
         only in an account entry is not a missing key. The cross-account
         checks then run once over the whole set.
+
+        `scope="ui"` drops the credential checks. The web UI reads databases
+        and writes job rows; it never calls Proton or Immich, so it has no
+        business holding anyone's API key -- and in the container layout it
+        deliberately does not, because the keys belong to the pipelines. A
+        missing key is not a reason to refuse to show a status page.
         """
         entries = self.get("accounts")
         if not entries:
-            return self._validate_one()
+            return self._validate_one(scope)
         try:
             accounts = self.accounts
         except ConfigError as exc:
@@ -539,12 +598,24 @@ class Config:
         problems: list[str] = []
         for account in accounts:
             problems += [f"accounts[{account.account_name}]: {p}"
-                         for p in account._validate_one()]
-        return problems + self._validate_cross_account(accounts)
+                         for p in account._validate_one(scope)]
+        return problems + self._validate_cross_account(accounts, scope)
 
-    def _validate_one(self) -> list[str]:
+    def _validate_one(self, scope: str = "pipeline") -> list[str]:
         """Checks that make sense for exactly one account's settings."""
         problems = []
+        if scope != "pipeline":
+            # Structural only: these are the settings the UI itself uses.
+            if self.delete_action not in DELETE_ACTIONS:
+                problems.append(
+                    f"delete.action must be one of {', '.join(DELETE_ACTIONS)} "
+                    f"(got {self.delete_action!r})")
+            runner = self.get("web.job_runner")
+            if runner and runner not in JOB_RUNNERS:
+                problems.append(
+                    f"web.job_runner must be one of {', '.join(JOB_RUNNERS)} "
+                    f"(got {runner!r})")
+            return problems
         url = str(self.get("immich.url", ""))
         if not url:
             problems.append("immich.url is empty")
@@ -578,7 +649,8 @@ class Config:
                 f"(got {runner!r})")
         return problems
 
-    def _validate_cross_account(self, found: list["Account"]) -> list[str]:
+    def _validate_cross_account(self, found: list["Account"],
+                                scope: str = "pipeline") -> list[str]:
         """The hard rule, enforced: no two accounts may share a staging subtree
         or an Immich key. Either mistake uploads one person's photos into the
         other's library, which is tedious to unpick after the fact."""
@@ -596,6 +668,10 @@ class Config:
                         f"accounts {seen[key]!r} and {account.account_name!r} "
                         f"share {label} {key!r}; each account needs its own")
                 seen[key] = account.account_name
+        if scope != "pipeline":
+            # The UI holds no keys, so it cannot check them -- and two
+            # accounts sharing a staging dir is still worth saying.
+            return problems
         keys: dict[str, str] = {}
         for account in found:
             literal = str(account.get("immich.api_key") or "")

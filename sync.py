@@ -39,6 +39,16 @@ EXIT_LOCKED = 3
 # Deliberately outside the unit's SuccessExitStatus, so systemd shows failed.
 EXIT_CONFIG = 4
 
+# Commands that move files and therefore need the staging tree. Everything
+# else needs only the state directory.
+# `status` is in here on purpose: it is the safe first command an install
+# runs, and creating the layout is part of what makes it useful. `serve` is
+# the one that must not -- it works on the *base* config, so it would leave
+# stray ready/ and incoming/ directories beside the per-account ones.
+NEEDS_STAGING = {"pull", "download", "push", "precheck", "verify", "reap",
+                 "run", "reconcile", "delete-staged", "login", "agent",
+                 "status"}
+
 CONFIG_CANDIDATES = [
     os.environ.get("PIS_CONFIG"),
     "./config.yaml",
@@ -87,9 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sync.py", description="Proton Drive -> Immich pipeline")
     parser.add_argument("-c", "--config", help="path to config.yaml")
-    parser.add_argument("-a", "--account",
+    parser.add_argument("-a", "--account", default=os.environ.get("PIS_ACCOUNT"),
                         help="which account to work on (required when the "
-                             "config lists more than one)")
+                             "config lists more than one; defaults to "
+                             "$PIS_ACCOUNT, which is how a container says "
+                             "which pipeline it is)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--human-logs", action="store_true",
                         help="plain text logs instead of one JSON object per line")
@@ -204,6 +216,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("web-password", parents=[common],
                    help="hash a password for web.password_hash")
 
+    sub.add_parser("agent", parents=[common],
+                   help="run one pipeline forever: the schedule plus the job "
+                        "queue (this is what a pipeline container runs)")
+
+    p_mig = sub.add_parser(
+        "migrate", parents=[common],
+        help="move an existing install to the layout the config asks for")
+    p_mig.add_argument("--yes", action="store_true",
+                       help="required to make changes; without it this only "
+                            "prints the plan")
+    p_mig.add_argument("--assign-to", metavar="ACCOUNT",
+                       help="owner for rows in a database that predates "
+                            "account support")
+
     return parser
 
 
@@ -281,6 +307,60 @@ def cmd_status(cfg, conn, args) -> int:
     else:
         print_human_status(status)
     return _status_exit(status)
+
+
+def cmd_migrate(base_cfg, args) -> int:
+    """Print what the layout change would do, and do it with --yes.
+
+    Never automatic. The failure this guards against is a pipeline quietly
+    creating an empty `david.sqlite` next to a `state.sqlite` full of David's
+    rows, then re-downloading the entire library -- so the plan is always
+    shown first and nothing happens without being asked.
+    """
+    from src import migrate
+
+    try:
+        plan = migrate.plan(base_cfg, assign_to=args.assign_to)
+    except migrate.MigrationError as exc:
+        print(f"cannot plan a migration: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    for warning in plan.warnings:
+        print(f"  warning: {warning}")
+
+    if not plan.needed:
+        print("  nothing to do: every account already has its own database")
+        for name, path in base_cfg.db_paths().items():
+            mark = "ok     " if path.exists() else "missing"
+            print(f"    {mark}  {name:<16} {path}")
+        return EXIT_PARTIAL if plan.warnings else EXIT_OK
+
+    print(f"  plan ({len(plan.steps)} step(s)):")
+    for step in plan.steps:
+        print(f"    - {step.describe()}")
+
+    if not args.yes:
+        print()
+        print("  This is a dry run. Re-run with --yes to carry it out.")
+        print("  A backup is written beside the database first, and the old")
+        print("  file is kept, renamed, rather than deleted.")
+        return EXIT_OK
+
+    try:
+        done = migrate.apply(base_cfg, plan)
+    except migrate.MigrationError as exc:
+        log.error("migrate.failed", detail=str(exc))
+        print(f"  migration failed: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    for line in done:
+        print(f"    {line}")
+    log.info("migrate.done", steps=len(plan.steps), detail=" | ".join(done))
+    print()
+    print("  Verify before the timer runs again:")
+    for name in base_cfg.db_paths():
+        print(f"    sync.py --account {name} pull --dry-run    # must be 0 new")
+    return EXIT_OK
 
 
 def cmd_status_all(accounts, conn, args) -> int:
@@ -399,18 +479,28 @@ def main(argv: list[str] | None = None) -> int:
         verbose=args.verbose or bool(cfg.get("logging.verbose", False)),
     )
 
-    problems = cfg.validate()
-    if problems:
-        # `status` and `login` still run -- they are what you reach for when
-        # something is wrong -- but they must not stay silent about it.
-        fatal = args.command not in ("status", "login", "web-password")
-        for problem in problems:
-            (log.error if fatal else log.warn)("config.invalid", problem=problem)
-        if fatal:
-            return EXIT_PARTIAL
-
     if args.command == "web-password":
         return cmd_web_password(cfg, args)
+
+    if args.command == "migrate":
+        return cmd_migrate(cfg, args)
+
+    # The layout guard. An install whose databases have not been split yet
+    # would otherwise open an empty <account>.sqlite, find nothing in state,
+    # and re-download the whole library -- so refuse, loudly, with the fix.
+    from src import migrate as _migrate
+    if _migrate.needs_migration(cfg):
+        log.error(
+            "layout.migration_required",
+            detail="this install still has the shared state.sqlite and at "
+                   "least one account has no database of its own; run "
+                   "`sync.py migrate` to see the plan")
+        print("This install predates the one-database-per-pipeline layout.\n"
+              "Nothing has been changed. Run:\n\n"
+              "    sync.py migrate            # shows the plan\n"
+              "    sync.py migrate --yes      # carries it out\n",
+              file=sys.stderr)
+        return EXIT_CONFIG
 
     # From here on everything works on one account, and `cfg` becomes that
     # account: its Proton session, its staging subtree, its Immich key, as one
@@ -431,11 +521,46 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"config error: {exc}", file=sys.stderr)
                 return EXIT_PARTIAL
 
-    required = [cfg.state_dir, cfg.ready_dir, cfg.incoming_dir, cfg.batch_dir]
-    if cfg.get("proton.backend") == "proton-cli":
-        # The Proton CLI writes cache, app data and logs here; failing now with
-        # one clear line beats a traceback from inside a subprocess call.
-        required.append(cfg.proton_cache_dir)
+    # Validation comes *after* the account is resolved, and validates what
+    # this process will actually be.
+    #
+    # It matters in the container layout: a pipeline container holds exactly
+    # one IMMICH_API_KEY, for its own account, and that key lands on the base
+    # config and so on every account in it. Checking "do two accounts share a
+    # key" against a process that can only ever act as one of them reports a
+    # collision that cannot happen. Validating the resolved account asks the
+    # right question: are *my* settings usable?
+    #
+    # The whole-config review still happens where it belongs -- `status` with
+    # no --account, and `serve` -- which is where a genuinely shared key is
+    # worth catching.
+    if args.command == "serve":
+        # Holds no Proton or Immich credentials; the pipelines do.
+        problems = base_cfg.validate(scope="ui")
+    elif status_all is not None:
+        problems = base_cfg.validate()
+    else:
+        problems = cfg.validate()
+    if problems:
+        # `status` and `login` still run -- they are what you reach for when
+        # something is wrong -- but they must not stay silent about it.
+        fatal = args.command not in ("status", "login")
+        for problem in problems:
+            (log.error if fatal else log.warn)("config.invalid", problem=problem)
+        if fatal:
+            return EXIT_PARTIAL
+
+    # Only the commands that actually move files need a staging tree. `serve`
+    # in particular runs against the *base* config, so creating ready/ and
+    # incoming/ for it would leave stray empty directories beside the
+    # per-account ones it is supposed to be reading.
+    required = [cfg.state_dir]
+    if args.command in NEEDS_STAGING:
+        required += [cfg.ready_dir, cfg.incoming_dir, cfg.batch_dir]
+        if cfg.get("proton.backend") == "proton-cli":
+            # The Proton CLI writes cache, app data and logs here; failing now
+            # with one clear line beats a traceback from inside a subprocess.
+            required.append(cfg.proton_cache_dir)
     for directory in required:
         try:
             directory.mkdir(parents=True, exist_ok=True)
@@ -493,6 +618,11 @@ def main(argv: list[str] | None = None) -> int:
         from src.web import serve
         return serve(base_cfg, port=args.port, bind=args.bind,
                      require_auth=not args.no_auth)
+
+    if args.command == "agent":
+        conn.close()
+        from src.agent import run_agent
+        return run_agent(cfg, config_path=str(cfg.path) if cfg.path else None)
 
     run_id = time.strftime("%Y%m%dT%H%M%S")
     log.set_run_id(run_id)

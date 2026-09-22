@@ -1,6 +1,15 @@
 # Running it
 
-Install, sign in, work through the phases, then hand it to systemd.
+Two ways to install it. Pick one:
+
+| | |
+|---|---|
+| **[Docker](#install-with-docker)** | One container per pipeline plus one for the UI. A build and an `up`. **Recommended**, and the only sane way to run two pipelines. |
+| **[By hand](#install-without-docker)** | A service account, the CLI binary, systemd units, env files. More steps, no daemon. |
+
+Everything after the install — signing in, the phases, the delete queue, the
+web UI, the backfill, migrations — is the same either way; only the command
+prefix differs.
 
 ---
 
@@ -20,13 +29,145 @@ into Immich:
 `login`, `pull`, `download` and `push` all completed against those services.
 What that run did **not** cover — `verify`, `reap`, the REST upload path, MQTT
 — is listed in
-[known-issues.md](known-issues.md#3-what-has-and-has-not-run-live). Every
+[known-issues.md](known-issues.md#3-what-has-and-has-not-run-live).
+
+**That run predates the container layout.** The image builds and both roles
+start, but no container has completed a Proton sign-in or an upload; the
+container path also uses `upload_mode: api`, which is the less-travelled one.
+Same list, same caveat. Every
 version-specific detail below is what that stack actually wanted, not what the
 documentation of any single release claims.
 
 ---
 
-## Install on the VM
+## Install with Docker
+
+One image, two roles. A pipeline container runs `sync.py agent`; the UI
+container runs `sync.py serve`.
+
+```
+┌──────────────┐   reads every *.sqlite, writes only `jobs` rows
+│  ui          │   holds NO Proton session and NO Immich key
+└──────┬───────┘
+       │  state volume: david.sqlite, mirjam.sqlite
+┌──────┴───────┬──────────────────┐
+│  david       │  mirjam          │   one container per pipeline
+│  → immich-   │  → immich-       │   each: own Proton login, own staging,
+│    david     │    mirjam        │         own database, own Immich
+└──────────────┴──────────────────┘
+```
+
+**The UI executes nothing.** Clicking *Sync now* writes a row into that
+pipeline's `jobs` table; the pipeline's own container picks it up. That is the
+only design that crosses a container boundary without mounting the docker
+socket — which would be a root-equivalent mount, for an upload.
+
+Each pipeline container runs `sync.py agent`: a loop that owns both the daily
+schedule and the job queue. No cron container, no host timer.
+
+### Setting it up
+
+```bash
+cp .env.example .env               # uid/gid, keys, paths, web password
+cp config.docker.yaml config.yaml  # accounts, roots, schedule
+$EDITOR .env config.yaml
+
+docker compose build
+docker compose run --rm ui web-password    # paste into PIS_WEB_PASSWORD_HASH
+
+docker compose run --rm david  login       # once per pipeline
+docker compose run --rm mirjam login
+
+docker compose up -d
+docker compose logs -f
+```
+
+`PIS_UID`/`PIS_GID` must own the bind-mounted state and staging directories on
+the host — the containers do not run as root.
+
+`docker compose run --rm <pipeline> login` prints a link; open it on any
+device. There is no loopback callback, so nothing needs forwarding — see
+[Signing in](#signing-in) for what that flow actually does.
+
+### Day to day
+
+Every CLI command in the rest of this page works in a container; put
+`docker compose run --rm <pipeline>` in front of it. The service name *is* the
+account name, so `--account` is already implied.
+
+```bash
+docker compose run --rm david status
+docker compose run --rm david pull --dry-run
+docker compose run --rm david staged
+docker compose run --rm david delete-staged --yes 14 15
+
+docker compose ps                     # who is up
+docker compose logs -f david          # one pipeline's journal
+docker compose restart david          # picks up a config.yaml edit
+docker compose exec david cat /proc/1/cmdline   # what the agent is running
+```
+
+Two things do **not** need a command: the nightly run (each agent owns its own
+schedule, `agent.at`) and force-sync (the UI queues it, the agent runs it).
+
+`config.yaml` is mounted read-only, so editing it on the host and restarting
+the affected container is the whole update loop. `docker compose up -d` after
+a `git pull` + `docker compose build` is the whole upgrade loop.
+
+### What the container layout fixes for free
+
+| Bare metal | Container |
+|---|---|
+| Create `protonsync`, `chown` staging | `user:` and two bind mounts |
+| `wget` the CLI, remember `chmod 755` | baked into the image, pinned to 0.8.0, `--version` proven at build time |
+| `apt install python3-yaml` | in the image |
+| Four systemd units + `daemon-reload` | `docker compose up -d` |
+| A sudoers entry for force-sync | not needed — the UI only enqueues |
+| `IMMICH_API_KEY` leaking to every account | impossible: one container, one account, one key in *its* environment |
+
+### The upload mode
+
+`config.docker.yaml` sets `immich.upload_mode: api`. The `cli` mode shells out
+to `docker run immich-cli`, which inside a container needs the docker socket.
+The REST path needs nothing — but it is the less-travelled route: see
+[known-issues.md item 3](known-issues.md). If a push misbehaves, that is the
+first thing to suspect.
+
+### Reaching Immich
+
+The compose file joins each pipeline to its own Immich's docker network by
+name (`docker network ls` to find them). If your Immich instances are
+published on the host instead, delete the `networks:` blocks and point
+`DAVID_IMMICH_URL` / `MIRJAM_IMMICH_URL` at the host address.
+
+### Pinning the CLI
+
+The image pins `proton-drive` 0.8.0 on purpose: its flags drift between
+releases, and a container that silently upgraded would break downloads at
+03:15 rather than while you were watching. On a CPU without AVX2
+(`grep avx2 /proc/cpuinfo` comes back empty):
+
+```bash
+docker compose build --build-arg PROTON_DRIVE_ARCH=linux-x64-baseline
+```
+
+A mismatch fails the build rather than the first run — the Dockerfile runs
+`proton-drive --version` as the last step of installing it.
+
+---
+
+---
+
+## Install without Docker
+
+The same thing by hand. Skip this entirely if you used Docker above.
+
+More to install, and the pieces the container layout gets for free have to be
+done yourself — but it keeps the single-binary, no-daemon shape, and it is the
+right choice if you are running exactly one pipeline and already have systemd
+timers you like.
+
+### On the VM
 
 The unit runs as an unprivileged service account of its own. **The Immich
 docker stack does not create a host user**, so make one — it owns staging and
@@ -87,7 +228,7 @@ Get the Immich API key from **Account Settings → API Keys** and put it in
 
 ---
 
-## Configure
+### Configure
 
 Everything in `config.example.yaml` is optional; omitted keys fall back to the
 defaults in `src/config.py`. The three you must set:
@@ -116,7 +257,7 @@ Finding the right `roots` is covered in
 
 ---
 
-## Signing in
+### Signing in
 
 There is no loopback callback and no port to forward — the CLI polls Proton
 while you sign in on whatever device you like. The only real problem is getting
@@ -167,9 +308,11 @@ downstream — state, dedupe, verify, reap — is unchanged.
 
 ---
 
-## Work through the phases
+### Work through the phases
 
-Check each before moving on:
+Check each before moving on. (Worth doing under Docker too — same list, with
+`docker compose run --rm david` in front of each, per
+[Day to day](#day-to-day).)
 
 ```bash
 sudo -u protonsync bash             # not root: state and staging stay service-owned
@@ -190,7 +333,9 @@ After `push`, the 20 files should appear in the Immich UI *and* under
 `/mnt/immich/data/library/<user>/...` — the storage template is on, so that
 tree is human-readable; use it.
 
-Then hand it to systemd:
+Then hand it to systemd — the single-account units, for one pipeline. Two
+pipelines use the templated ones instead, see
+[Two pipelines under systemd](#two-pipelines-under-systemd):
 
 ```bash
 sudo cp systemd/proton-to-immich-pipeline.{service,timer} /etc/systemd/system/
@@ -205,7 +350,7 @@ The timer fires nightly at 03:15 with 30 minutes of jitter and
 The unit runs as **`protonsync`, which must own `/mnt/immich/staging`** — see
 [known-issues.md](known-issues.md#4-operational-assumptions).
 
-### The backfill
+## The backfill
 
 Only once the nightly cycle has been green for a few days:
 
@@ -213,6 +358,13 @@ Only once the nightly cycle has been green for a few days:
 python3 sync.py run --backfill      # uses backfill.max_files / max_bytes
 watch df -h /mnt/immich             # and watch dmesg for USB resets
 journalctl -u proton-to-immich-pipeline -f | grep -E 'download.batched|circuit'
+```
+
+Under Docker:
+
+```bash
+docker compose run --rm david run --backfill
+docker compose logs -f david | grep -E 'download.batched|circuit'
 ```
 
 Two settings exist for exactly this run, both covered in
@@ -232,7 +384,7 @@ Two settings exist for exactly this run, both covered in
 A tripped pass exits **1** and leaves the rows it never reached untouched, so
 the next run simply carries on.
 
-### Skipping what Immich already has
+## Skipping what Immich already has
 
 Proton reports a sha1 for every file at discovery and Immich dedupes on sha1,
 so the two can be matched *before* anything transfers:
@@ -352,17 +504,22 @@ rather than a fresh download.
 
 ## The web UI
 
-`sync.py serve` — status per account, a force-sync button, and the delete
-queue. Standard library only: no framework, no Node, nothing to build.
+`sync.py serve` — every pipeline's status side by side, a force-sync button,
+and the delete queue. It opens each `<account>.sqlite` **read-only** and
+combines them, so it never takes a write lock a pipeline needs.
+
+Standard library only: no framework, no Node, nothing to build.
+
+**Under Docker** it is already running — the `ui` service, on
+`PIS_WEB_PORT` (8080 by default). Nothing below applies; skip to
+[Force sync](#force-sync-never-runs-inside-a-request).
+
+**By hand:**
 
 ```bash
 python3 sync.py web-password        # prints a web.password_hash line
 python3 sync.py serve               # http://127.0.0.1:8080
-```
 
-Then:
-
-```bash
 sudo cp systemd/proton-to-immich-pipeline-web.service /etc/systemd/system/
 sudo cp systemd/proton-to-immich-pipeline-env.web.example \
         /etc/proton-to-immich-pipeline/env.web
@@ -370,6 +527,11 @@ sudo chown root:protonsync /etc/proton-to-immich-pipeline/env.web
 sudo chmod 640 /etc/proton-to-immich-pipeline/env.web
 sudo systemctl enable --now proton-to-immich-pipeline-web
 ```
+
+The UI holds **no Proton session and no Immich key** — it never talks to
+either. That is why it validates its config on structure alone and starts
+happily without credentials, and why the container version mounts no staging
+tree.
 
 **Set a password before binding anywhere but loopback.** Mirjam uses this, so
 it is not a localhost tool — and it can trash files in Proton. `serve` refuses
@@ -385,13 +547,18 @@ A handler that shelled out to a download would time out, and a page refresh
 would start a second one. A click becomes a row in `jobs`; a worker runs them
 one at a time. A second click while one is active is rejected with the reason.
 
-| `web.job_runner` | How |
-|---|---|
-| `subprocess` (default) | One worker thread in the serve process spawns `sync.py run`. No sudo, works from a checkout. |
-| `systemd` | `systemctl start proton-to-immich-pipeline@<account>.service` via a narrow NOPASSWD sudoers entry. systemd then owns the lock, the logging and the exit code. |
+| `web.job_runner` | How | For |
+|---|---|---|
+| `queue` | The UI writes the row and stops. Each pipeline's own `sync.py agent` picks it up. | **Docker.** The only one that crosses a container boundary — no docker socket, no sudo, no cross-container exec. |
+| `subprocess` (default) | One worker thread in the serve process spawns `sync.py run`. | Bare metal. No sudo, works from a checkout. |
+| `systemd` | `systemctl start proton-to-immich-pipeline@<account>.service` via a narrow NOPASSWD sudoers entry. | Bare metal. systemd then owns the lock, the logging and the exit code. |
 
 For the `systemd` runner, install [`systemd/sudoers.example`](../systemd/sudoers.example)
 — one line per account, naming the exact unit, never a wildcard.
+
+`queue` needs an agent per pipeline, which is what the compose file runs. Set
+it on bare metal and jobs will sit in the table forever unless you are also
+running `sync.py agent` for each account.
 
 The existing `flock` still applies either way: a forced run during a scheduled
 one exits 3 cleanly rather than racing.
@@ -416,26 +583,57 @@ which together with `SameSite=Strict` is the CSRF defence.
 
 ---
 
-## Two accounts
+## Two pipelines
 
-One VM, one Immich, one `state.sqlite`, two Proton logins. The plan's hard
-rule: **the Proton session, the staging subtree and the Immich API key travel
-as one object.** The failure mode is uploading one person's photos into the
-other's library, which is tedious to unpick afterwards, so three things must
-differ per account and `sync.py status` refuses the config if any collides:
+**One VM is the only thing they share.** Two Proton accounts, two staging
+trees, two databases, and **two Immich instances** — or two users in one, if
+that is what you have. Nothing in the pipeline assumes a single Immich.
+
+The plan's hard rule: **the Proton session, the staging subtree and the Immich
+API key travel as one object.** The failure mode is uploading one person's
+photos into the other's library, so three things must differ per account and
+`sync.py status` refuses the config if any collides:
 
 | Must differ | Why |
 |---|---|
 | `staging_dir` | Never a shared `ready/` — the reaper works per account. |
-| `proton_cache_dir` | One Proton session per directory. `credentials_store: unsafe_file` keeps it there; the keyring path uses a single fixed service name, so two accounts sharing a keyring invalidate each other. |
-| `immich_api_key_file` | A separate Immich **user** per person. |
+| `proton_cache_dir` | One Proton session per directory. `credentials_store: unsafe_file` keeps it there; the keyring path uses a single fixed service name, so two accounts sharing a keyring invalidate each other. Optional — it defaults to `<staging_dir>/.proton`, which is already per-account. |
+| `immich_api_key_file` | A separate Immich instance, or at least a separate **user**. Set `immich_url` per account too. |
 
-`state.sqlite` is deliberately *shared*: rows are scoped by an `account`
-column, which is what lets the UI show both at once and stops a node id ever
-being read against the wrong volume. `node_id` is unique per Proton volume,
-not globally.
+### One database per pipeline
 
-### Setting it up
+Each account gets **its own `<name>.sqlite`**, all in one shared state
+directory:
+
+```
+/mnt/immich/staging/.state/
+    david.sqlite      ← only the david pipeline writes this
+    mirjam.sqlite     ← only the mirjam pipeline writes this
+    web-secret
+```
+
+One writer per file. Two pipelines never contend for a write lock, and a bug
+in one cannot reach the other's rows — which matters most in the container
+layout, where they are separate processes with separate volumes. The UI mounts
+that one directory, opens each database **read-only**, and combines them.
+
+The `account` column stays inside each file even though it is now redundant
+there. It keeps a file self-describing, and it is what makes splitting and
+merging databases possible in either direction — see
+[Going from one account to two](#going-from-one-account-to-two).
+
+`node_id` is unique per Proton volume, not globally, which is why the two
+files can hold the same id for different photos without either noticing.
+
+---
+
+## Two pipelines under systemd
+
+The same thing without containers. More to install, and the pieces the
+container layout gets for free have to be done by hand — but it keeps the
+single-binary, no-daemon shape if that is what you want.
+
+### Setting it up by hand
 
 Start from [`config.accounts.example.yaml`](../config.accounts.example.yaml).
 That form **needs PyYAML** (`apt install python3-yaml`) — the built-in fallback
@@ -495,21 +693,368 @@ base config and therefore to every account. That is the one mistake the
 config check cannot save you from silently, so it refuses to run at all when
 two accounts end up with the same key.
 
-### Upgrading an existing single-account install
+## Upgrading an existing install: `sync.py migrate`
 
-Nothing to do first: the schema migration runs on the next invocation of any
-command. It backs `state.sqlite` up beside itself (`state.sqlite.pre-v3-…`),
-rebuilds `assets` and `runs` with an `account` column, and assigns every
-existing row to `account.name` — `default` unless you change it. The old tables
-are kept as `assets_v2` / `runs_v2`, which is the rollback.
+There have been two layout changes, and one command handles both:
+
+| | Layout |
+|---|---|
+| v1/v2 | one `state.sqlite`, no account column |
+| v3 | one `state.sqlite`, rows tagged with an `account` |
+| **v4** | **one `<account>.sqlite` per pipeline** ← current |
+
+The v3 step is a schema change to a file that is already the right file, so it
+still runs automatically on the next command, backing up to
+`state.sqlite.pre-v3-…` first and keeping the old tables as `assets_v2` /
+`runs_v2`.
+
+The v4 step **never runs by itself**. Splitting one database into several has
+to be deliberate: a pipeline that quietly created an empty `david.sqlite` next
+to a `state.sqlite` full of David's rows would re-download the whole library.
+So any command refuses until you have run the migration:
 
 ```
-{"event": "schema.migrated", "to_version": 3, "detail": "backup=… assets runs"}
+$ sync.py run
+This install predates the one-database-per-pipeline layout.
+Nothing has been changed. Run:
+
+    sync.py migrate            # shows the plan
+    sync.py migrate --yes      # carries it out
+```
+
+The plan is printed first and nothing happens without `--yes`:
+
+```
+$ sync.py migrate
+  plan (2 step(s)):
+    - bring state.sqlite up to schema v3
+    - split 2109 assets for 'david' out of state.sqlite into david.sqlite
+
+  This is a dry run. Re-run with --yes to carry it out.
+```
+
+`--yes` writes `state.sqlite.pre-split-<ts>` first, then retires the original
+as `state.sqlite.split-<ts>` rather than deleting it. Both are the rollback.
+
+What it will not do:
+
+- **Guess an owner.** A pre-v3 database has no account column, so every row is
+  unowned. One configured account is not a guess; two is, and it stops and
+  asks for `--assign-to <account>`.
+- **Overwrite.** If a target `<account>.sqlite` already exists it says so and
+  leaves both files alone.
+- **Silently drop anyone.** Rows for an account the config does not name are
+  reported as a warning and stay in the retired file, which is then the only
+  copy — so read the warnings before deleting it.
+
+**Verify afterwards**, per account:
+
+```bash
+sync.py --account david pull --dry-run     # must report 0 new
 ```
 
 Keep `account.name: default` and the lock and `status.json` keep their v1
 paths, so existing Home Assistant sensors carry on working. Rename it and they
-become `sync-<name>.lock` and `status-<name>.json`.
+become `sync-<name>.lock` and `status-<name>.json` — and the database becomes
+`<name>.sqlite`, which is what makes the rename a real migration rather than a
+config edit.
+
+---
+
+## Going from one account to two
+
+A working single-account install already has every row in `state.sqlite`
+stamped with an account name. Adding a second person is mostly config plus
+whatever runs it — but there is one way to lose a night to it, and it is worth
+understanding before you touch anything.
+
+The steps below are written for a bare-metal install, because that is what an
+existing one-account setup almost certainly is. **Moving to Docker at the same
+time is a reasonable thing to do** and changes only the last step: instead of
+templated systemd units, write `config.yaml` and `.env` from
+[`config.docker.yaml`](../config.docker.yaml) and `.env.example`, point
+`PIS_STATE_DIR` at the *existing* `.state` directory, and `docker compose up
+-d`. Steps 1 to 8 — drain, back up, rename, split, verify — are identical
+either way, because they are all about the database.
+
+#### The thing that will bite you
+
+**Renaming the existing account in the config does not rename it in the
+database.** The rows keep the old name, the puller finds nothing it recognises
+under the new one, and the next run re-downloads the entire library while the
+old rows sit there owned by nobody:
+
+```
+account.name: default  →  accounts: [{name: david}, …]
+
+  rows owned by 'default'  5   ← orphaned, nothing will ever sync them
+  rows owned by 'david'    0   → pull reports your whole library as new
+```
+
+Two ways out. **Pick one before you start.**
+
+| | Effort | What it costs |
+|---|---|---|
+| **A — keep the first account called `default`** | none | `accounts:` reads `[{name: default}, {name: mirjam}]`, which is ugly but harmless. `default` is special-cased throughout, so Home Assistant entities, `status.json` and `sync.lock` all keep their v1 names. |
+| **B — rename it to a person** | five `UPDATE`s | Tidy config and unit names. Home Assistant entities are renamed, so dashboards and automations need updating. |
+
+**A is the low-risk choice** and the one to take if you are not sure. Nothing
+below depends on which you pick except step 4.
+
+#### What actually changes
+
+| | Single account | Two accounts |
+|---|---|---|
+| Config | top-level `account.name` | an `accounts:` list — **needs PyYAML** |
+| Staging | `staging/ready/` | `staging/<name>/ready/` |
+| Proton session | `staging/.proton/` | `staging/<name>/.proton/` (automatic — see step 5) |
+| Immich key | `IMMICH_API_KEY` in the shared env file | `immich_api_key_file:` per account |
+| Immich user | one | **one per person** — not just one key per person |
+| Lock | `.state/sync.lock` | `.state/sync-<name>.lock` |
+| `status.json` | `.state/status.json` | `.state/status-<name>.json` |
+| MQTT node | `proton_immich_sync` | `proton_immich_sync_<name>` |
+| MQTT topic | `proton_immich_sync/state` | `proton_immich_sync/<name>/state` |
+| systemd | `proton-to-immich-pipeline.timer` | `…@<name>.timer`, one per account |
+| Database | one `state.sqlite` | one `<name>.sqlite` **each**, in the same directory |
+
+#### 1. Drain the existing account first
+
+This is what makes the staging move a non-problem. Every row holding a file has
+an absolute `local_path` pointing into the *old* staging tree; if you move the
+tree out from under those rows, `push` reports `local file missing` and
+re-downloads them. Drain and there is nothing to move:
+
+```bash
+python3 sync.py run                 # repeat until backlog is 0
+python3 sync.py status | grep backlog
+python3 sync.py reap --keep-days 0
+ls -A /mnt/immich/staging/ready     # must be empty
+```
+
+After a clean drain every row is `purged` with `local_path` NULL, so nothing
+in the database points at a path that is about to change.
+
+*If you cannot drain* — a backfill is half done and you would rather not lose
+it — move the tree and fix the paths in the same breath, with the timer
+stopped:
+
+```bash
+sudo -u protonsync mkdir -p /mnt/immich/staging/david
+sudo -u protonsync mv /mnt/immich/staging/ready /mnt/immich/staging/david/ready
+sqlite3 /mnt/immich/staging/.state/state.sqlite \
+  "UPDATE assets SET local_path =
+     replace(local_path, '/mnt/immich/staging/ready/',
+                         '/mnt/immich/staging/david/ready/')
+   WHERE local_path LIKE '/mnt/immich/staging/ready/%';"
+```
+
+#### 2. Stop everything and back up
+
+```bash
+sudo systemctl stop proton-to-immich-pipeline.timer
+sudo systemctl stop proton-to-immich-pipeline-web    # if you are running the UI
+sudo -u protonsync cp /mnt/immich/staging/.state/state.sqlite \
+                      /mnt/immich/staging/.state/state.sqlite.pre-multi
+```
+
+The web UI matters: its worker holds a connection and can start a job mid-edit.
+
+#### 3. Install PyYAML
+
+```bash
+sudo apt install python3-yaml
+```
+
+The built-in fallback parser cannot read maps inside a list. It says so rather
+than guessing — `maps inside lists are not supported` — but it is easier to
+install this first than to debug that message later.
+
+#### 4. Rename the account — **option B only**
+
+Skip this entirely if you kept `default`.
+
+Do this **before** `sync.py migrate`, while the rows are still in the one
+shared `state.sqlite`. Renaming after the split means renaming inside
+`default.sqlite` *and* renaming the file, which is more steps and more to get
+wrong.
+
+Five tables carry an `account` column and all five must move together, in one
+transaction, with nothing running:
+
+```bash
+sqlite3 /mnt/immich/staging/.state/state.sqlite <<'SQL'
+BEGIN;
+UPDATE assets         SET account='david' WHERE account='default';
+UPDATE runs           SET account='david' WHERE account='default';
+UPDATE staged_deletes SET account='david' WHERE account='default';
+UPDATE deletions      SET account='david' WHERE account='default';
+UPDATE jobs           SET account='david' WHERE account='default';
+COMMIT;
+SELECT account, COUNT(*) FROM assets GROUP BY account;
+SQL
+```
+
+That last `SELECT` must print **one** row, named `david`. Two rows means a
+table was missed and half your library is orphaned — restore the backup from
+step 2 and start again.
+
+**Never rename onto a name that already owns rows.** `(account, node_id)` is
+the primary key of `assets`, so merging two libraries means collisions, and
+`staged_deletes` has the same constraint. Rename into an unused name only.
+
+#### 5. Write the new config
+
+Start from [`config.accounts.example.yaml`](../config.accounts.example.yaml).
+The minimum per account is a name, a staging dir and a key file:
+
+```yaml
+accounts:
+  - name: david
+    staging_dir: /mnt/immich/staging/david
+    immich_api_key_file: /etc/proton-to-immich-pipeline/david.key
+    proton_roots: ["/my-files/Photos"]
+  - name: mirjam
+    staging_dir: /mnt/immich/staging/mirjam
+    immich_api_key_file: /etc/proton-to-immich-pipeline/mirjam.key
+    proton_roots: ["/my-files/Camera"]
+```
+
+`proton_cache_dir` needs no entry: it defaults to `<staging_dir>/.proton`,
+which is already one directory per account — which is the whole isolation
+requirement. Set it explicitly only if you want the sessions somewhere else.
+
+**Mirjam needs her own Immich *user*, not just her own key.** Administration →
+Users → Add, then her API key comes from her own account settings. Sharing one
+user would put both libraries in one place and defeat the exercise.
+
+```bash
+for who in david mirjam; do
+  sudo install -o root -g protonsync -m 640 /dev/null \
+       /etc/proton-to-immich-pipeline/$who.key
+  printf '%s' 'THE-KEY-FOR-THAT-USER' | \
+       sudo tee /etc/proton-to-immich-pipeline/$who.key > /dev/null
+done
+```
+
+#### 6. Remove the shared `IMMICH_API_KEY`
+
+```bash
+sudo sed -i '/^IMMICH_API_KEY=/d' /etc/proton-to-immich-pipeline/env
+```
+
+It applies to the *base* config and therefore to every account, so leaving it
+in gives both people the same key and uploads one library into the other. The
+config check catches exactly this and refuses to run — `accounts 'david' and
+'mirjam' share one Immich API key` — so it fails safe rather than quietly, but
+delete it anyway.
+
+#### 7. Sign both accounts in
+
+The old session lives in the old cache dir, which nothing points at any more.
+Re-logging in is one command and beats moving a credential around by hand:
+
+```bash
+sudo -u protonsync python3 sync.py --account david  login
+sudo -u protonsync python3 sync.py --account mirjam login
+```
+
+Then run the **session isolation test** from
+[Setting it up by hand](#setting-it-up-by-hand) above, with the new
+per-account cache dirs.
+Do it now, before the timers exist: if the sessions are not isolated, nothing
+after this point works and you want to find that out by hand.
+
+#### 8. Split the database, then verify
+
+The rows are still in one shared `state.sqlite`; each pipeline now needs its
+own file. The plan comes first:
+
+```bash
+python3 sync.py migrate            # shows what it would do
+python3 sync.py migrate --yes      # backs up, splits, retires the original
+```
+
+Then check what landed:
+
+```bash
+python3 sync.py status                       # both accounts, no --account
+ls -1 /mnt/immich/staging/.state/*.sqlite    # one per account
+```
+
+Read any warnings `migrate` printed. An account it mentions that you did not
+expect is an orphan — its rows stay in the retired `state.sqlite.split-…` and
+nothing will sync them.
+
+**The real proof is a dry run:**
+
+```bash
+python3 sync.py --account david pull --dry-run
+```
+
+It must report **0 new**. If it reports your whole library as new, the rows are
+still owned by the old name: stop, restore the backup from step 2, and redo
+step 4.
+
+#### 9. Hand it back to whatever runs it
+
+**Docker:** write `config.yaml` from
+[`config.docker.yaml`](../config.docker.yaml) and `.env` from `.env.example`,
+set `PIS_STATE_DIR` to the `.state` directory you just migrated and the two
+`*_STAGING` paths to the per-account trees from step 1, then:
+
+```bash
+sudo systemctl disable --now proton-to-immich-pipeline.timer
+docker compose build
+docker compose run --rm david  login       # the sessions are not portable
+docker compose run --rm mirjam login
+docker compose up -d
+```
+
+**systemd:**
+
+```bash
+sudo systemctl disable --now proton-to-immich-pipeline.timer
+sudo cp systemd/proton-to-immich-pipeline@.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now proton-to-immich-pipeline@david.timer
+sudo systemctl enable --now proton-to-immich-pipeline@mirjam.timer
+sudo systemctl start proton-to-immich-pipeline-web       # if you use the UI
+```
+
+**Disabling the old timer is not optional.** Left enabled it keeps running the
+untemplated unit, which has no `--account` and will happily process an account
+called `default` — a third, empty library alongside the two real ones.
+
+Then stagger them, per [Nightly](#nightly) above.
+
+#### What this does to Home Assistant
+
+Only if you took option B and renamed. Each account publishes under its own
+MQTT node id and its own `status.json`, so:
+
+- `status.json` becomes `status-david.json` — a `file` sensor pointed at the
+  old path goes stale rather than erroring. Update the path.
+- MQTT discovery creates a **new device** (`proton_immich_sync_david`) with new
+  entity ids. The old entities stay in the registry as unavailable; delete them
+  once the new ones are reporting.
+- Any automation referencing the old `sensor.proton_to_immich_sync_*` entity
+  ids needs updating. Grep your config before you rename, not after.
+
+Option A leaves the first account's names untouched — `default` keeps
+`status.json`, `sync.lock`, the `proton_immich_sync` node and the
+`proton_immich_sync/state` topic. Only Mirjam's are new, so nothing you
+already have in Home Assistant moves.
+
+#### Rolling back
+
+Stop the timers, delete the per-account `*.sqlite` files, restore
+`state.sqlite.pre-multi` from step 2 as `state.sqlite`, put the old
+single-account config back, and re-enable the old timer. The staging move from
+step 1 is the only thing that is not in that backup — if you moved `ready/`,
+move it back before restoring.
+
+`migrate` leaves two more copies of its own (`.pre-split-…` and `.split-…`),
+so there is no point at which only one copy of the database exists.
 
 ---
 
@@ -549,10 +1094,15 @@ Without MQTT, point a `command_line` sensor at `sync.py status --json`.
 
 ## How state works
 
-SQLite at `staging/.state/state.sqlite`, schema version 3. Five tables:
-`assets`, `runs`, `staged_deletes`, `deletions`, `jobs`. **Every row is scoped
-by an `account` column**, and `(account, node_id)` is the primary key of
-`assets` — a Proton node id is unique within one volume, not globally.
+**One SQLite database per pipeline**, at `staging/.state/<account>.sqlite`,
+schema version 3. Five tables each: `assets`, `runs`, `staged_deletes`,
+`deletions`, `jobs`. Every row is scoped by an `account` column and
+`(account, node_id)` is the primary key of `assets` — a Proton node id is
+unique within one volume, not globally.
+
+The column is redundant inside a single-account file, and kept anyway: it
+makes a file self-describing, and it is what lets `sync.py migrate` split and
+merge databases in either direction.
 
 ```
 discovered ─► downloading ─► downloaded ─► uploading ─► uploaded ─► verified ─► purged
@@ -581,7 +1131,7 @@ discovered ─► downloading ─► downloaded ─► uploading ─► uploaded
   being re-downloaded before you get round to deleting it.
 
 ```bash
-DB=/mnt/immich/staging/.state/state.sqlite
+DB=/mnt/immich/staging/.state/david.sqlite      # one per account
 sqlite3 $DB "SELECT account, status, COUNT(*) FROM assets GROUP BY 1, 2;"
 sqlite3 $DB "SELECT remote_path, attempts, last_error FROM assets
              WHERE status='quarantined';"
@@ -591,9 +1141,10 @@ sqlite3 $DB "SELECT executed_at, result, remote_path, error FROM deletions
              ORDER BY id DESC LIMIT 20;"
 ```
 
-The migration from v1/v2 keeps the old tables as `assets_v2` and `runs_v2`, and
-writes `state.sqlite.pre-v3-<timestamp>` next to the database first. To roll
-back, stop everything, restore that file, and downgrade the code.
+Migrations keep every previous copy: `assets_v2` / `runs_v2` inside the file
+for the v3 schema change, and `state.sqlite.pre-split-…` plus
+`state.sqlite.split-…` beside it for the per-pipeline split. To roll back, stop
+everything, restore the relevant file, and downgrade the code.
 
 ---
 
@@ -632,6 +1183,12 @@ back, stop everything, restore that file, and downgrade the code.
 | `web.refusing_unauthenticated_bind` (exit 4) | `web.bind` is not loopback and no password is set. `sync.py web-password`, or bind to 127.0.0.1. |
 | The UI rejects every sync click | A job is stuck `running` from a killed server. Restarting the web service releases them; `serve` does that at startup. |
 | `sudo: a password is required` in a job | The `systemd` job runner without the sudoers entry. Install `systemd/sudoers.example`, or use `job_runner: subprocess`. |
+| `layout.migration_required` (exit 4) | The shared `state.sqlite` is still there and a pipeline has no database of its own. Nothing was changed — run `sync.py migrate`. |
+| Jobs queue in the UI but never run | `job_runner: queue` with no agent for that pipeline. In Docker: `docker compose ps` — is that container up? Bare metal: `queue` needs `sync.py agent` running; use `subprocess` instead. |
+| An account shows as `pending` in the UI | It has no database yet, so it has never run. Normal for a pipeline you just added; run it once. |
+| `web.layout_migration_required` from `serve` | Same as above — the UI refuses to start against an unsplit install rather than showing half a picture. |
+| A container exits with `config.invalid` about a shared Immich key | Two accounts resolving to the same key. In the container layout each pipeline has its own `IMMICH_API_KEY`; check you did not put one in a shared `env` block in compose. |
+| `Permission denied` on the state volume in Docker | `PIS_UID`/`PIS_GID` in `.env` do not match the owner of the bind-mounted directories. `ls -ln` the host path. |
 
 Logs are one JSON object per line, one per state transition. `--human-logs`
 makes them readable interactively; `-v` adds the executed commands.

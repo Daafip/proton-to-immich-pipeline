@@ -54,9 +54,12 @@ class TwoAccountTest(unittest.TestCase):
                               account.incoming_dir, account.batch_dir):
                 directory.mkdir(parents=True, exist_ok=True)
 
-        # One database for both, as the config guarantees.
-        self.conn = state.connect(self.accounts["david"].db_path)
-        state.init_schema(self.conn, "david")
+        # One database per pipeline, all in the shared state directory.
+        self.conns = {}
+        for name, account in self.accounts.items():
+            conn = state.connect(account.db_path)
+            state.init_schema(conn, name)
+            self.conns[name] = conn
 
         # Separate Proton volumes and separate Immich users.
         self.world = {}
@@ -70,14 +73,18 @@ class TwoAccountTest(unittest.TestCase):
             }
 
     def tearDown(self):
-        self.conn.close()
+        for conn in self.conns.values():
+            conn.close()
         self.tmp.cleanup()
+
+    def db(self, name):
+        return self.conns[name]
 
     def pipe(self, name, **kwargs) -> Pipeline:
         parts = self.world[name]
-        return Pipeline(self.accounts[name], self.conn, backend=parts["backend"],
-                        client=parts["client"], uploader=parts["uploader"],
-                        **kwargs)
+        return Pipeline(self.accounts[name], self.conns[name],
+                        backend=parts["backend"], client=parts["client"],
+                        uploader=parts["uploader"], **kwargs)
 
     def seed(self, name, count=2, prefix="IMG"):
         """Deliberately the same node ids and filenames in both volumes:
@@ -100,10 +107,15 @@ class TestIsolation(TwoAccountTest):
 
         self.assertEqual(david.stats.uploaded, 3)
         self.assertEqual(mirjam.stats.uploaded, 2)
-        self.assertEqual(state.counts(self.conn, "david")["total"], 3)
-        self.assertEqual(state.counts(self.conn, "mirjam")["total"], 2)
+        self.assertEqual(state.counts(self.db("david"), "david")["total"], 3)
+        self.assertEqual(state.counts(self.db("mirjam"), "mirjam")["total"], 2)
+        # Five assets across two files -- the whole point of the layout.
         self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) c FROM assets").fetchone()["c"], 5)
+            sum(c.execute("SELECT COUNT(*) c FROM assets").fetchone()["c"]
+                for c in self.conns.values()), 5)
+        self.assertEqual(
+            self.db("david").execute(
+                "SELECT COUNT(*) c FROM assets").fetchone()["c"], 3)
 
     def test_the_same_node_id_in_both_volumes_stays_two_assets(self):
         self.seed("david", 2)
@@ -111,15 +123,15 @@ class TestIsolation(TwoAccountTest):
         self.pipe("david", run_id="d1").run()
         self.pipe("mirjam", run_id="m1").run()
         for name in ("david", "mirjam"):
-            row = state.get(self.conn, name, "node-0")
+            row = state.get(self.db(name), name, "node-0")
             self.assertIsNotNone(row, name)
             self.assertEqual(row["status"], state.PURGED)
         # Different content, so different checksums and different asset ids.
-        self.assertNotEqual(state.get(self.conn, "david", "node-0")["sha1"],
-                            state.get(self.conn, "mirjam", "node-0")["sha1"])
+        self.assertNotEqual(state.get(self.db("david"), "david", "node-0")["sha1"],
+                            state.get(self.db("mirjam"), "mirjam", "node-0")["sha1"])
         self.assertNotEqual(
-            state.get(self.conn, "david", "node-0")["immich_asset_id"],
-            state.get(self.conn, "mirjam", "node-0")["immich_asset_id"])
+            state.get(self.db("david"), "david", "node-0")["immich_asset_id"],
+            state.get(self.db("mirjam"), "mirjam", "node-0")["immich_asset_id"])
 
     def test_each_account_downloads_into_its_own_staging_subtree(self):
         self.seed("david", 2)
@@ -168,19 +180,19 @@ class TestIsolation(TwoAccountTest):
         david.run()
         mirjam = self.pipe("mirjam", run_id="m1")
         mirjam.run()
-        self.assertEqual(state.counts(self.conn, "david")[state.FAILED], 1)
-        self.assertEqual(state.counts(self.conn, "mirjam")[state.FAILED], 0)
-        self.assertEqual(state.backlog(self.conn, "mirjam"), 0)
+        self.assertEqual(state.counts(self.db("david"), "david")[state.FAILED], 1)
+        self.assertEqual(state.counts(self.db("mirjam"), "mirjam")[state.FAILED], 0)
+        self.assertEqual(state.backlog(self.db("mirjam"), "mirjam"), 0)
 
     def test_requeue_and_resume_stay_within_one_account(self):
         self.seed("david", 1)
         self.seed("mirjam", 1)
         self.pipe("david", run_id="d1").pull()
         self.pipe("mirjam", run_id="m1").pull()
-        state.mark_downloading(self.conn, "david", "node-0")
-        reset = state.resume(self.conn, "david")
+        state.mark_downloading(self.db("david"), "david", "node-0")
+        reset = state.resume(self.db("david"), "david")
         self.assertEqual(reset, {state.DOWNLOADING: 1})
-        self.assertEqual(state.get(self.conn, "mirjam", "node-0")["status"],
+        self.assertEqual(state.get(self.db("mirjam"), "mirjam", "node-0")["status"],
                          state.DISCOVERED)
 
     def test_runs_are_recorded_per_account(self):
@@ -190,18 +202,20 @@ class TestIsolation(TwoAccountTest):
         self.pipe("mirjam", run_id="shared-run-id").run()
         # The same run id in two accounts is two rows: (account, run_id) is
         # the primary key, so two staggered timers cannot collide.
-        state.finish_run(self.conn, "david", "shared-run-id", 1, 1, 1, 0, 0)
-        state.finish_run(self.conn, "mirjam", "shared-run-id", 1, 1, 1, 0, 0)
+        state.finish_run(self.db("david"), "david", "shared-run-id", 1, 1, 1, 0, 0)
+        state.finish_run(self.db("mirjam"), "mirjam", "shared-run-id", 1, 1, 1, 0, 0)
         self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"], 2)
-        self.assertEqual(len(state.recent_runs(self.conn, "david")), 1)
+            [c.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"]
+             for c in self.conns.values()], [1, 1],
+            "the same run id in two pipelines is two rows in two files")
+        self.assertEqual(len(state.recent_runs(self.db("david"), "david")), 1)
 
     def test_status_is_reported_per_account(self):
         from src import report
         self.seed("david", 2)
         self.pipe("david", run_id="d1").run()
-        david = report.build_status(self.conn, self.accounts["david"])
-        mirjam = report.build_status(self.conn, self.accounts["mirjam"])
+        david = report.build_status(self.db("david"), self.accounts["david"])
+        mirjam = report.build_status(self.db("mirjam"), self.accounts["mirjam"])
         self.assertEqual(david["account"], "david")
         self.assertEqual(david["uploaded_total"], 2)
         self.assertEqual(mirjam["uploaded_total"], 0)
@@ -218,16 +232,16 @@ class TestDeleteIsolation(TwoAccountTest):
     def stage_for(self, name):
         self.seed(name, 2)
         self.pipe(name, run_id=f"{name}-1").run()
-        row = state.get(self.conn, name, "node-0")
+        row = state.get(self.db(name), name, "node-0")
         self.world[name]["server"].trash_asset(row["immich_asset_id"],
                                                row["remote_name"])
         self.pipe(name, run_id=f"{name}-2").reconcile()
-        return state.staged_deletes(self.conn, name)
+        return state.staged_deletes(self.db(name), name)
 
     def test_reconcile_stages_only_its_own_account(self):
         david_rows = self.stage_for("david")
         self.assertEqual(len(david_rows), 1)
-        self.assertEqual(state.count_staged(self.conn, "mirjam"), 0)
+        self.assertEqual(state.count_staged(self.db("mirjam"), "mirjam"), 0)
 
     def test_an_id_from_one_account_cannot_delete_from_the_other(self):
         """Both volumes hold `/Photos/IMG_0.jpg` at node `node-0`. Staging
@@ -242,7 +256,7 @@ class TestDeleteIsolation(TwoAccountTest):
         self.assertEqual(mirjam.stats.trashed, 0)
         self.assertEqual(self.world["mirjam"]["backend"].trash_calls, [])
         self.assertEqual(self.world["david"]["backend"].trash_calls, [])
-        self.assertEqual(state.count_staged(self.conn, "david"), 1)
+        self.assertEqual(state.count_staged(self.db("david"), "david"), 1)
 
     def test_deleting_in_one_account_leaves_the_others_file_alone(self):
         david_rows = self.stage_for("david")
@@ -256,9 +270,9 @@ class TestDeleteIsolation(TwoAccountTest):
         self.assertEqual(david.stats.trashed, 1)
         self.assertNotIn("/Photos/IMG_0.jpg", self.world["david"]["backend"].files)
         self.assertIn("/Photos/IMG_0.jpg", self.world["mirjam"]["backend"].files)
-        self.assertEqual(state.get(self.conn, "david", "node-0")["status"],
+        self.assertEqual(state.get(self.db("david"), "david", "node-0")["status"],
                          state.REMOTE_TRASHED)
-        self.assertEqual(state.get(self.conn, "mirjam", "node-0")["status"],
+        self.assertEqual(state.get(self.db("mirjam"), "mirjam", "node-0")["status"],
                          state.PURGED)
 
     def test_the_audit_trail_is_per_account(self):
@@ -266,8 +280,8 @@ class TestDeleteIsolation(TwoAccountTest):
         self.accounts["david"].set("delete.action", "execute")
         self.pipe("david", run_id="d9").execute_deletes(
             ids=[int(david_rows[0]["id"])])
-        self.assertEqual(len(state.deletions(self.conn, "david")), 1)
-        self.assertEqual(state.deletions(self.conn, "mirjam"), [])
+        self.assertEqual(len(state.deletions(self.db("david"), "david")), 1)
+        self.assertEqual(state.deletions(self.db("mirjam"), "mirjam"), [])
 
 
 class TestWebSeesBoth(TwoAccountTest):
@@ -309,8 +323,8 @@ class TestWebSeesBoth(TwoAccountTest):
         api = web.Api(self.cfg, require_auth=False)
         worker = web.JobWorker(self.cfg, api.accounts, None)
         for name in ("david", "mirjam"):
-            job_id = state.create_job(self.conn, name, "sync")
-            argv = worker.argv_for(state.get_job(self.conn, job_id))
+            job_id = state.create_job(self.db(name), name, "sync")
+            argv = worker.argv_for(state.get_job(self.db(name), job_id))
             self.assertEqual(argv[-1],
                              f"proton-to-immich-pipeline@{name}.service")
 

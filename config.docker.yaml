@@ -1,0 +1,84 @@
+# proton-to-immich-pipeline -- the container layout.
+#
+# Copy to config.yaml next to docker-compose.yml. It is mounted read-only into
+# every container; each pipeline container picks its account with PIS_ACCOUNT,
+# and the UI reads all of them.
+#
+# Paths here are container paths. The host side is in docker-compose.yml.
+#
+# NEEDS PyYAML for the accounts list -- the image already has it.
+
+state:
+  # The shared volume. One <account>.sqlite per pipeline lives here, and this
+  # is the only directory the UI container needs.
+  dir: /state
+
+proton:
+  backend: proton-cli
+  # Keeps the session in each account's own cache dir rather than a keyring,
+  # which a container does not have.
+  credentials_store: unsafe_file
+  cli_log_level: WARNING
+  # One call per batch instead of one per file: ~8 hours of process startup
+  # saved on a 25k-file backfill. Set to 1 if a backfill night misbehaves.
+  download_batch_size: 25
+
+immich:
+  # upload_mode: api, not cli. The "cli" mode shells out to `docker run
+  # immich-cli`, which inside a container needs the docker socket -- a
+  # root-equivalent mount for an upload. The REST path needs nothing.
+  #
+  # Note this is the less-travelled route: see docs/known-issues.md item 3.
+  upload_mode: api
+  album_strategy: flat
+  # immich.url and immich.api_key come from the environment, per container
+  # (IMMICH_INSTANCE_URL / IMMICH_API_KEY in docker-compose.yml). One
+  # container is one account, so there is no shared environment for a key to
+  # leak through.
+
+limits:
+  max_files: 500
+  max_bytes: 20000000000
+  consecutive_failures: 25
+
+reap:
+  keep_days: 7
+
+reconcile:
+  enabled: true
+
+delete:
+  action: mark_only
+  batch_cap: 50
+
+# The loop each pipeline container runs: the schedule *and* the job queue.
+# No cron container, no host timer.
+agent:
+  at: "03:15"          # local time; set TZ in .env
+  jitter_sec: 1800
+  poll_sec: 5
+
+web:
+  # Inside the container. The port mapping decides who can reach it.
+  bind: 0.0.0.0
+  port: 8080
+  # The UI only writes job rows; each pipeline's agent runs them. This is the
+  # only runner that works across a container boundary.
+  job_runner: queue
+  # From PIS_WEB_PASSWORD_HASH in .env.
+  password_hash: ""
+
+accounts:
+  - name: david
+    staging_dir: /staging/david
+    proton_roots:
+      - /my-files/Photos
+    album_name: "Proton Import"
+    delete_action: execute
+
+  - name: mirjam
+    staging_dir: /staging/mirjam
+    proton_roots:
+      - /my-files/Camera
+    album_name: "Proton Import"
+    delete_action: mark_only

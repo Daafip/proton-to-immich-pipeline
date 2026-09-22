@@ -1,4 +1,13 @@
-# proton-to-immich-pipeline -- two people, one VM, one Immich.
+# proton-to-immich-pipeline -- two independent pipelines on one VM.
+#
+# One VM is the ONLY thing they share. Each pipeline has its own Proton
+# account, its own staging tree, its own database and **its own Immich** --
+# set immich_url per account below. They do not have to be two users in one
+# Immich; two separate Immich instances is the case this is built for.
+#
+# For the container version of exactly this, see docker-compose.yml and
+# config.docker.yaml -- one container per pipeline plus one for the UI, which
+# is a good deal less to install than the bare-metal path.
 #
 # NEEDS PyYAML:  apt install python3-yaml
 # The built-in fallback parser cannot read maps inside a list, and it says so
@@ -6,6 +15,17 @@
 #
 # Start from config.example.yaml for the single-account shape and the
 # explanation of each key. This file only shows what changes.
+#
+# ALREADY RUNNING WITH ONE ACCOUNT? Do not just paste this over your config.
+# Every row in state.sqlite is stamped with the account name it was synced
+# under -- "default" unless you changed it -- and renaming the account here
+# does NOT rename it there. The puller then finds nothing it recognises and
+# re-downloads the entire library, while the old rows sit orphaned.
+#
+#   docs/operations.md -> "Going from one account to two"
+#
+# has the runbook, including the five-table rename and the one dry-run that
+# proves it worked.
 
 # ---------------------------------------------------------------------------
 # Shared by every account. Anything an account entry does not override is
@@ -29,6 +49,8 @@ proton:
   cli_log_level: WARNING
 
 immich:
+  # Only a default. Each account below names its own instance with
+  # immich_url, because two people can have two entirely separate Immichs.
   url: http://127.0.0.1:2283/api
   upload_mode: cli
   album_strategy: flat
@@ -60,12 +82,17 @@ web:
 # refuses the config if any of them collides:
 #
 #   staging_dir           -- never a shared ready/; the reaper works per account
-#   proton_cache_dir      -- one Proton session per directory
-#   immich_api_key_file   -- a separate Immich USER per person
+#   proton_cache_dir      -- one Proton session per directory. Optional: it
+#                            defaults to <staging_dir>/.proton, which is
+#                            already per-account.
+#   immich_api_key_file   -- a separate Immich instance (or at least user)
+#                            per person
 #
-# state.sqlite is deliberately shared: rows are scoped by an `account` column,
-# which is what lets the UI show both at once and keeps a node id from ever
-# being interpreted against the wrong volume.
+# Each account also gets **its own database**, <name>.sqlite, in the shared
+# state directory. One writer per file, so two pipelines -- two containers,
+# two systemd units -- never contend for a write lock and a bug in one cannot
+# reach the other's rows. The UI mounts that one directory read-only and
+# combines them.
 #
 # Each key file is chmod 640 root:protonsync and holds just the key:
 #   install -o root -g protonsync -m 640 /dev/null /etc/proton-to-immich-pipeline/david.key
@@ -75,21 +102,24 @@ web:
 accounts:
   - name: david
     staging_dir: /mnt/immich/staging/david
-    proton_cache_dir: /mnt/immich/staging/.proton/david
+    immich_url: http://127.0.0.1:2283/api
     immich_api_key_file: /etc/proton-to-immich-pipeline/david.key
     proton_roots:
       - /my-files/Photos
-    album_name: "Proton Import (David)"
+    album_name: "Proton Import"
     # /my-files is where `filesystem trash` is expected to work.
     delete_action: execute
 
   - name: mirjam
     staging_dir: /mnt/immich/staging/mirjam
-    proton_cache_dir: /mnt/immich/staging/.proton/mirjam
+    # A different Immich entirely -- a second instance on the same VM, on its
+    # own port. A second user in one instance works too; just point both
+    # immich_url values at it and give each its own key.
+    immich_url: http://127.0.0.1:2284/api
     immich_api_key_file: /etc/proton-to-immich-pipeline/mirjam.key
     proton_roots:
       - /my-files/Camera
-    album_name: "Proton Import (Mirjam)"
+    album_name: "Proton Import"
     # Her library may live under the Photos section, where the CLI's delete
     # support is unverified. Leave it as a to-do list until tested.
     delete_action: mark_only

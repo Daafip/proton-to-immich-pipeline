@@ -7,14 +7,21 @@ its health to Home Assistant.
 ```
  phone ─► Proton Drive ─► [pull] ─► [download] ─► staging/ready ─► [push] ─► Immich
                   ▲          │           │                          │         │
-                  │          └────► state.sqlite ◄──────────────────┘         │
+                  │          └──► <account>.sqlite ◄────────────────┘         │
       [delete-staged]                    │                                    │
       trash, on request                  ├─ [verify] → [reap] purges staging  │
-                  │                      │                                   │
-                  └─── staged_deletes ◄──┴─ [reconcile] ◄── what you trashed ─┘
+                  │                      │                                    │
+                  └─── staged_deletes ◄──┴─ [reconcile] ◄── what you trashed ──┘
                                          │
                                    status.json ─► Home Assistant
-                                   sync.py serve ─► web UI
+```
+
+One pipeline per person, each with its own Proton account, staging tree,
+database and Immich. `sync.py serve` reads every database and combines them:
+
+```
+      ui ──reads──► .state/david.sqlite   ◄──writes── david pipeline ──► immich A
+         ──reads──► .state/mirjam.sqlite  ◄──writes── mirjam pipeline ─► immich B
 ```
 
 Nothing is deleted locally until the asset is confirmed **server-side by
@@ -48,11 +55,18 @@ against live services — see
 | `staged` | List what is staged for deletion (`--csv` for the paths). |
 | `delete-staged` | Trash staged files in Proton. Dry run unless `--yes`. |
 | `unstage` | Take rows back off the delete queue. |
-| `serve` | The web UI: status, force sync, the delete queue. |
+| `serve` | The web UI: status, force sync, the delete queue, across every pipeline. |
+| `agent` | Run one pipeline forever: its schedule plus its job queue. What a container runs. |
+| `migrate` | Move an existing install to the layout the config asks for. |
 | `web-password` | Hash a password for `web.password_hash`. |
 
-Every command works on one account (`--account`, implicit when there is one).
-`status` and `serve` span all of them.
+Every command works on one account (`--account`, or `$PIS_ACCOUNT`, implicit
+when there is one). `status` and `serve` span all of them.
+
+**Two people = two independent pipelines** — separate Proton account, staging
+tree, database *and* Immich. One VM is all they share.
+[Docker](docs/operations.md#install-with-docker) is the easy way to run that: one container
+per pipeline plus one for the UI.
 
 Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** lock held ·
 **4** config fault (nothing was attempted; fix the config and re-run).
@@ -71,6 +85,20 @@ Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** loc
 ---
 
 ## Quick start
+
+**Docker** — one container per pipeline plus one for the UI, and the
+recommended path:
+
+```bash
+cp .env.example .env                 # uid/gid, keys, paths, web password
+cp config.docker.yaml config.yaml    # accounts, roots, schedule
+docker compose build
+docker compose run --rm ui web-password      # → PIS_WEB_PASSWORD_HASH
+docker compose run --rm david login          # once per pipeline
+docker compose up -d
+```
+
+**By hand:**
 
 ```bash
 sudo cp config.example.yaml /etc/proton-to-immich-pipeline/config.yaml
@@ -101,6 +129,11 @@ to every account, and one shared key uploads one person's photos into the
 other's library. Each account gets its own `immich_api_key_file:`;
 `sync.py status` refuses a config where two of them collide.
 
+Already running with one account? Follow
+[Going from one account to two](docs/operations.md#going-from-one-account-to-two)
+rather than editing the config in place — renaming the existing account without
+renaming it in the database re-downloads the whole library.
+
 Full deployment, including systemd, the backfill, the delete queue and the UI,
 is in [docs/operations.md](docs/operations.md). **Read
 [docs/known-issues.md](docs/known-issues.md) before a large backfill.**
@@ -114,15 +147,19 @@ sync.py                 CLI entry point
 src/config.py           config, Account objects, a PyYAML-free fallback parser
 src/log.py              one JSON line per state transition
 src/state.py            SQLite schema, transitions, resume, the delete queue
+src/migrate.py          moving an install to the layout the config asks for
 src/proton.py           Proton CLI backend, rclone fallback backend
 src/login.py            sign-in flow + the phone redirect page
 src/immich.py           REST client + docker immich-cli uploader
 src/pipeline.py         phase orchestration (backends injected, so testable)
 src/report.py           status.json + MQTT discovery
+src/agent.py            the loop one pipeline container runs
 src/web.py              http.server API, session auth, the job worker
 web/index.html          the whole frontend: one file, no build step
+Dockerfile              one image, two roles: agent and serve
+docker-compose.yml      one container per pipeline + one for the UI
 systemd/                templated per-account units, nightly timers, web service
-tests/                  376 tests, no network, no Docker
+tests/                  426 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -136,7 +173,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-376 tests, no network and no Docker. The Proton backend and Immich server are
+426 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap → reconcile` runs
 end to end, including the failure paths: truncated transfers, checksum
 mismatches, sessions expiring mid-run, killed runs resuming, quarantine after
@@ -157,6 +194,11 @@ it than anything else:
   checking that nothing leaks either way.
 - **`tests/test_state.py`** — the v1 → v3 migration, row by row, including the
   backup file and the refusal to migrate with no account to assign rows to.
+- **`tests/test_migrate.py`** — the layout migrations, and mostly what they
+  refuse: to run unasked, to guess whose rows are whose, to overwrite a
+  database, to drop an account nobody mentioned.
+- **`tests/test_agent.py`** — the container loop: an agent runs its own jobs
+  from its own database and nobody else's.
 - **`tests/test_throughput.py`** — batched downloads and the circuit breaker:
   that a batch never spans two folders or repeats a filename, that a batch
   which dies halfway keeps what landed, that one bad file does not charge an

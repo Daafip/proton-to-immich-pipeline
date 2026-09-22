@@ -173,7 +173,7 @@ class TestApiReads(WebTest):
 
     def test_reads_use_a_read_only_connection(self):
         import sqlite3
-        conn = self.api().reader()
+        conn = self.api().reader(ACCOUNT)
         try:
             with self.assertRaises(sqlite3.OperationalError):
                 conn.execute("DELETE FROM assets")
@@ -553,9 +553,10 @@ class TestHttpRoutes(HttpTest):
                 second = conn.getresponse()
                 self.assertEqual(second.status, 200)
                 json.loads(second.read())
-            except http.client.HTTPException:
-                # The server closed the connection, which is the other
-                # acceptable answer -- the client just has to reconnect.
+            except (http.client.HTTPException, OSError):
+                # The server hung up, which is the other acceptable answer to
+                # an undrainable body -- the client just has to reconnect.
+                # BrokenPipeError is an OSError, not an HTTPException.
                 pass
             finally:
                 conn.close()

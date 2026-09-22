@@ -94,9 +94,16 @@ in [operations.md](operations.md#verified-on).
 **Still only exercised against in-process fakes:**
 
 - **Everything added in v2.** `reconcile`, the delete path, the web UI and the
-  two-account layout have 123 tests between them (`test_delete.py`,
-  `test_web.py`, `test_accounts.py`) and have not touched a real Proton or
-  Immich. The specific unknowns are items 5 and 6 below.
+  two-pipeline layout have 170+ tests between them (`test_delete.py`,
+  `test_web.py`, `test_accounts.py`, `test_migrate.py`, `test_agent.py`) and
+  have not touched a real Proton or Immich. The specific unknowns are items 5
+  and 6 below.
+- **The container layout.** The image builds, both roles start, and a job
+  queued in the UI container was picked up and run by a pipeline container
+  through the shared state volume — all verified locally, but against an
+  unreachable Immich and with no Proton login. What is still unproven is the
+  part that needs credentials: `docker compose run --rm <pipeline> login`
+  completing a real sign-in, and an upload over `upload_mode: api`.
 - **`verify` and `reap` against the server** — and with them `/assets/{id}`,
   `/server/ping`, `/users/me`, `/search/metadata`. Endpoint paths drift
   between Immich versions.
@@ -113,13 +120,20 @@ in [operations.md](operations.md#verified-on).
 
 ## 4. Operational assumptions
 
-- **The service account.** The unit runs as `protonsync`, created by the
-  install steps — the Immich docker stack runs as root and leaves no host user
-  to borrow. It must own `/mnt/immich/staging`, and `immich.upload_mode: cli`
-  also needs it in the `docker` group, which is root-equivalent on that host.
-  Anything run by hand as root that writes into staging or `.state` leaves
-  files the timer then cannot touch; that is the most likely first-boot
-  failure.
+- **The service account** (bare metal only). The unit runs as `protonsync`,
+  created by the install steps — the Immich docker stack runs as root and
+  leaves no host user to borrow. It must own `/mnt/immich/staging`, and
+  `immich.upload_mode: cli` also needs it in the `docker` group, which is
+  root-equivalent on that host. Anything run by hand as root that writes into
+  staging or `.state` leaves files the timer then cannot touch; that is the
+  most likely first-boot failure.
+
+  **The container layout removes most of this**: the image runs as
+  `PIS_UID`/`PIS_GID`, `upload_mode: api` needs no docker group, and the only
+  ownership that matters is that those ids own the two bind mounts. The
+  equivalent first-boot failure there is a uid mismatch, which shows up
+  immediately as `Permission denied` on the state volume rather than three
+  days later.
 - **CLI flags drift between builds.** Observed the hard way: `-c` for
   `filesystem download` works in 0.6.0 and is rejected by 0.8.0, which failed
   every download in a run until the template moved to the long
