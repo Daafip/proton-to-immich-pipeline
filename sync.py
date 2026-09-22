@@ -455,9 +455,19 @@ def cmd_web_password(cfg, args) -> int:
     if first != getpass.getpass("again: "):
         print("passwords do not match", file=sys.stderr)
         return EXIT_PARTIAL
-    print("\nAdd this to the config (or set PIS_WEB_PASSWORD_HASH):\n")
+    digest = hash_password(first)
+    print("\nDocker -- put this line in .env:\n")
+    print(f"PIS_WEB_PASSWORD_HASH={digest}")
+    # Only the real assignment may start a line with the variable name, so
+    # `web-password | grep ^PIS_WEB_PASSWORD_HASH >> .env` does the right
+    # thing instead of appending a sentence to the env file.
+    print("\nBare metal -- put this in the config, or use the same env")
+    print("line above in the service's EnvironmentFile:\n")
     print("web:")
-    print(f"  password_hash: \"{hash_password(first)}\"")
+    print(f"  password_hash: \"{digest}\"")
+    print("\nThe hash is colon-separated on purpose: a `$` in it would be "
+          "eaten\nby Docker Compose's .env interpolation, leaving a truncated "
+          "hash and\na login that can never succeed.")
     return EXIT_OK
 
 

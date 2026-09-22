@@ -70,16 +70,37 @@ class WebTest(unittest.TestCase):
 class TestPasswords(unittest.TestCase):
     def test_hash_round_trip(self):
         stored = web.hash_password("hunter2")
-        self.assertTrue(stored.startswith("scrypt$"))
+        self.assertTrue(stored.startswith("scrypt:"))
         self.assertNotIn("hunter2", stored)
         self.assertTrue(web.verify_password(stored, "hunter2"))
         self.assertFalse(web.verify_password(stored, "hunter3"))
+
+    def test_the_hash_contains_no_dollar_sign(self):
+        """A `$` would be eaten by Docker Compose's .env interpolation --
+        `scrypt$32768$8$1$<salt>$<key>` reaches the container as
+        `scrypt$32768$8$1`, and every login fails with no explanation."""
+        for _ in range(5):
+            self.assertNotIn("$", web.hash_password("hunter2"))
+
+    def test_a_legacy_dollar_separated_hash_still_verifies(self):
+        stored = web.hash_password("hunter2").replace(":", "$")
+        self.assertTrue(web.verify_password(stored, "hunter2"))
+        self.assertFalse(web.verify_password(stored, "wrong"))
+
+    def test_a_truncated_hash_is_refused_not_matched(self):
+        """What a `$`-separated hash looks like after .env has had it."""
+        for mangled in ("scrypt$32768$8$1", "scrypt:32768:8:1",
+                        "scrypt$$32768$$8$$1", "scrypt:32768"):
+            with self.subTest(mangled=mangled):
+                self.assertIsNone(web.split_hash(mangled))
+                self.assertFalse(web.verify_password(mangled, "hunter2"))
 
     def test_each_hash_is_salted(self):
         self.assertNotEqual(web.hash_password("x"), web.hash_password("x"))
 
     def test_a_malformed_hash_is_just_a_failed_login(self):
-        for junk in ("", "nonsense", "scrypt$a$b$c$d$e", "md5$1$2$3$4$5"):
+        for junk in ("", "nonsense", "scrypt:a:b:c:d:e", "md5:1:2:3:4:5",
+                     "scrypt$a$b$c$d$e"):
             self.assertFalse(web.verify_password(junk, "anything"))
 
     def test_session_signing(self):
@@ -104,6 +125,26 @@ class TestPasswords(unittest.TestCase):
         forged = web.sign_session(b"guess" * 8, int(time.time()) + 9999)
         self.assertFalse(web.check_session(secret, forged))
         self.assertFalse(web.check_session(secret, f"{forged.split('.')[0]}.{mac}"))
+
+
+class TestMangledHashIsRefusedAtStartup(WebTest):
+    def test_serve_refuses_a_truncated_hash_rather_than_failing_logins(self):
+        """The failure mode this replaces: every login rejected, nothing in
+        the log to say the hash itself was the problem."""
+        self.cfg.set("web.password_hash", "scrypt$32768$8$1")
+        with self.assertRaises(ValueError) as ctx:
+            web.Api(self.cfg, require_auth=True)
+        message = str(ctx.exception)
+        self.assertIn(".env", message)
+        self.assertIn("web-password", message)
+
+    def test_a_good_hash_starts_normally(self):
+        self.cfg.set("web.password_hash", web.hash_password("x"))
+        self.assertTrue(web.Api(self.cfg, require_auth=True).auth_configured)
+
+    def test_no_hash_at_all_is_not_an_error(self):
+        self.cfg.set("web.password_hash", "")
+        self.assertFalse(web.Api(self.cfg, require_auth=True).auth_configured)
 
 
 class TestSecret(WebTest):

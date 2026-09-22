@@ -77,7 +77,7 @@ cp config.docker.yaml config.yaml  # accounts, roots, schedule
 $EDITOR .env config.yaml
 
 docker compose build
-docker compose run --rm ui web-password    # paste into PIS_WEB_PASSWORD_HASH
+docker compose run --rm ui web-password    # prints the PIS_WEB_PASSWORD_HASH line
 
 docker compose run --rm david  login       # once per pipeline
 docker compose run --rm mirjam login
@@ -547,6 +547,29 @@ The UI holds **no Proton session and no Immich key** — it never talks to
 either. That is why it validates its config on structure alone and starts
 happily without credentials, and why the container version mounts no staging
 tree.
+
+### Setting the password
+
+```bash
+python3 sync.py web-password                 # bare metal
+docker compose run --rm ui web-password      # containers
+```
+
+It prompts twice and prints the hash in both forms — a
+`PIS_WEB_PASSWORD_HASH=…` line for `.env` or a systemd env file, and a
+`web.password_hash:` line for the config.
+
+The hash is **colon**-separated, `scrypt:32768:8:1:salt:key`, not the `$` that
+crypt-style strings normally use. That is deliberate: Docker Compose
+interpolates values from `.env`, so `scrypt$32768$8$1$<salt>$<key>` reaches
+the container as `scrypt$32768$8$1` — `$<salt>` is an undefined variable and
+expands to nothing. `env_file:` behaves the same way, and systemd's
+`EnvironmentFile=` has the same hazard. The result is a silently truncated
+hash and a login that can never succeed.
+
+`serve` refuses to start on a hash it cannot parse and says so, rather than
+rejecting every password with no explanation. A `$`-separated hash from an
+older build still verifies **if it reached the process intact**.
 
 **Set a password before binding anywhere but loopback.** Mirjam uses this, so
 it is not a localhost tool — and it can trash files in Proton. `serve` refuses
@@ -1242,6 +1265,8 @@ everything, restore the relevant file, and downgrade the code.
 | `delete-staged` reports only dry runs | `--yes` was omitted. Without it the command is a dry run whatever else is passed. |
 | Nothing ever appears in `staged` | Immich's trash was auto-emptied before a sync saw it (default ~30 days), or `reconcile.enabled: false`. |
 | `web.refusing_unauthenticated_bind` (exit 4) | `web.bind` is not loopback and no password is set. `sync.py web-password`, or bind to 127.0.0.1. |
+| `web.password_hash is not a usable scrypt hash` | It was truncated in transit — almost always a `$`-separated hash through a `.env` file, where compose ate everything after the first `$`. Regenerate with `sync.py web-password`; the current format uses colons and survives. |
+| The web password is rejected no matter what | Same cause as above on an older build. Check the hash in the container: `docker compose exec ui printenv PIS_WEB_PASSWORD_HASH` — if it is shorter than the one in `.env`, that is it. |
 | The UI rejects every sync click | A job is stuck `running` from a killed server. Restarting the web service releases them; `serve` does that at startup. |
 | `sudo: a password is required` in a job | The `systemd` job runner without the sudoers entry. Install `systemd/sudoers.example`, or use `job_runner: subprocess`. |
 | `layout.migration_required` (exit 4) | The shared `state.sqlite` is still there and a pipeline has no database of its own. Nothing was changed — run `sync.py migrate`. |

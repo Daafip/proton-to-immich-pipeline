@@ -68,22 +68,52 @@ SCRYPT_P = 1
 # --------------------------------------------------------------------------
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
-    """`scrypt$n$r$p$salt$key`, so the config holds no password."""
+    """`scrypt:n:r:p:salt:key`, so the config holds no password.
+
+    Colons, not the `$` that crypt(3)-style strings conventionally use. The
+    hash has to survive being pasted into a `.env` file, and **Docker Compose
+    interpolates those**: `scrypt$32768$8$1$<salt>$<key>` arrives in the
+    container as `scrypt$32768$8$1`, because `$<salt>` is read as an undefined
+    variable and expands to nothing. The result is a silently truncated hash
+    and a login that can never succeed. systemd's `EnvironmentFile=` has the
+    same hazard. A colon is special to none of them.
+    """
     salt = salt or secrets.token_bytes(16)
     key = scrypt(password.encode("utf-8"), salt=salt, n=SCRYPT_N,
                  r=SCRYPT_R, p=SCRYPT_P, dklen=32, maxmem=64 * 1024 * 1024)
-    return (f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}"
-            f"${salt.hex()}${key.hex()}")
+    return (f"scrypt:{SCRYPT_N}:{SCRYPT_R}:{SCRYPT_P}"
+            f":{salt.hex()}:{key.hex()}")
+
+
+def split_hash(stored: str) -> tuple[str, int, int, int, str, str] | None:
+    """Parse either separator. Returns None if it is not a usable hash.
+
+    `$` is still accepted so a hash generated before the move to colons keeps
+    working -- but only if it survived the trip, which through a `.env` file
+    it very likely did not.
+    """
+    text = (stored or "").strip()
+    for sep in (":", "$"):
+        if text.count(sep) == 5:
+            scheme, n, r, p, salt_hex, key_hex = text.split(sep)
+            if scheme != "scrypt":
+                return None
+            try:
+                return scheme, int(n), int(r), int(p), salt_hex, key_hex
+            except ValueError:
+                return None
+    return None
 
 
 def verify_password(stored: str, password: str) -> bool:
     """Constant-time compare, and a malformed hash is simply a failed login."""
+    parsed = split_hash(stored)
+    if parsed is None:
+        return False
+    _, n, r, p, salt_hex, key_hex = parsed
     try:
-        scheme, n, r, p, salt_hex, key_hex = stored.split("$")
-        if scheme != "scrypt":
-            return False
         candidate = scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt_hex),
-                           n=int(n), r=int(r), p=int(p),
+                           n=n, r=r, p=p,
                            dklen=len(key_hex) // 2, maxmem=64 * 1024 * 1024)
     except (ValueError, TypeError, MemoryError):
         return False
@@ -302,6 +332,17 @@ class Api:
         if plaintext and not self.password_hash:
             # Hashed here and not written anywhere; the env var is the source.
             self.password_hash = hash_password(plaintext)
+        if self.password_hash and split_hash(self.password_hash) is None:
+            # Almost always a hash that went through Docker Compose or a
+            # systemd EnvironmentFile and had everything after the first `$`
+            # eaten. Failing every login with no explanation is the worst
+            # possible way to find that out.
+            raise ValueError(
+                f"web.password_hash is not a usable scrypt hash "
+                f"({self.password_hash[:24]!r}...). If it came from a .env "
+                f"file, the `$` characters were interpolated away -- "
+                f"regenerate it with `sync.py web-password`, which now emits "
+                f"a colon-separated hash that survives that trip.")
         self.require_auth = bool(require_auth and self.password_hash)
         self.auth_configured = bool(self.password_hash)
         self.session_hours = int(cfg.get("web.session_hours", 168))
