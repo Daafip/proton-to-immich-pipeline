@@ -11,7 +11,14 @@ staging/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite.pre-v3-*
 status.json
+status-*.json
+
+# v2: the web UI's cookie-signing key, and the per-account Immich keys.
+# Holding the secret is enough to mint a session.
+web-secret
+*.key
 
 __pycache__/
 *.pyc

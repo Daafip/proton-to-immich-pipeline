@@ -12,6 +12,10 @@ from src.pipeline import AuthFailure, Pipeline  # noqa: E402
 from tests.helpers import (FakeImmichClient, FakeImmichServer, FakeProtonBackend,  # noqa: E402
                            FakeUploader, sha1_bytes, silence_logs)
 
+# The account every Pipeline in these tests belongs to: `load(None)` yields a
+# single-account config, and its name is what state rows are scoped by.
+ACCOUNT = "default"
+
 
 class PipelineTest(unittest.TestCase):
     def setUp(self):
@@ -29,7 +33,7 @@ class PipelineTest(unittest.TestCase):
                           self.cfg.incoming_dir, self.cfg.batch_dir):
             directory.mkdir(parents=True, exist_ok=True)
         self.conn = state.connect(self.cfg.db_path)
-        state.init_schema(self.conn)
+        state.init_schema(self.conn, ACCOUNT)
 
         self.backend = FakeProtonBackend()
         self.server = FakeImmichServer()
@@ -62,7 +66,7 @@ class TestHappyPath(PipelineTest):
         self.assertEqual(stats.verified, 3)
         self.assertEqual(stats.purged, 3)
         self.assertEqual(stats.failed, 0)
-        counts = state.counts(self.conn)
+        counts = state.counts(self.conn, ACCOUNT)
         self.assertEqual(counts[state.PURGED], 3)
         self.assertEqual(self.ready_files(), [], "staging should shrink back")
 
@@ -87,7 +91,7 @@ class TestHappyPath(PipelineTest):
         self.seed(2)
         stats = self.pipe(run_id="r1", dry_run=True).pull()
         self.assertEqual(stats.discovered, 2)
-        self.assertEqual(state.counts(self.conn)["total"], 0)
+        self.assertEqual(state.counts(self.conn, ACCOUNT)["total"], 0)
 
     def test_pull_counts_new_changed_unchanged(self):
         self.seed(2)
@@ -116,7 +120,7 @@ class TestDownload(PipelineTest):
         pipeline.pull()
         pipeline.download(limit=2)
         self.assertEqual(pipeline.stats.downloaded, 2)
-        self.assertEqual(state.counts(self.conn)[state.DISCOVERED], 3)
+        self.assertEqual(state.counts(self.conn, ACCOUNT)[state.DISCOVERED], 3)
 
     def test_free_space_floor_aborts(self):
         self.seed(2)
@@ -133,7 +137,7 @@ class TestDownload(PipelineTest):
         pipeline.pull()
         self.backend.files["/Photos/a.jpg"] = b"x" * 40  # truncated transfer
         pipeline.download()
-        row = state.get(self.conn, "node-1")
+        row = state.get(self.conn, ACCOUNT, "node-1")
         self.assertEqual(row["status"], state.FAILED)
         self.assertIn("size mismatch", row["last_error"])
         self.assertEqual(self.ready_files(), [])
@@ -145,13 +149,13 @@ class TestDownload(PipelineTest):
         first.pull()
         first.download()
         self.assertEqual(first.stats.failed, 1)
-        self.assertEqual(state.get(self.conn, "node-1")["attempts"], 1)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["attempts"], 1)
 
         self.backend.fail_paths.clear()
         second = self.pipe(run_id="r2")
         second.download()
         self.assertEqual(second.stats.downloaded, 1)
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.DOWNLOADED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.DOWNLOADED)
 
     def test_quarantine_after_repeated_failures(self):
         self.backend.add("/Photos/a.jpg", b"x" * 10)
@@ -159,7 +163,7 @@ class TestDownload(PipelineTest):
         self.pipe(run_id="r0").pull()
         for i in range(5):
             self.pipe(run_id=f"r{i}").download()
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.QUARANTINED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.QUARANTINED)
 
     def test_incoming_scratch_is_cleaned(self):
         self.seed(1)
@@ -200,7 +204,7 @@ class TestPush(PipelineTest):
         self.server.add(sha1_bytes(b"already there"), "existing-asset")
         pipeline = self.prepared()
         pipeline.push()
-        row = state.get(self.conn, "node-1")
+        row = state.get(self.conn, ACCOUNT, "node-1")
         self.assertEqual(row["status"], state.UPLOADED)
         self.assertEqual(row["is_duplicate"], 1)
         self.assertEqual(row["immich_asset_id"], "existing-asset")
@@ -232,9 +236,9 @@ class TestPush(PipelineTest):
     def test_missing_local_file_fails_the_row(self):
         self.seed(1)
         pipeline = self.prepared()
-        Path(state.get(self.conn, "node-1")["local_path"]).unlink()
+        Path(state.get(self.conn, ACCOUNT, "node-1")["local_path"]).unlink()
         pipeline.push()
-        row = state.get(self.conn, "node-1")
+        row = state.get(self.conn, ACCOUNT, "node-1")
         self.assertEqual(row["status"], state.FAILED)
         self.assertIn("local file missing", row["last_error"])
 
@@ -251,7 +255,7 @@ class TestPush(PipelineTest):
         self.prepared()
         pipeline = self.pipe(run_id="r2", dry_run=True)
         pipeline.push()
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.DOWNLOADED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.DOWNLOADED)
         self.assertEqual(self.uploader.calls[0][1], True)
 
     def test_push_survives_precheck_outage(self):
@@ -260,7 +264,7 @@ class TestPush(PipelineTest):
         pipeline._client = FakeImmichClient(self.server, fail_precheck=True)
         pipeline.push()
         # Precheck and postcheck both unavailable -> falls back to find_by_checksum
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.UPLOADED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.UPLOADED)
 
 
 class TestConfigFaultsDoNotBurnAttempts(PipelineTest):
@@ -300,7 +304,7 @@ class TestConfigFaultsDoNotBurnAttempts(PipelineTest):
         from src.immich import ImmichConfigError
         with self.assertRaises(ImmichConfigError):
             pipeline.push()
-        state.resume(self.conn)
+        state.resume(self.conn, ACCOUNT)
         rows = self.conn.execute("SELECT * FROM assets").fetchall()
         self.assertTrue(all(r["status"] == state.DOWNLOADED for r in rows),
                         "a fixed config must let the next run pick them up")
@@ -340,7 +344,7 @@ class TestPrecheck(PipelineTest):
 
         pipeline.precheck()
         self.assertEqual(pipeline.stats.skipped_present, 1)
-        row = state.get(self.conn, "node-1")
+        row = state.get(self.conn, ACCOUNT, "node-1")
         self.assertEqual(row["status"], state.UPLOADED)
         self.assertEqual(row["immich_asset_id"], "existing-1")
         self.assertEqual(row["is_duplicate"], 1)
@@ -355,7 +359,7 @@ class TestPrecheck(PipelineTest):
         pipeline = self.pull_with_claimed(contents)
         pipeline.precheck()
         self.assertEqual(pipeline.stats.skipped_present, 0)
-        self.assertEqual(state.counts(self.conn)[state.DISCOVERED], 2)
+        self.assertEqual(state.counts(self.conn, ACCOUNT)[state.DISCOVERED], 2)
 
     def test_rows_without_a_claimed_digest_are_ignored(self):
         self.seed(2)
@@ -370,7 +374,7 @@ class TestPrecheck(PipelineTest):
         pipeline = self.pull_with_claimed(contents)
         pipeline.precheck()
         pipeline.verify()
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.VERIFIED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.VERIFIED)
 
     def test_skipped_rows_reach_a_terminal_state(self):
         contents = self.seed_with_digests(1)
@@ -379,8 +383,8 @@ class TestPrecheck(PipelineTest):
         pipeline.precheck()
         pipeline.verify()
         pipeline.reap()
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.PURGED)
-        self.assertEqual(state.backlog(self.conn), 0)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.PURGED)
+        self.assertEqual(state.backlog(self.conn, ACCOUNT), 0)
 
     def test_precheck_outage_falls_back_to_downloading(self):
         contents = self.seed_with_digests(2)
@@ -399,7 +403,7 @@ class TestPrecheck(PipelineTest):
         dry = self.pipe(run_id="r2", dry_run=True)
         dry.precheck()
         self.assertEqual(dry.stats.skipped_present, 1)
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.DISCOVERED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.DISCOVERED)
 
     def test_batching_covers_every_row(self):
         contents = self.seed_with_digests(5)
@@ -442,14 +446,14 @@ class TestVerifyAndReap(PipelineTest):
         pipeline = self.uploaded(2)
         pipeline.verify()
         self.assertEqual(pipeline.stats.verified, 2)
-        self.assertEqual(state.counts(self.conn)[state.VERIFIED], 2)
+        self.assertEqual(state.counts(self.conn, ACCOUNT)[state.VERIFIED], 2)
 
     def test_checksum_mismatch_fails_verification(self):
         pipeline = self.uploaded(1)
-        row = state.get(self.conn, "node-1")
+        row = state.get(self.conn, ACCOUNT, "node-1")
         self.server.corrupt.add(row["immich_asset_id"])
         pipeline.verify()
-        row = state.get(self.conn, "node-1")
+        row = state.get(self.conn, ACCOUNT, "node-1")
         self.assertEqual(row["status"], state.FAILED)
         self.assertIn("checksum mismatch", row["last_error"])
 
@@ -457,7 +461,7 @@ class TestVerifyAndReap(PipelineTest):
         pipeline = self.uploaded(1)
         self.server.by_checksum.clear()
         pipeline.verify()
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.FAILED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.FAILED)
 
     def test_reap_respects_grace_period(self):
         self.cfg.set("reap.keep_days", 7)
@@ -470,7 +474,7 @@ class TestVerifyAndReap(PipelineTest):
         pipeline.reap(keep_days=0)
         self.assertEqual(pipeline.stats.purged, 1)
         self.assertEqual(self.ready_files(), [])
-        self.assertEqual(state.get(self.conn, "node-1")["status"], state.PURGED)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.PURGED)
 
     def test_reap_clears_abandoned_scratch_dirs(self):
         import os
@@ -504,7 +508,7 @@ class TestResilience(PipelineTest):
         with self.assertRaises(AuthFailure):
             pipeline.download()
         self.assertFalse(pipeline.auth_ok)
-        state.resume(self.conn)
+        state.resume(self.conn, ACCOUNT)
         stuck = self.conn.execute(
             "SELECT COUNT(*) c FROM assets WHERE status IN (?,?)",
             (state.DOWNLOADING, state.UPLOADING)).fetchone()["c"]
@@ -516,16 +520,16 @@ class TestResilience(PipelineTest):
         pipeline.pull()
         pipeline.download()
         # Simulate a kill in the middle of a push.
-        state.mark_uploading(self.conn, "node-1")
+        state.mark_uploading(self.conn, ACCOUNT, "node-1")
         resumed = self.pipe(run_id="r2")
         resumed.run()
-        self.assertEqual(state.counts(self.conn)[state.PURGED], 2)
+        self.assertEqual(state.counts(self.conn, ACCOUNT)[state.PURGED], 2)
 
     def test_interrupted_download_row_is_retried(self):
         self.seed(1)
         pipeline = self.pipe(run_id="r1")
         pipeline.pull()
-        state.mark_downloading(self.conn, "node-1")
+        state.mark_downloading(self.conn, ACCOUNT, "node-1")
         second = self.pipe(run_id="r2")
         second.run()
         self.assertEqual(second.stats.downloaded, 1)

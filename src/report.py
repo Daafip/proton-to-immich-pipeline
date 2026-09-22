@@ -23,11 +23,31 @@ from typing import Any
 from . import log, state
 
 
+def _disk(path: Path) -> tuple[float | None, float | None]:
+    """Free space on the filesystem holding `path`.
+
+    Walks up to the nearest existing ancestor: an account whose staging
+    subtree has not been created yet still lives on a filesystem with a
+    known amount of free space, and reporting "None GB" for it would look
+    like a broken sensor rather than an empty directory.
+    """
+    for candidate in (path, *path.parents):
+        try:
+            usage = shutil.disk_usage(str(candidate))
+        except OSError:
+            continue
+        return (round(usage.free / 1e9, 2),
+                round(usage.used / usage.total * 100, 1) if usage.total else None)
+    return None, None
+
+
 def build_status(conn: sqlite3.Connection, cfg, auth_ok: bool | None = None,
                  immich_ok: bool | None = None) -> dict[str, Any]:
-    counts = state.counts(conn)
-    last = state.last_run(conn)
-    success = state.last_success(conn)
+    """One account's health. `cfg` is that account's Account object."""
+    account = str(getattr(cfg, "account_name", None) or "default")
+    counts = state.counts(conn, account)
+    last = state.last_run(conn, account)
+    success = state.last_success(conn, account)
     stale_hours = int(cfg.get("report.stale_success_hours", 48))
 
     last_success_ts = success["finished_at"] if success else None
@@ -36,15 +56,11 @@ def build_status(conn: sqlite3.Connection, cfg, auth_ok: bool | None = None,
     if parsed is not None:
         stale = datetime.now(timezone.utc) - parsed > timedelta(hours=stale_hours)
 
-    try:
-        usage = shutil.disk_usage(str(cfg.staging))
-        free_gb = round(usage.free / 1e9, 2)
-        used_pct = round(usage.used / usage.total * 100, 1) if usage.total else None
-    except OSError:
-        free_gb, used_pct = None, None
+    free_gb, used_pct = _disk(cfg.staging)
 
     return {
-        "schema": 1,
+        "schema": 2,
+        "account": account,
         "generated_at": state.utcnow(),
         "last_run": last["started_at"] if last else None,
         "last_run_finished": last["finished_at"] if last else None,
@@ -55,8 +71,15 @@ def build_status(conn: sqlite3.Connection, cfg, auth_ok: bool | None = None,
         "downloaded": last["downloaded"] if last else 0,
         "uploaded": last["uploaded"] if last else 0,
         "failed": last["failed"] if last else 0,
-        "backlog": state.backlog(conn),
+        "backlog": state.backlog(conn, account),
+        "uploaded_total": state.uploaded_total(conn, account),
         "quarantined": counts.get(state.QUARANTINED, 0),
+        # v2: how many files someone has trashed in Immich and not yet
+        # deleted from Proton. A number that only ever grows is the signal
+        # that nobody is working the queue.
+        "staged_deletes": state.count_staged(conn, account),
+        "delete_failed": counts.get(state.DELETE_FAILED, 0),
+        "delete_action": str(getattr(cfg, "delete_action", "mark_only")),
         "auth_ok": bool(auth_ok) if auth_ok is not None else None,
         "immich_ok": bool(immich_ok) if immich_ok is not None else None,
         "counts": {k: v for k, v in counts.items() if k != "total"},
@@ -87,6 +110,8 @@ SENSORS: list[dict[str, Any]] = [
     {"key": "new", "name": "New last run", "icon": "mdi:image-plus", "unit": "files"},
     {"key": "failed", "name": "Failed last run", "icon": "mdi:alert-circle", "unit": "files"},
     {"key": "quarantined", "name": "Quarantined", "icon": "mdi:biohazard", "unit": "files"},
+    {"key": "staged_deletes", "name": "Staged for deletion",
+     "icon": "mdi:delete-clock", "unit": "files"},
     {"key": "staging_free_gb", "name": "Staging free", "icon": "mdi:harddisk", "unit": "GB"},
     {"key": "last_run", "name": "Last run", "device_class": "timestamp"},
     {"key": "last_success", "name": "Last success", "device_class": "timestamp"},
@@ -98,13 +123,32 @@ BINARY_SENSORS: list[dict[str, Any]] = [
 ]
 
 
+def mqtt_identity(cfg) -> tuple[str, str, str]:
+    """(discovery_prefix, node_id, state_topic) for this account.
+
+    Suffixed per account: two accounts publishing to one retained topic would
+    each overwrite the other's state, and Home Assistant would show whichever
+    ran last as the whole truth.
+    """
+    prefix = str(cfg.get("mqtt.discovery_prefix", "homeassistant"))
+    node = str(cfg.get("mqtt.node_id", "proton_immich_sync"))
+    topic = str(cfg.get("mqtt.state_topic", "proton_immich_sync/state"))
+    account = str(getattr(cfg, "account_name", None) or "default")
+    if account != "default" and not node.endswith(account):
+        node = f"{node}_{account}"
+        base, _, leaf = topic.rpartition("/")
+        topic = f"{base}/{account}/{leaf}" if base else f"{account}/{topic}"
+    return prefix, node, topic
+
+
 def discovery_payloads(cfg) -> list[tuple[str, dict[str, Any]]]:
-    prefix = cfg.get("mqtt.discovery_prefix", "homeassistant")
-    node = cfg.get("mqtt.node_id", "proton_immich_sync")
-    state_topic = cfg.get("mqtt.state_topic", "proton_immich_sync/state")
+    prefix, node, state_topic = mqtt_identity(cfg)
+    account = str(getattr(cfg, "account_name", None) or "default")
+    label = ("Proton to Immich sync" if account == "default"
+             else f"Proton to Immich sync ({account})")
     device = {
         "identifiers": [node],
-        "name": "Proton to Immich sync",
+        "name": label,
         "manufacturer": "proton-to-immich-pipeline",
         "model": "pipeline",
     }
@@ -203,8 +247,7 @@ class MqttPublisher:
         if with_discovery:
             messages += [(topic, json.dumps(payload))
                          for topic, payload in discovery_payloads(self.cfg)]
-        messages.append((self.cfg.get("mqtt.state_topic", "proton_immich_sync/state"),
-                         json.dumps(status)))
+        messages.append((mqtt_identity(self.cfg)[2], json.dumps(status)))
         try:
             if self._publish_paho(messages):
                 return True

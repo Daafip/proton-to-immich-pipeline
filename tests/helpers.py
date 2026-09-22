@@ -39,6 +39,17 @@ class FakeProtonBackend:
         self.fail_paths: set[str] = set()
         self.auth_fail_paths: set[str] = set()
         self.downloads: list[str] = []
+        # One entry per download_many call, so tests can assert on batching.
+        self.batch_calls: list[list[str]] = []
+        # -- the delete path
+        self.trashed: dict[str, bytes] = {}
+        self.trash_calls: list[str] = []
+        self.trash_fail_paths: set[str] = set()
+        self.trash_auth_fail_paths: set[str] = set()
+        # Paths where `trash` reports success but leaves the node in place --
+        # the case the post-trash verification exists to catch.
+        self.trash_noop_paths: set[str] = set()
+        self.resolve_fail_paths: set[str] = set()
 
     def add(self, path: str, content: bytes, node_id: str | None = None,
             modified: str = "2026-08-01T10:00:00+00:00") -> str:
@@ -80,6 +91,58 @@ class FakeProtonBackend:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(self.files[node.path])
 
+    def download_many(self, nodes, dest_dir: Path) -> None:
+        """One call, every file into one folder -- as `filesystem download
+        path... localFolder` behaves.
+
+        Crucially it fails the way the real thing does: it raises on the first
+        bad file and leaves everything written before it on disk. That partial
+        state is what the pipeline has to cope with, so the fake has to
+        produce it.
+        """
+        self.batch_calls.append([node.path for node in nodes])
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for node in nodes:
+            if node.path in self.auth_fail_paths:
+                raise AuthError("session expired")
+            if node.path in self.fail_paths:
+                raise ProtonError("simulated transfer failure")
+            if node.path not in self.files:
+                raise ProtonError("no such file")
+            self.downloads.append(node.path)
+            (dest_dir / node.name).write_bytes(self.files[node.path])
+
+    # -- the delete path ---------------------------------------------------
+    def node_at(self, path: str) -> RemoteNode | None:
+        if path not in self.files:
+            return None
+        meta = self.meta.get(path, {})
+        return RemoteNode(
+            node_id=meta.get("node_id", f"path:{path}"),
+            path=path,
+            name=os.path.basename(path),
+            size=len(self.files[path]),
+            modified=meta.get("modified"),
+            is_folder=False,
+        )
+
+    def resolve(self, path: str) -> RemoteNode | None:
+        if path in self.resolve_fail_paths:
+            raise ProtonError("simulated info failure")
+        return self.node_at(path)
+
+    def trash(self, path: str) -> None:
+        """Move to the fake trash: gone from `files`, still recoverable here."""
+        if path in self.trash_auth_fail_paths:
+            raise AuthError("session expired")
+        if path in self.trash_fail_paths:
+            raise ProtonError("simulated trash failure")
+        self.trash_calls.append(path)
+        if path in self.trash_noop_paths:
+            return
+        if path in self.files:
+            self.trashed[path] = self.files.pop(path)
+
 
 class FakeImmichServer:
     """Holds assets keyed by sha1, the way the real server dedupes."""
@@ -87,6 +150,8 @@ class FakeImmichServer:
     def __init__(self):
         self.by_checksum: dict[str, str] = {}
         self.corrupt: set[str] = set()
+        # asset_id -> the metadata /search/metadata would return for it.
+        self.trash: dict[str, dict[str, Any]] = {}
 
     def add(self, sha1_hex: str, asset_id: str | None = None) -> str:
         asset_id = asset_id or str(uuid.uuid4())
@@ -96,12 +161,28 @@ class FakeImmichServer:
     def asset_id_for(self, sha1_hex: str) -> str | None:
         return self.by_checksum.get(sha1_hex)
 
+    def trash_asset(self, asset_id: str, filename: str = "x.jpg",
+                    asset_type: str = "IMAGE") -> str:
+        """What "someone deleted this photo in Immich" looks like."""
+        self.trash[str(asset_id)] = {
+            "id": str(asset_id), "originalFileName": filename,
+            "type": asset_type, "isTrashed": True,
+        }
+        return str(asset_id)
+
+    def empty_trash(self) -> None:
+        """Immich's 30-day auto-purge: the asset stops being discoverable."""
+        self.trash.clear()
+
 
 class FakeImmichClient:
-    def __init__(self, server: FakeImmichServer, fail_precheck: bool = False):
+    def __init__(self, server: FakeImmichServer, fail_precheck: bool = False,
+                 fail_trash_search: bool = False):
         self.server = server
         self.fail_precheck = fail_precheck
+        self.fail_trash_search = fail_trash_search
         self.uploaded: list[str] = []
+        self.trash_queries: list[tuple] = []
 
     def ping(self) -> bool:
         return True
@@ -119,6 +200,16 @@ class FakeImmichClient:
             out[str(key)] = UploadResult(
                 asset_id=asset_id, duplicate=bool(asset_id), found=bool(asset_id))
         return out
+
+    def search_trashed(self, types=("IMAGE", "VIDEO"), page_size: int = 250,
+                       max_pages: int = 400) -> list[dict[str, Any]]:
+        from src.immich import ImmichError
+        self.trash_queries.append(tuple(types))
+        if self.fail_trash_search:
+            raise ImmichError("search/metadata unavailable")
+        wanted = {str(t).upper() for t in types}
+        return [dict(item) for item in self.server.trash.values()
+                if str(item.get("type", "IMAGE")).upper() in wanted]
 
     def find_by_checksum(self, sha1_hex: str, filename: str | None = None) -> UploadResult:
         asset_id = self.server.asset_id_for(sha1_hex)

@@ -79,6 +79,20 @@ def checksums_match(local_sha1_hex: str | None, remote: str | None) -> bool:
     return bool(a and b and a == b)
 
 
+def _api_key(cfg) -> str:
+    """The key belonging to *this* account.
+
+    Config.immich_api_key() reads immich.api_key_file when one is set, which
+    is how two accounts hold two keys without either being written into the
+    config. Read here rather than cached at load time so a key never sits in
+    the config data that gets logged or serialised.
+    """
+    reader = getattr(cfg, "immich_api_key", None)
+    if callable(reader):
+        return str(reader())
+    return str(cfg.get("immich.api_key", ""))
+
+
 @dataclass
 class UploadResult:
     asset_id: str | None = None
@@ -103,7 +117,7 @@ class ImmichClient:
             log.warn("immich.url_missing_api_suffix", url=url)
             url = url + "/api"
         self.base_url = url
-        self.api_key = str(cfg.get("immich.api_key", ""))
+        self.api_key = _api_key(cfg)
         self.timeout = int(cfg.get("immich.http_timeout_sec", 120))
         self.device_id = str(cfg.get("immich.device_id", "proton-to-immich-pipeline"))
         self._checksum_format: str | None = None
@@ -231,6 +245,52 @@ class ImmichClient:
                 log.debug("immich.search_failed", detail=str(exc)[:200])
         return UploadResult()
 
+    def search_trashed(
+        self,
+        types: Sequence[str] = ("IMAGE", "VIDEO"),
+        page_size: int = 250,
+        max_pages: int = 400,
+    ) -> list[dict[str, Any]]:
+        """Every asset currently sitting in Immich's trash.
+
+        /search/metadata takes one `type` per request, so each is queried
+        separately and the results deduped by asset id.
+
+        Pagination is by `page`, and the server reports `nextPage` as a string
+        or null. max_pages is a stop so a server that always returns a
+        nextPage cannot loop against the API all night.
+        """
+        seen: dict[str, dict[str, Any]] = {}
+        for asset_type in types:
+            page: Any = 1
+            for _ in range(max_pages):
+                body = {
+                    "isTrashed": True,
+                    "type": asset_type,
+                    "size": page_size,
+                    "page": int(page),
+                    # withDeleted is what makes the server include assets it
+                    # considers soft-deleted; isTrashed alone filters an
+                    # already-narrowed set on some versions.
+                    "withDeleted": True,
+                }
+                payload = self._request("POST", "/search/metadata", body)
+                assets = (payload or {}).get("assets") or {}
+                items = assets.get("items") or []
+                for item in items:
+                    asset_id = item.get("id")
+                    if asset_id:
+                        seen[str(asset_id)] = item
+                next_page = assets.get("nextPage")
+                if not next_page or not items:
+                    break
+                page = next_page
+            else:
+                log.warn("immich.trash_pagination_capped", type=asset_type,
+                         pages=max_pages)
+        log.debug("immich.trash_scanned", assets=len(seen))
+        return list(seen.values())
+
     def get_asset(self, asset_id: str) -> dict[str, Any] | None:
         try:
             return self._request("GET", f"/assets/{asset_id}")
@@ -319,7 +379,7 @@ class ImmichCliUploader:
         self.url = str(cfg.get("immich.url", "")).rstrip("/")
         if self.url and not self.url.endswith("/api"):
             self.url += "/api"
-        self.api_key = str(cfg.get("immich.api_key", ""))
+        self.api_key = _api_key(cfg)
         self.concurrency = int(cfg.get("immich.concurrency", 4))
         self.album_strategy = cfg.get("immich.album_strategy", "flat")
         self.album_name = cfg.get("immich.album_name", "Proton Import")

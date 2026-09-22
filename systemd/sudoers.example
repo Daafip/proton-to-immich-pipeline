@@ -1,0 +1,15 @@
+# Install to /etc/sudoers.d/proton-to-immich-pipeline  (chmod 440, root:root)
+# Validate before saving:  visudo -c -f /etc/sudoers.d/proton-to-immich-pipeline
+#
+# Only needed for web.job_runner: systemd. The default, `subprocess`, runs
+# sync.py from the UI's own worker thread and needs no sudo at all.
+#
+# One line per account, naming the exact unit. Deliberately not a wildcard:
+# `systemctl start proton-to-immich-pipeline@*` would let the web process
+# start any instance name it liked, and the account name is the one thing in
+# that command line that came from outside.
+protonsync ALL=(root) NOPASSWD: /usr/bin/systemctl start proton-to-immich-pipeline@david.service
+protonsync ALL=(root) NOPASSWD: /usr/bin/systemctl start proton-to-immich-pipeline@mirjam.service
+
+# For a single-account install:
+#protonsync ALL=(root) NOPASSWD: /usr/bin/systemctl start proton-to-immich-pipeline@default.service

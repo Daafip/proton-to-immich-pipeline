@@ -1,43 +1,80 @@
 # Known issues and untested surfaces
 
-An honest account of what is not solved. Items 1 and 2 matter most at backfill
-scale; item 3 is simply the list of things that cannot be verified without the
-VM and live services.
+An honest account of what is not solved. Items 1 and 2 were the two things
+that mattered most at backfill scale and are now implemented — read item 1
+before the first big backfill, because batching has not been run against real
+Proton. Item 3 is the list of things that cannot be verified without the VM
+and live services. **Items 5 and 6 are the v2 additions, and item 5 is the one
+to read before using the delete queue for real.**
 
 ---
 
-## 1. Backfill throughput
+## 1. Backfill throughput — fixed, but unverified against real Proton
 
 **Measured: ~1.2 s of CLI startup per invocation**, even when the command fails
 immediately — it is Bun runtime plus SDK init, not transfer time. The download
-loop currently spawns **one process per file**. For ~25k files that is roughly
+loop used to spawn **one process per file**, which for ~25k files is roughly
 **8 hours of process startup alone**, before a single byte moves.
 
-The fix is available in the CLI signature: `filesystem download path...
-localFolder` accepts **multiple paths per call**. Batching ~50 files per
-invocation would cut the overhead by ~50×.
+`filesystem download path... localFolder` accepts **multiple paths per call**,
+so `proton.download_batch_size` (default **25**) now sends a batch per
+invocation. Counted against a realistic library shape:
 
-The constraint to respect when implementing it: all files in one call land in
-the same destination folder, so a batch must be grouped **by source folder**,
-where names are unique and cannot collide. With `-c skip`, a collision would
+| Library | `download_batch_size` | CLI invocations | Startup cost |
+|---|---|---|---|
+| 2,109 files / 13 folders | 1 | 2,109 | 42 min |
+| | 25 | 91 | 2 min |
+| 25,000 files / 150 folders | 1 | 25,000 | **8 h 20 m** |
+| | 25 | 1,050 | 21 min |
+| | 50 | 600 | 12 min |
+
+The constraint the plan called out is enforced in `Pipeline._plan_batches`:
+all files in one call land in the same destination folder, so a batch is
+grouped **by source folder**, and **no two files in a batch share a name** —
+a name can repeat across folders, and an undecryptable name falls back to a
+node uid. Anything that would collide, or whose name is not a safe basename,
+gets a batch of its own. With `--conflict-strategy skip` a collision would
 silently keep the wrong file.
 
-Not implemented.
+Two further behaviours worth knowing:
 
-## 2. No circuit breaker
+- **Partial success is expected.** A batch that dies halfway leaves real files
+  on disk, so the destination folder is inspected rather than the exit code
+  trusted; whatever landed is kept and not re-transferred.
+- **A failed batch degrades to one call per file.** Otherwise a single
+  unreadable file would charge an attempt to the other 24 and quarantine them
+  in five nights.
 
-Per-asset exponential backoff exists. A global one does not.
+`proton.timeout_sec` is a per-invocation budget, and it now scales with the
+batch.
 
-If Proton starts rate-limiting mid-backfill, every file fails in quick
-succession and each burns an attempt. At `limits.max_attempts` (5) they reach
-`quarantined` — so one bad night could mass-quarantine hundreds of files that
-were never actually broken. `sync.py requeue` recovers them, but only after
-someone notices.
+**Still unverified:** no batch has gone to real Proton. If the first backfill
+night misbehaves, `proton.download_batch_size: 1` restores the old path
+exactly, and `sync.py requeue` clears anything that failed. The safety net if
+a batch ever returns the wrong bytes is the existing per-file check — size
+must match what Proton reported, and the file is sha1'd before it is promoted
+out of the scratch folder.
 
-What is missing: a consecutive-failure threshold that aborts the pass and
-leaves the remaining attempts intact.
+## 2. No circuit breaker — fixed
 
-Not implemented.
+Per-asset exponential backoff did not help when everything failed at once: if
+Proton started rate-limiting mid-backfill, every file failed in quick
+succession and each burned an attempt. At `limits.max_attempts` (5) they reach
+`quarantined`, so one bad night could mass-quarantine hundreds of files that
+were never actually broken.
+
+`limits.consecutive_failures` (default **25**, 0 disables) now stops a pass
+after that many consecutive failures, in `download`, `push` and `verify`. A
+single success resets the count, so scattered bad files do not trip it — only
+a run of them does.
+
+Tripping is deliberate, not an error path:
+
+- The rows never reached keep their full attempt budget.
+- Anything left mid-flight is rewound immediately — a pass that stops on
+  purpose leaves no row looking `downloading`.
+- It is recorded in `stats.aborted`, so the run exits **1** and both the timer
+  and Home Assistant see it. Grep the journal for `circuit.tripped`.
 
 ## 3. What has and has not run live
 
@@ -56,6 +93,10 @@ in [operations.md](operations.md#verified-on).
 
 **Still only exercised against in-process fakes:**
 
+- **Everything added in v2.** `reconcile`, the delete path, the web UI and the
+  two-account layout have 123 tests between them (`test_delete.py`,
+  `test_web.py`, `test_accounts.py`) and have not touched a real Proton or
+  Immich. The specific unknowns are items 5 and 6 below.
 - **`verify` and `reap` against the server** — and with them `/assets/{id}`,
   `/server/ping`, `/users/me`, `/search/metadata`. Endpoint paths drift
   between Immich versions.
@@ -88,17 +129,81 @@ in [operations.md](operations.md#verified-on).
   and would surface as discovery quietly finding nothing.
 - **Proton cache growth.** 26 MB after listing ~2,100 entries; a full library is
   plausibly a few hundred MB, living in `staging/.proton` on the shared SSD.
-- **No partial-file resume.** A 2 GB video failing at 90% restarts from zero.
+- **No partial-file resume.** A 2 GB video failing at 90% restarts from zero,
+  and with batching a failed batch re-fetches only the files that did not
+  land, not the whole batch.
 - **`verify` does one HTTP GET per asset.** 25k sequential calls is slow,
   though harmless.
 - **Proton fair-use behaviour under sustained load is unknown.** Downloads are
   sequential, which helps; see item 2 for what happens if limits are hit.
 
-## 5. Decisions still open
+## 5. The delete path has never touched a real Proton
+
+`cli-drive@0.8.0` has `filesystem trash`, `restore`, `delete` and
+`empty-trash` — that much is verified from `--help`. What is **not** verified:
+
+- **Whether `trash` works on the Photos section.** Proton's support docs say
+  items there cannot be deleted from desktop apps, and a third-party GUI
+  wrapper reports delete/rename/restore as unavailable in the Photos view.
+  Hence `delete.action` per account, defaulting to `mark_only`. A
+  `/my-files/...` root is the expected `execute` case, and that is what
+  `proton.roots` ships with.
+- **What `filesystem info` prints for a trashed node.** No sample was
+  captured. If it still resolves a trashed node by path with the same uid, the
+  post-trash verification would report `delete_failed` on a deletion that
+  actually worked — a false alarm, not a lost photo, and the row stays visible
+  with the reason. If it errors instead, `looks_like_missing_node` has to
+  recognise the wording; anything it does not recognise surfaces as a failure
+  rather than a silent success.
+- **Whether `trash` is synchronous.** The verification re-resolves immediately.
+  If Proton's trash is eventually consistent, expect spurious
+  `delete_failed` rows on the first attempt.
+
+**So: run it with `--dry-run` first, then with `--yes` on two or three junk
+files in `/my-files`, and read the `deletions` table before trusting it with
+anything that matters.** The design limits the damage — trash rather than
+delete, one path per invocation, re-resolve before and verify after, a batch
+cap of 50, and an append-only audit table — but none of that is a substitute
+for trying it.
+
+`reconcile` is the safe half and can be left on: it cannot call a Proton
+mutation at all.
+
+## 6. Untested corners of the v2 additions
+
+- **Immich's trash query.** `POST /search/metadata` with `isTrashed: true`,
+  paginated by `page`/`nextPage`, one request per `type`. The field names and
+  the pagination shape are read off the API, not observed. If they are wrong,
+  `reconcile` finds nothing and logs `reconcile.unavailable` or simply reports
+  zero — a quiet failure, so check `staged_deletes` after deliberately
+  trashing something.
+- **The `systemd` job runner.** `systemctl start` on a `Type=oneshot` unit is
+  expected to block until the unit finishes and exit with its status, which is
+  what the worker relies on. Untested here, and it needs the sudoers entry.
+  `job_runner: subprocess` is the default and needs neither.
+- **Two Proton sessions in two cache dirs.** The isolation argument is sound —
+  `unsafe_file` keeps the session in `PROTON_DRIVE_CACHE_DIR` — but the CLI's
+  keyring path uses one fixed service name, and nobody has confirmed that
+  nothing else is shared. [operations.md](operations.md#setting-it-up) has the
+  five-command test to run before writing any config.
+- **The UI in a browser.** The page is served, its JS parses and every
+  endpoint it calls is tested over real HTTP, but no browser has rendered it.
+- **`/api/staged-deletes.csv` filename handling.** Account names are validated
+  to `[A-Za-z0-9_.-]`, so the `Content-Disposition` cannot be broken by one,
+  but no exotic name has been tried.
+
+## 7. Decisions still open
 
 - **Album strategy** (`immich.album_strategy`) — settle before the first real
   push; changing it later means re-tagging.
 - **`reap.keep_days`** — 7 to start, 0 once trusted.
+- **`delete.action`** — `mark_only` until item 5 is settled.
+- **Immich's trash retention.** The default ~30 days is what makes the staged
+  list necessary. Extending it (Administration → Settings → Trash) buys time
+  to look a staged photo up before deciding; disabling the auto-empty means
+  the two lists never disagree.
+- **Whether the UI is reachable from outside the LAN.** `web.password_hash`
+  gives you the auth; TLS is a reverse proxy's job, not this process's.
 
 ---
 

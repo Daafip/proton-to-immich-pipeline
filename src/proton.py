@@ -24,7 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from . import log
 
@@ -264,6 +264,51 @@ def looks_like_auth_failure(text: str) -> bool:
     return any(hint in low for hint in _AUTH_HINTS)
 
 
+# A path that resolves to nothing is not an error for the delete path -- it is
+# the answer ("the node is gone"). Distinguishing it from a real failure is
+# what stops a transport hiccup being read as "already deleted".
+_MISSING_HINTS = (
+    "not found", "no such", "does not exist", "doesn't exist", "enoent",
+    "404", "cannot find", "could not find", "no node", "invalid path",
+)
+
+
+def looks_like_missing_node(text: str) -> bool:
+    low = (text or "").lower()
+    if looks_like_auth_failure(low):
+        return False
+    return any(hint in low for hint in _MISSING_HINTS)
+
+
+_TRASHED_KEYS = ("isTrashed", "is_trashed", "trashed", "trashedAt", "trashTime",
+                 "deletedAt", "state", "nodeState")
+
+
+def is_trashed_entry(obj: dict[str, Any]) -> bool:
+    """Whether a node the CLI just described is in Proton's trash.
+
+    Best-effort: the key is not in any captured `filesystem info` sample, so
+    the delete path treats "no longer resolvable at that path" as the primary
+    signal and this as a bonus. Returning False must therefore never be read
+    as "definitely still live" on its own.
+    """
+    for key in _TRASHED_KEYS:
+        if key not in obj:
+            continue
+        value = unwrap(obj[key])
+        if isinstance(value, bool):
+            if value:
+                return True
+        elif isinstance(value, str):
+            if value.strip().lower() in ("trashed", "trash", "deleted", "true"):
+                return True
+        elif value not in (None, ""):
+            # A timestamp under trashedAt/deletedAt means it happened.
+            if key in ("trashedAt", "trashTime", "deletedAt"):
+                return True
+    return False
+
+
 _UNSAFE_FILENAME = re.compile(r"[/\\\x00]")
 
 
@@ -309,6 +354,31 @@ class Backend:
         raise NotImplementedError
 
     def download(self, node: RemoteNode, dest: Path) -> None:
+        raise NotImplementedError
+
+    def download_many(self, nodes: Sequence[RemoteNode], dest_dir: Path) -> None:
+        """Fetch several nodes into one folder.
+
+        The default is one call per node, which is exactly what v1 did.
+        ProtonCliBackend overrides it with a real multi-path invocation --
+        that is where the saving is, because the cost being avoided is process
+        startup, not transfer.
+
+        Every caller must treat partial success as normal: some files may have
+        landed before a failure, so the folder is inspected afterwards rather
+        than trusted to the exit code.
+        """
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for node in nodes:
+            self.download(node, dest_dir / safe_filename(node.name))
+
+    # -- v2: the delete path ----------------------------------------------
+    def resolve(self, path: str) -> RemoteNode | None:
+        """The node currently at `path`, or None if nothing is there."""
+        raise NotImplementedError
+
+    def trash(self, path: str) -> None:
+        """Move one node to Proton's trash. Never a permanent delete."""
         raise NotImplementedError
 
 
@@ -395,6 +465,25 @@ class ProtonCliBackend(Backend):
     def _template(self, key: str, default: list[str], **subs: str) -> list[str]:
         template = self.cmd.get(key) or default
         return [str(part).format(**subs) for part in template]
+
+    def _template_multi(self, key: str, default: list[str],
+                        paths: Sequence[str], **subs: str) -> list[str]:
+        """Like _template, but `{path}` expands to several arguments.
+
+        `filesystem download path... localFolder` takes any number of source
+        paths, so the single `{path}` slot in the configured template becomes
+        the whole list. Nothing goes through a shell, so a path with spaces
+        stays one argument.
+        """
+        template = self.cmd.get(key) or default
+        out: list[str] = []
+        for part in template:
+            part = str(part)
+            if part == "{path}":
+                out.extend(paths)
+            else:
+                out.append(part.format(path="", **subs))
+        return out
 
     def _run(self, args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
         argv = [self.binary, *args]
@@ -525,7 +614,7 @@ class ProtonCliBackend(Backend):
                 else:
                     yield node
 
-    def _run_download(self, args: list[str]) -> None:
+    def _run_download(self, args: list[str], timeout: int | None = None) -> None:
         """Run the download, negotiating the conflict flag if this build
         rejects the configured one -- the same remember-what-worked trick the
         Immich client uses for its checksum encoding.
@@ -538,7 +627,7 @@ class ProtonCliBackend(Backend):
         if self._conflict_args is not None:
             args = _set_conflict_args(args, self._conflict_args)
         try:
-            self._run(args)
+            self._run(args, timeout=timeout)
             return
         except ProtonError as exc:
             if self._conflict_args is not None or not looks_like_unknown_option(str(exc)):
@@ -550,7 +639,7 @@ class ProtonCliBackend(Backend):
             if candidate == args:
                 continue
             try:
-                self._run(candidate)
+                self._run(candidate, timeout=timeout)
             except ProtonError as retry_exc:
                 if looks_like_unknown_option(str(retry_exc)):
                     continue
@@ -589,6 +678,91 @@ class ProtonCliBackend(Backend):
             raise ProtonError(
                 f"download reported success but {dest.name} is missing "
                 f"(folder holds: {listing})")
+
+    def download_many(self, nodes: Sequence[RemoteNode], dest_dir: Path) -> None:
+        """One `filesystem download` call for the whole batch.
+
+        The CLI costs ~1.2 s of Bun and SDK startup per invocation whatever it
+        does, so for a 25k-file backfill the per-file loop spends most of a
+        working day starting processes. Batching is the only lever that
+        touches that.
+
+        The caller guarantees what makes this safe: every node comes from the
+        same source folder and no two share a filename, because they all land
+        in one destination folder and `--conflict-strategy skip` would
+        silently keep the wrong file on a collision.
+        """
+        if not nodes:
+            return
+        if len(nodes) == 1:
+            self.download(nodes[0], dest_dir / nodes[0].name)
+            return
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        args = self._template_multi(
+            "download",
+            ["filesystem", "download", "--conflict-strategy", "skip",
+             "{path}", "{dest_dir}"],
+            [node.path for node in nodes],
+            dest_dir=str(dest_dir), dest=str(dest_dir),
+        )
+        # proton.timeout_sec is a per-invocation budget sized for one file,
+        # and this invocation does the work of len(nodes) of them, so it
+        # scales with the batch. Without this a batch of 25 would have to
+        # finish in the time one file was allowed.
+        #
+        # No post-check here: the pipeline inspects the folder itself, because
+        # a batch that fails halfway still leaves real files behind and those
+        # should not be thrown away.
+        self._run_download(args, timeout=self.timeout * len(nodes))
+
+    # -- the delete path ---------------------------------------------------
+    def resolve(self, path: str) -> RemoteNode | None:
+        """`filesystem info path --json` -- what is at that path right now.
+
+        Returns None when nothing is. This is the pre-flight check the delete
+        path is built on: a staged row is only trashed when the node id at its
+        recorded path still matches the one that was staged, so a path since
+        reused for a different file is skipped rather than deleted.
+        """
+        args = self._template("info", ["filesystem", "info", "{path}", "--json"],
+                              path=path)
+        try:
+            proc = self._run(args)
+        except AuthError:
+            raise
+        except ProtonError as exc:
+            if looks_like_missing_node(str(exc)):
+                return None
+            raise
+        payload = parse_json_output(proc.stdout)
+        # `info` describes one node, so a bare object is the node itself --
+        # not a container to dig a list out of.
+        if isinstance(payload, dict) and any(
+                k in payload for k in _ID_KEYS + _NAME_KEYS + _TYPE_KEYS):
+            entries: list[dict[str, Any]] = [payload]
+        else:
+            entries = extract_entries(payload)
+        if not entries:
+            return None
+        parent = posixpath.dirname(path.rstrip("/")) or "/"
+        node = normalize_entry(entries[0], parent)
+        if node is not None and is_trashed_entry(entries[0]):
+            log.debug("proton.resolved_trashed", path=path, node_id=node.node_id)
+            return None
+        return node
+
+    def trash(self, path: str) -> None:
+        """`filesystem trash path` -- reversible; Proton's trash is the undo.
+
+        Deliberately never `filesystem delete` or `empty-trash`, which are
+        permanent, and deliberately one path per invocation even though the
+        CLI accepts several. A batch shares one exit code, so a partial
+        failure would leave us unable to say which node it was -- and this is
+        the only destructive call in the pipeline, so an unambiguous result
+        per node is worth the ~1.2 s of CLI startup.
+        """
+        args = self._template("trash", ["filesystem", "trash", "{path}"], path=path)
+        self._run(args)
 
 
 class RcloneBackend(Backend):
@@ -649,6 +823,38 @@ class RcloneBackend(Backend):
         self._run(["copyto", self._remote_path(node.path), str(dest)])
         if not dest.exists():
             raise ProtonError(f"rclone copyto finished but {dest} is missing")
+
+    def resolve(self, path: str) -> RemoteNode | None:
+        proc = self._run(["lsjson", "--stat", self._remote_path(path)], timeout=120)
+        try:
+            entry = parse_json_output(proc.stdout)
+        except ProtonError:
+            return None
+        if isinstance(entry, list):
+            entry = entry[0] if entry else None
+        if not isinstance(entry, dict) or not entry.get("Name"):
+            return None
+        return RemoteNode(
+            node_id=str(entry.get("ID") or f"path:{path}"),
+            path="/" + str(path).lstrip("/"),
+            name=str(entry.get("Name")),
+            size=_coerce_int(entry.get("Size")),
+            modified=_coerce_ts(entry.get("ModTime")),
+            is_folder=bool(entry.get("IsDir")),
+        )
+
+    def trash(self, path: str) -> None:
+        """Not supported, on purpose.
+
+        rclone's protondrive backend deletes rather than trashing, and the one
+        inviolable rule of this path is "trash, never permanent" -- Proton's
+        trash is the undo. There is no safe way to honour that here, so an
+        rclone install stays `delete_action: mark_only`.
+        """
+        raise ProtonError(
+            "the rclone backend cannot move a file to Proton's trash, only "
+            "delete it permanently; use proton.backend: proton-cli for "
+            "delete.action: execute, or keep delete.action: mark_only")
 
 
 def get_backend(cfg) -> Backend:

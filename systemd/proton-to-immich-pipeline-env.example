@@ -1,6 +1,19 @@
 # Install to /etc/proton-to-immich-pipeline/env  (chmod 640, owned root:protonsync)
-# Immich API key: Account Settings -> API Keys
-IMMICH_API_KEY=replace-me
-# Optional: override the config's immich.url. Loopback works for
-# upload_mode: api only -- the immich-cli container cannot reach it.
+# Shared settings for every account.
+
+# Optional: override the config's immich.url.
 #IMMICH_INSTANCE_URL=http://127.0.0.1:2283/api
+
+# SINGLE ACCOUNT ONLY. Immich -> Account Settings -> API Keys.
+IMMICH_API_KEY=replace-me
+
+# With more than one account, DELETE the line above: it would apply to every
+# account and upload one person's photos into the other's library. Give each
+# account its own key file in the config instead --
+#
+#   accounts:
+#     - name: david
+#       immich_api_key_file: /etc/proton-to-immich-pipeline/david.key
+#
+# each chmod 640 root:protonsync, holding just the key and a newline.
+# `sync.py status` refuses a config where two accounts share one key.

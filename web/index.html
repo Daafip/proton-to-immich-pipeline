@@ -1,0 +1,792 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Proton → Immich</title>
+<style>
+  /* One file, no build step, no external fonts or scripts -- the CSP the
+     server sends allows inline style and script and nothing else. */
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --panel-2: #fafbfc;
+    --line: #e3e6ea;
+    --ink: #1b1f24;
+    --ink-dim: #5b6670;
+    --ink-faint: #8792a0;
+    --accent: #2f6fd0;
+    --accent-ink: #ffffff;
+    --ok: #1f7a4d;
+    --warn: #9a6400;
+    --bad: #b3261e;
+    --bad-bg: #fdf0ef;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a;
+      --panel: #1c2024;
+      --panel-2: #22272c;
+      --line: #2e353c;
+      --ink: #e6eaee;
+      --ink-dim: #a3adb8;
+      --ink-faint: #76818d;
+      --accent: #6aa3f0;
+      --accent-ink: #0d1117;
+      --ok: #62c68f;
+      --warn: #e0ae4a;
+      --bad: #f2867c;
+      --bad-bg: #2c1e1d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0 16px 48px;
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px;
+    padding: 20px 0 14px;
+  }
+  h1 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 14px; font-weight: 650; margin: 0 0 10px; }
+  .spacer { flex: 1; }
+  .muted { color: var(--ink-dim); }
+  .faint { color: var(--ink-faint); font-size: 12px; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 16px;
+  }
+  .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+
+  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .card-head h2 { margin: 0; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+    gap: 1px; background: var(--line); border: 1px solid var(--line);
+    border-radius: 8px; overflow: hidden; margin-bottom: 12px;
+  }
+  .stat { background: var(--panel-2); padding: 9px 10px; }
+  .stat .n { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .k { font-size: 11px; color: var(--ink-dim); text-transform: uppercase; letter-spacing: .04em; }
+  .stat.alert .n { color: var(--bad); }
+  .stat.note .n { color: var(--warn); }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--ink-dim); white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); border-color: currentColor; }
+  .pill.bad { color: var(--bad); border-color: currentColor; }
+  .pill.warn { color: var(--warn); border-color: currentColor; }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  button {
+    font: inherit; font-weight: 550; padding: 7px 13px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel-2);
+    color: var(--ink); cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--ink-faint); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button.small, .btn-link { padding: 4px 9px; font-size: 12px; }
+  .btn-link {
+    display: inline-block; font-weight: 550; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel-2);
+    color: var(--ink); text-decoration: none;
+  }
+  .btn-link:hover { border-color: var(--ink-faint); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .scroll { overflow-x: auto; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-dim); font-weight: 600; }
+  tbody tr:hover { background: var(--panel-2); }
+  td.path { white-space: normal; word-break: break-all; min-width: 240px; }
+  tr.failed { background: var(--bad-bg); }
+  tr.failed td.err { color: var(--bad); white-space: normal; }
+
+  input[type=password], input[type=text], select {
+    font: inherit; padding: 7px 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+  }
+  label.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+
+  .note {
+    border-left: 3px solid var(--accent); background: var(--panel-2);
+    padding: 9px 12px; border-radius: 0 8px 8px 0; margin: 12px 0; font-size: 13px;
+  }
+  .note.bad { border-color: var(--bad); }
+  .note.ok { border-color: var(--ok); }
+  #toast {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+    background: var(--ink); color: var(--bg); padding: 9px 16px;
+    border-radius: 999px; font-size: 13px; font-weight: 550;
+    box-shadow: 0 4px 16px rgba(0,0,0,.25); max-width: 90vw;
+  }
+  #toast.bad { background: var(--bad); color: #fff; }
+  dialog {
+    border: 1px solid var(--line); border-radius: var(--radius);
+    background: var(--panel); color: var(--ink); padding: 20px;
+    max-width: min(440px, 92vw);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  textarea {
+    width: 100%; min-height: 120px; font-family: var(--mono); font-size: 12px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px;
+    background: var(--panel-2); color: var(--ink); resize: vertical;
+  }
+  [hidden] { display: none !important; }
+  .center { text-align: center; padding: 28px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ── login ─────────────────────────────────────────────────────── -->
+  <section id="login" class="panel" hidden style="max-width:380px;margin:80px auto;">
+    <h2>Proton → Immich</h2>
+    <p class="faint">This page can trash files in Proton Drive, so it asks for the shared password.</p>
+    <div class="row" style="margin-top:12px">
+      <input type="password" id="pw" placeholder="password" autocomplete="current-password" style="flex:1">
+      <button class="primary" id="login-btn">Sign in</button>
+    </div>
+    <div id="login-err" class="note bad" hidden></div>
+  </section>
+
+  <!-- ── app ───────────────────────────────────────────────────────── -->
+  <div id="app" hidden>
+    <header>
+      <h1>Proton → Immich</h1>
+      <span class="pill" id="runner-pill"></span>
+      <div class="spacer"></div>
+      <span class="faint" id="updated"></span>
+      <button class="small" id="refresh">Refresh</button>
+      <button class="small" id="logout" hidden>Sign out</button>
+    </header>
+
+    <div id="cards" class="cards"></div>
+
+    <section class="panel">
+      <div class="card-head">
+        <h2>Staged for deletion in Proton</h2>
+        <div class="spacer"></div>
+        <select id="acct-select" hidden></select>
+      </div>
+      <div id="staged-body"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Recent runs</h2>
+      <div class="scroll"><table id="runs"><thead><tr>
+        <th>started</th><th>account</th><th>new</th><th>down</th>
+        <th>up</th><th>failed</th><th>exit</th>
+      </tr></thead><tbody></tbody></table></div>
+    </section>
+  </div>
+</div>
+
+<div id="toast" hidden></div>
+
+<dialog id="confirm">
+  <h2 id="confirm-title">Confirm</h2>
+  <p id="confirm-body" class="muted"></p>
+  <div class="row" style="justify-content:flex-end;margin-top:16px">
+    <button id="confirm-no">Cancel</button>
+    <button id="confirm-yes" class="danger">Confirm</button>
+  </div>
+</dialog>
+
+<dialog id="copybox">
+  <h2>Proton paths</h2>
+  <p class="faint">Select all and copy. These are the files to delete in Proton.</p>
+  <textarea id="copytext" readonly></textarea>
+  <div class="row" style="justify-content:flex-end;margin-top:12px">
+    <button id="copybox-close">Close</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- state
+const S = {
+  cfg: null,
+  accounts: [],       // one status object per account
+  account: null,      // which account the delete table is showing
+  staged: null,
+  selected: new Set(),
+  dryRun: true,       // the safe default: a first click never deletes
+  lastResult: null,
+  timer: null,
+  authed: false,
+};
+
+const $ = (sel) => document.querySelector(sel);
+const el = (tag, props = {}, kids = []) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const kid of [].concat(kids)) {
+    if (kid) node.appendChild(typeof kid === "string" ? document.createTextNode(kid) : kid);
+  }
+  return node;
+};
+
+let toastTimer = null;
+function toast(message, bad = false) {
+  const node = $("#toast");
+  node.textContent = message;
+  node.className = bad ? "bad" : "";
+  node.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { node.hidden = true; }, bad ? 6500 : 3000);
+}
+
+function confirmDialog(title, body, confirmLabel) {
+  return new Promise((resolve) => {
+    const dlg = $("#confirm");
+    $("#confirm-title").textContent = title;
+    $("#confirm-body").textContent = body;
+    $("#confirm-yes").textContent = confirmLabel;
+    const done = (answer) => { dlg.close(); resolve(answer); };
+    $("#confirm-yes").onclick = () => done(true);
+    $("#confirm-no").onclick = () => done(false);
+    dlg.onclose = () => resolve(false);
+    dlg.showModal();
+  });
+}
+
+// ---------------------------------------------------------------- fetch
+async function api(path, options = {}) {
+  const init = { credentials: "same-origin", headers: {}, ...options };
+  if (init.body !== undefined) {
+    init.method = init.method || "POST";
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(init.body);
+  }
+  const response = await fetch(path, init);
+  if (response.status === 401) {
+    S.authed = false;
+    showLogin();
+    throw new Error("authentication required");
+  }
+  const text = await response.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
+  if (!response.ok && response.status !== 409) {
+    throw new Error(data.error || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------- format
+const fmtNum = (n) => (n === null || n === undefined ? "–" : Number(n).toLocaleString());
+
+function fmtWhen(iso) {
+  if (!iso) return "never";
+  const then = new Date(iso);
+  if (isNaN(then)) return iso;
+  const secs = Math.round((Date.now() - then.getTime()) / 1000);
+  if (secs < 60) return "just now";
+  if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
+  if (secs < 7 * 86400) return `${Math.round(secs / 86400)}d ago`;
+  return then.toLocaleDateString();
+}
+
+const fmtDate = (iso) => {
+  if (!iso) return "–";
+  const d = new Date(iso);
+  return isNaN(d) ? String(iso).slice(0, 10) : d.toLocaleDateString();
+};
+
+// ---------------------------------------------------------------- render
+function statusPill(s) {
+  const job = s.active_job;
+  if (job) return { cls: "warn", text: `${job.type} ${job.state}` };
+  if (s.auth_ok === false) return { cls: "bad", text: "proton signed out" };
+  if (s.stale) return { cls: "warn", text: "stale" };
+  if (s.last_run_exit_code === null || s.last_run_exit_code === undefined) {
+    return { cls: "", text: "never run" };
+  }
+  if (s.last_run_exit_code === 0) return { cls: "ok", text: "healthy" };
+  return { cls: "warn", text: `last exit ${s.last_run_exit_code}` };
+}
+
+function renderCards() {
+  const host = $("#cards");
+  host.textContent = "";
+  for (const s of S.accounts) {
+    const pill = statusPill(s);
+    const busy = !!s.active_job;
+
+    const stats = el("div", { class: "grid" }, [
+      stat("backlog", s.backlog, s.backlog > 0 ? "note" : ""),
+      stat("in immich", s.uploaded_total),
+      stat("failed", s.failed, s.failed > 0 ? "alert" : ""),
+      stat("quarantined", s.quarantined, s.quarantined > 0 ? "alert" : ""),
+      stat("staged", s.staged_deletes, s.staged_deletes > 0 ? "note" : ""),
+      stat("free GB", s.staging_free_gb),
+    ]);
+
+    const actions = el("div", { class: "row" }, [
+      el("button", {
+        class: "primary", text: busy ? "running…" : "Sync now",
+        disabled: busy ? "disabled" : null,
+        onclick: () => startJob(s.account, "sync"),
+      }),
+      el("button", {
+        class: "small", text: "Re-scan trash",
+        disabled: busy ? "disabled" : null,
+        title: "Ask Immich what is in its trash and stage the matches",
+        onclick: () => startJob(s.account, "reconcile"),
+      }),
+      el("span", { class: "spacer" }),
+      el("span", { class: "faint", text: `last success ${fmtWhen(s.last_success)}` }),
+    ]);
+
+    const kids = [
+      el("div", { class: "card-head" }, [
+        el("h2", { text: s.account }),
+        el("span", { class: "pill " + pill.cls }, [
+          el("span", { class: "dot" }), pill.text,
+        ]),
+      ]),
+      stats,
+      actions,
+    ];
+
+    if (s.delete_failed > 0) {
+      kids.push(el("div", { class: "note bad", text:
+        `${s.delete_failed} row(s) could not be trashed in Proton — see the table below.` }));
+    }
+    const job = s.last_job;
+    if (!busy && job && job.state === "failed") {
+      kids.push(el("div", { class: "note bad" }, [
+        el("strong", { text: `last ${job.type} job failed. ` }),
+        el("span", { class: "mono", text: (job.detail || "").slice(0, 400) }),
+      ]));
+    }
+    host.appendChild(el("section", { class: "panel" }, kids));
+  }
+}
+
+function stat(key, value, cls = "") {
+  return el("div", { class: "stat " + cls }, [
+    el("div", { class: "n", text: fmtNum(value) }),
+    el("div", { class: "k", text: key }),
+  ]);
+}
+
+function renderRuns(runs) {
+  const body = $("#runs tbody");
+  body.textContent = "";
+  if (!runs.length) {
+    body.appendChild(el("tr", {}, [
+      el("td", { colspan: "7", class: "muted", text: "no runs recorded yet" }),
+    ]));
+    return;
+  }
+  for (const r of runs) {
+    body.appendChild(el("tr", {}, [
+      el("td", { title: r.started_at || "", text: fmtWhen(r.started_at) }),
+      el("td", { text: r.account }),
+      el("td", { text: fmtNum(r.discovered) }),
+      el("td", { text: fmtNum(r.downloaded) }),
+      el("td", { text: fmtNum(r.uploaded) }),
+      el("td", { text: fmtNum(r.failed) }),
+      el("td", { text: r.exit_code === null ? "…" : String(r.exit_code) }),
+    ]));
+  }
+}
+
+function renderStaged() {
+  const host = $("#staged-body");
+  host.textContent = "";
+  const data = S.staged;
+  if (!data) { host.appendChild(el("div", { class: "center muted", text: "loading…" })); return; }
+
+  const rows = data.staged || [];
+  const pending = rows.filter((r) => r.state === "staged");
+  const markOnly = data.delete_action === "mark_only";
+
+  if (S.lastResult) {
+    host.appendChild(el("div", { class: "note " + (S.lastResult.bad ? "bad" : "ok"),
+                                 text: S.lastResult.text }));
+  }
+
+  host.appendChild(el("div", { class: "note" }, [
+    markOnly
+      ? "delete.action is mark_only: nothing is sent to Proton. Delete these there yourself, then mark them done here."
+      : "delete.action is execute: confirming runs `filesystem trash` in Proton. Proton's trash is the undo.",
+  ]));
+
+  if (!rows.length) {
+    host.appendChild(el("div", { class: "center muted",
+      text: "Nothing staged. Trash a photo in Immich and it appears here after the next sync." }));
+    renderDeletions(host, data);
+    return;
+  }
+
+  // -- controls
+  const allChecked = pending.length > 0 && pending.every((r) => S.selected.has(r.id));
+  const controls = el("div", { class: "row", style: "margin-bottom:10px" }, [
+    el("label", { class: "check" }, [
+      checkbox(allChecked, (on) => {
+        for (const r of pending) { on ? S.selected.add(r.id) : S.selected.delete(r.id); }
+        renderStaged();
+      }),
+      `Select all ${pending.length}`,
+    ]),
+    el("span", { class: "spacer" }),
+    el("label", { class: "check", title: "A dry run logs what it would do and changes nothing" }, [
+      checkbox(S.dryRun, (on) => { S.dryRun = on; renderStaged(); }),
+      "Dry run",
+    ]),
+    el("button", {
+      class: S.dryRun ? "" : "danger",
+      disabled: S.selected.size ? null : "disabled",
+      text: S.dryRun
+        ? `Dry run ${S.selected.size || ""}`.trim()
+        : (markOnly
+            ? `Mark ${S.selected.size} done`
+            : `Trash ${S.selected.size} in Proton`),
+      onclick: executeSelected,
+    }),
+    el("button", { class: "small", text: "Copy paths", onclick: () => copyPaths(rows) }),
+    // A styled <a>, not a <button> inside one: nesting a button in an anchor
+    // is invalid and does not reliably navigate.
+    el("a", {
+      class: "btn-link", download: "",
+      href: `/api/staged-deletes.csv?account=${encodeURIComponent(data.account)}`,
+      text: "CSV",
+    }),
+  ]);
+  host.appendChild(controls);
+
+  if (S.selected.size > data.batch_cap) {
+    host.appendChild(el("div", { class: "note bad", text:
+      `${S.selected.size} selected, but delete.batch_cap is ${data.batch_cap}. Deselect some.` }));
+  }
+
+  // -- table
+  const body = el("tbody");
+  for (const r of rows) {
+    const selectable = r.state === "staged";
+    const tr = el("tr", { class: r.state === "failed" ? "failed" : "" }, [
+      el("td", {}, [selectable
+        ? checkbox(S.selected.has(r.id), (on) => {
+            on ? S.selected.add(r.id) : S.selected.delete(r.id);
+            renderStaged();
+          })
+        : el("span", { class: "faint", text: "–" })]),
+      el("td", { text: r.remote_name || "–" }),
+      el("td", { text: fmtDate(r.capture_time) }),
+      el("td", { class: "path mono", text: r.remote_path || "–" }),
+      el("td", { class: "mono faint", title: r.node_id, text: String(r.node_id).slice(0, 12) + "…" }),
+      el("td", { title: r.staged_at, text: fmtWhen(r.staged_at) }),
+      el("td", {}, [el("span", { class: "pill " + (r.state === "failed" ? "bad" : ""), text: r.state })]),
+      el("td", {}, [selectable || r.state === "failed"
+        ? el("button", { class: "small", text: "Unstage", title:
+            "Take it off the queue — restore it in Immich first",
+            onclick: () => unstage(r) })
+        : null]),
+    ]);
+    body.appendChild(tr);
+    if (r.error) {
+      body.appendChild(el("tr", { class: "failed" }, [
+        el("td", {}), el("td", { colspan: "7", class: "err mono", text: r.error }),
+      ]));
+    }
+  }
+
+  host.appendChild(el("div", { class: "scroll" }, [
+    el("table", {}, [
+      el("thead", {}, [el("tr", {}, [
+        el("th", {}), el("th", { text: "file" }), el("th", { text: "captured" }),
+        el("th", { text: "proton path" }), el("th", { text: "node id" }),
+        el("th", { text: "staged" }), el("th", { text: "state" }), el("th", {}),
+      ])]),
+      body,
+    ]),
+  ]));
+
+  renderDeletions(host, data);
+}
+
+function renderDeletions(host, data) {
+  const done = data.recent_deletions || [];
+  if (!done.length) return;
+  const body = el("tbody");
+  for (const r of done.slice(0, 15)) {
+    body.appendChild(el("tr", { class: r.result === "failed" ? "failed" : "" }, [
+      el("td", { title: r.executed_at, text: fmtWhen(r.executed_at) }),
+      el("td", {}, [el("span", { class: "pill " + (r.result === "failed" ? "bad" : "ok"), text: r.result })]),
+      el("td", { class: "path mono", text: r.remote_path || r.node_id }),
+      el("td", { class: "err mono", text: (r.error || "").slice(0, 160) }),
+    ]));
+  }
+  host.appendChild(el("details", { style: "margin-top:14px" }, [
+    el("summary", { class: "muted", text: `Deletion history (${done.length})` }),
+    el("div", { class: "scroll", style: "margin-top:8px" }, [
+      el("table", {}, [
+        el("thead", {}, [el("tr", {}, [
+          el("th", { text: "when" }), el("th", { text: "result" }),
+          el("th", { text: "path" }), el("th", { text: "error" }),
+        ])]),
+        body,
+      ]),
+    ]),
+  ]));
+}
+
+function checkbox(checked, onchange) {
+  const node = el("input", { type: "checkbox" });
+  node.checked = !!checked;
+  node.addEventListener("change", () => onchange(node.checked));
+  return node;
+}
+
+// ---------------------------------------------------------------- actions
+async function startJob(account, type) {
+  try {
+    const result = await api("/api/jobs", { body: { account, type } });
+    if (result.rejected) {
+      // The plan's "a second click while running is rejected with a clear
+      // message" -- the server decides, so both job runners behave alike.
+      toast(result.reason, true);
+    } else {
+      toast(`${type} queued`);
+    }
+  } catch (err) {
+    toast(err.message, true);
+  }
+  schedule(true);
+  refresh();
+}
+
+async function executeSelected() {
+  const data = S.staged;
+  const ids = [...S.selected];
+  if (!ids.length) return;
+  const markOnly = data.delete_action === "mark_only";
+
+  if (!S.dryRun) {
+    const title = markOnly ? `Mark ${ids.length} as deleted?` : `Trash ${ids.length} in Proton?`;
+    const body = markOnly
+      ? `This records that you deleted ${ids.length} file(s) in Proton yourself. Nothing is sent to Proton.`
+      : `This moves ${ids.length} file(s) to Proton's trash, where they can be restored. `
+        + `Each node is re-checked against Proton first, and anything that has changed is skipped.`;
+    if (!await confirmDialog(title, body, markOnly ? "Mark done" : "Trash them")) return;
+  }
+
+  try {
+    const result = await api("/api/staged-deletes/execute", {
+      body: { account: data.account, ids, dry_run: S.dryRun },
+    });
+    if (result.rejected) { toast(result.reason, true); return; }
+    S.selected.clear();
+    S.lastResult = {
+      bad: false,
+      text: S.dryRun
+        ? `Dry run queued for ${ids.length} row(s): the log will say what it would do. Nothing changed.`
+        : `Queued ${ids.length} row(s). The table updates as each one completes.`,
+    };
+    toast(S.dryRun ? "dry run queued" : "delete job queued");
+    schedule(true);
+    refresh();
+  } catch (err) {
+    S.lastResult = { bad: true, text: err.message };
+    renderStaged();
+    toast(err.message, true);
+  }
+}
+
+async function unstage(row) {
+  const ok = await confirmDialog(
+    "Take it off the queue?",
+    `${row.remote_name} goes back to being an ordinary completed asset and will not be `
+    + `re-downloaded. Restore it in Immich too, or the next sync will simply stage it again.`,
+    "Unstage");
+  if (!ok) return;
+  try {
+    await api("/api/staged-deletes/unstage", {
+      body: { account: S.staged.account, ids: [row.id] },
+    });
+    S.selected.delete(row.id);
+    toast("unstaged");
+    refresh();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function copyPaths(rows) {
+  const text = rows.filter((r) => r.state === "staged")
+                   .map((r) => r.remote_path).join("\n");
+  if (!text) { toast("nothing staged to copy", true); return; }
+  // The Clipboard API needs a secure context, which plain http on the LAN is
+  // not, so the textarea is the path that always works -- not a fallback.
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text)
+      .then(() => toast(`copied ${rows.length} path(s)`))
+      .catch(() => showCopyBox(text));
+  } else {
+    showCopyBox(text);
+  }
+}
+
+function showCopyBox(text) {
+  $("#copytext").value = text;
+  $("#copybox").showModal();
+  $("#copytext").select();
+}
+
+// ---------------------------------------------------------------- polling
+function anyBusy() {
+  return S.accounts.some((a) => !!a.active_job);
+}
+
+function schedule(assumeBusy = false) {
+  clearTimeout(S.timer);
+  if (!S.authed || !S.cfg) return;
+  const secs = (assumeBusy || anyBusy())
+    ? S.cfg.poll_active_sec : S.cfg.poll_idle_sec;
+  S.timer = setTimeout(refresh, Math.max(1, secs) * 1000);
+}
+
+async function refresh() {
+  if (!S.authed) return;
+  try {
+    const accounts = await api("/api/accounts");
+    S.accounts = accounts.accounts || [];
+    if (!S.account || !S.accounts.some((a) => a.account === S.account)) {
+      S.account = S.accounts.length ? S.accounts[0].account : null;
+    }
+    renderCards();
+    $("#updated").textContent = "updated " + new Date().toLocaleTimeString();
+
+    if (S.account) {
+      S.staged = await api(`/api/staged-deletes?account=${encodeURIComponent(S.account)}`);
+      // Drop selections for rows that are no longer staged.
+      const live = new Set(S.staged.staged.filter((r) => r.state === "staged").map((r) => r.id));
+      for (const id of [...S.selected]) if (!live.has(id)) S.selected.delete(id);
+      renderStaged();
+    }
+
+    const runs = [];
+    for (const a of S.accounts) {
+      const data = await api(`/api/runs?account=${encodeURIComponent(a.account)}&limit=10`);
+      for (const r of data.runs) runs.push({ ...r, account: a.account });
+    }
+    runs.sort((x, y) => String(y.started_at || "").localeCompare(String(x.started_at || "")));
+    renderRuns(runs.slice(0, 15));
+  } catch (err) {
+    if (S.authed) toast(err.message, true);
+  }
+  schedule();
+}
+
+// ---------------------------------------------------------------- boot
+function showLogin() {
+  clearTimeout(S.timer);
+  $("#app").hidden = true;
+  $("#login").hidden = false;
+  $("#pw").focus();
+}
+
+function showApp() {
+  $("#login").hidden = true;
+  $("#app").hidden = false;
+  $("#logout").hidden = !S.cfg.auth_required;
+  const pill = $("#runner-pill");
+  pill.textContent = S.cfg.job_runner === "systemd" ? "systemd" : "worker";
+  pill.title = S.cfg.job_runner === "systemd"
+    ? "Force sync starts the systemd unit"
+    : "Force sync runs sync.py from a worker thread";
+  if (S.accounts.length > 1) {
+    const select = $("#acct-select");
+    select.hidden = false;
+    select.textContent = "";
+    for (const a of S.accounts) {
+      select.appendChild(el("option", { value: a.account, text: a.account }));
+    }
+    select.value = S.account;
+    select.onchange = () => { S.account = select.value; S.selected.clear(); refresh(); };
+  }
+}
+
+async function login() {
+  const err = $("#login-err");
+  err.hidden = true;
+  try {
+    await api("/api/login", { body: { password: $("#pw").value } });
+    $("#pw").value = "";
+    S.authed = true;
+    await start();
+  } catch (e) {
+    err.textContent = e.message;
+    err.hidden = false;
+  }
+}
+
+async function start() {
+  await refresh();
+  showApp();
+}
+
+async function boot() {
+  S.cfg = await api("/api/config");
+  if (!S.cfg.auth_required) {
+    S.authed = true;
+    await start();
+    return;
+  }
+  // Probe with a real request: a valid cookie from a previous visit means we
+  // are already in, and there is no endpoint that just says so.
+  try {
+    await api("/api/accounts");
+    S.authed = true;
+    await start();
+  } catch (_) {
+    showLogin();
+  }
+}
+
+$("#login-btn").addEventListener("click", login);
+$("#pw").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+$("#refresh").addEventListener("click", () => refresh());
+$("#copybox-close").addEventListener("click", () => $("#copybox").close());
+$("#logout").addEventListener("click", async () => {
+  await api("/api/logout", { body: {} });
+  S.authed = false;
+  showLogin();
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && S.authed) refresh();
+});
+
+boot().catch((err) => {
+  document.body.textContent = "could not reach the server: " + err.message;
+});
+</script>
+</body>
+</html>

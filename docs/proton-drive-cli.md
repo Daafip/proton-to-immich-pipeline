@@ -22,8 +22,13 @@ below.
 ```
 auth login | auth logout
 filesystem list [-t TYPE] path
+filesystem info path
 filesystem download [-c STRATEGY] [-f STRATEGY] [-d STRATEGY] path... localFolder
-filesystem upload | info | create-folder | rename | copy | move | trash | ...
+filesystem upload [-f STRATEGY] [-d STRATEGY] [-t] localPath... parentPath
+filesystem create-folder | rename | copy | move
+filesystem trash path...       | restore path...
+filesystem delete path...      | empty-trash
+sharing … | invitation … | album … | photo timeline | photo upload | photo download
 General options: -h|--help  -j|--json  -v|--verbose
 ```
 
@@ -53,6 +58,32 @@ Four things follow from that signature:
 
 There is **no `auth status` subcommand**. The session probe is
 `filesystem list /` (`proton.auth_probe_path`).
+
+### Deletion (verified present on 0.8.0)
+
+The build plan had to assume the CLI could not delete at all. It can:
+
+| Command | Behaviour, per its own `--help` |
+|---|---|
+| `filesystem trash path...` | "Moves items to trash. Does not permanently delete." **Reversible** — this is the only one the pipeline calls. |
+| `filesystem restore path...` | Undoes a trash. |
+| `filesystem delete path...` | "Permanently deletes trashed items only." Never called. |
+| `filesystem empty-trash` | Never called. |
+
+`filesystem info path` is the pre-flight check the delete path is built on: it
+prints the node currently at a path, so the staged `uid` can be compared with
+whatever is there now before anything is touched. A path since reused for a
+different file is then skipped rather than deleted.
+
+**Still unverified:** whether any of these work on the **Photos** section.
+Proton's support docs say items there cannot be deleted from desktop apps, and
+a third-party GUI wrapper reports delete/rename/restore as unavailable in the
+Photos view. That is why `delete.action` is per account and defaults to
+`mark_only`; a `/my-files/...` root is the `execute` case.
+
+There is no documented trashed/`isTrashed` field in `filesystem info` output,
+so the pipeline treats **"no longer resolvable at that path"** as the primary
+signal that a trash succeeded, and checks a trash-ish flag only as a bonus.
 
 ## Paths
 

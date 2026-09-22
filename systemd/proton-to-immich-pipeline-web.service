@@ -1,0 +1,43 @@
+[Unit]
+# The status and delete-queue UI. Standard library only -- no gunicorn, no
+# node, nothing to build.
+Description=Proton -> Immich sync web UI
+Documentation=file:/opt/proton-to-immich-pipeline/README.md
+After=network-online.target mnt-immich.mount
+Wants=network-online.target
+RequiresMountsFor=/mnt/immich
+
+[Service]
+Type=simple
+User=protonsync
+Group=protonsync
+WorkingDirectory=/opt/proton-to-immich-pipeline
+EnvironmentFile=-/etc/proton-to-immich-pipeline/env.web
+Environment=PIS_CONFIG=/etc/proton-to-immich-pipeline/config.yaml
+ExecStart=/usr/bin/python3 /opt/proton-to-immich-pipeline/sync.py serve
+Restart=on-failure
+RestartSec=5s
+
+# The UI writes the jobs table and the cookie-signing secret, and its worker
+# spawns sync.py, which needs staging. Reads of asset state go through a
+# mode=ro connection so a page refresh never queues behind a running backfill.
+ReadWritePaths=/mnt/immich/staging
+
+# web.bind defaults to 127.0.0.1. Point it at the LAN address (or 0.0.0.0)
+# only once web.password_hash is set -- `sync.py serve` refuses an
+# unauthenticated non-loopback bind rather than publishing the delete queue.
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

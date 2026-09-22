@@ -1,13 +1,25 @@
-"""Phase orchestration: pull, download, push, verify, reap.
+"""Phase orchestration: pull, download, push, verify, reap, reconcile.
 
 Backends are injected so the whole pipeline can be exercised against fakes
 without touching the network -- see tests/.
+
+One Pipeline belongs to one account, and `cfg` is that account's Account
+object -- Proton session, staging subtree and Immich key in a single value.
+Nothing is read from a module-level default, so there is no way to pair one
+account's staging directory with another's API key.
+
+`reconcile` and `execute_deletes` are the v2 additions, and they are
+deliberately asymmetric: reconcile runs unattended at the end of every sync
+and only ever *adds* to the staged list, while execute_deletes -- the only
+destructive code in the pipeline -- runs when a human asks and re-checks every
+node against Proton before touching it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import shutil
 import sqlite3
 import time
@@ -38,6 +50,12 @@ class Stats:
     failed: int = 0
     quarantined: int = 0
     bytes_downloaded: int = 0
+    # v2: the delete queue. `staged` is what reconcile added this pass;
+    # `trashed`/`delete_failed`/`delete_skipped` are what execute did.
+    staged: int = 0
+    trashed: int = 0
+    delete_failed: int = 0
+    delete_skipped: int = 0
     aborted: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -48,10 +66,46 @@ class AuthFailure(Exception):
     """Raised to surface exit code 2 to the CLI layer."""
 
 
+class CircuitBreaker:
+    """Stop a pass after N consecutive failures.
+
+    Per-asset exponential backoff already exists; this is the global one it
+    was missing. The case it is for: Proton starts rate-limiting mid-backfill,
+    every file fails in quick succession, and each failure burns an attempt --
+    so one bad night quarantines hundreds of files that were never broken.
+    `requeue` recovers them, but only once somebody notices.
+
+    Tripping stops the pass, which is the whole point: the rows not reached
+    keep their full attempt budget for the next run.
+    """
+
+    def __init__(self, threshold: int):
+        # 0 disables it. Anything below that is a typo, not a request for a
+        # breaker that trips on the first failure.
+        self.threshold = max(0, int(threshold))
+        self.consecutive = 0
+        self.tripped = False
+
+    def record_success(self) -> None:
+        self.consecutive = 0
+
+    def record_failure(self) -> bool:
+        """Returns True once the pass should stop."""
+        self.consecutive += 1
+        if self.threshold and self.consecutive >= self.threshold:
+            self.tripped = True
+        return self.tripped
+
+
 class Pipeline:
     def __init__(self, cfg, conn: sqlite3.Connection, backend=None, client=None,
                  uploader=None, run_id: str | None = None, dry_run: bool = False):
+        # cfg is an Account: one object carrying this identity's Proton
+        # session, staging subtree and Immich key. Nothing here reads any of
+        # those from anywhere else, which is what stops one account's photos
+        # reaching the other's library.
         self.cfg = cfg
+        self.account = str(getattr(cfg, "account_name", None) or "default")
         self.conn = conn
         self.dry_run = dry_run
         self.run_id = run_id or time.strftime("%Y%m%dT%H%M%S")
@@ -95,9 +149,19 @@ class Pipeline:
     def _min_free_bytes(self) -> int:
         return int(float(self.cfg.get("staging.min_free_gb", 20)) * 1e9)
 
+    def _breaker(self) -> CircuitBreaker:
+        return CircuitBreaker(self.cfg.get("limits.consecutive_failures", 25))
+
+    def _trip(self, breaker: CircuitBreaker, stage: str) -> None:
+        message = (f"{stage} stopped after {breaker.consecutive} consecutive "
+                   f"failures; the rows not reached keep their attempts")
+        log.error("circuit.tripped", stage=stage,
+                  consecutive=breaker.consecutive, threshold=breaker.threshold)
+        self.stats.aborted.append(message)
+
     def _fail(self, node_id: str, stage: str, error: str, previous: str) -> None:
         status = state.mark_failed(
-            self.conn, node_id, stage, error,
+            self.conn, self.account, node_id, stage, error,
             max_attempts=int(self.cfg.get("limits.max_attempts", 5)))
         self.stats.failed += 1
         if status == state.QUARANTINED:
@@ -130,7 +194,7 @@ class Pipeline:
                         self.stats.skipped += 1
                         continue
                     if dry:
-                        row = state.get(self.conn, node.node_id)
+                        row = state.get(self.conn, self.account, node.node_id)
                         if row is None:
                             self.stats.discovered += 1
                         elif ((row["remote_size"] or 0) != (node.size or 0)
@@ -141,7 +205,8 @@ class Pipeline:
                         continue
 
                     result = state.upsert_discovered(
-                        self.conn, node.node_id, node.path, node.name,
+                        self.conn, self.account, node.node_id, node.path,
+                        node.name,
                         node.size, node.modified,
                         claimed_sha1=node.sha1, capture_time=node.capture_time)
                     if result == "new":
@@ -177,7 +242,7 @@ class Pipeline:
         asset already in Immich would skip a file that never actually arrived.
         A wrong claim that matches nothing simply downloads as normal.
         """
-        rows = state.select_for_precheck(self.conn, limit=limit)
+        rows = state.select_for_precheck(self.conn, self.account, limit=limit)
         if not rows:
             log.info("precheck.nothing_to_do")
             return self.stats
@@ -202,7 +267,7 @@ class Pipeline:
                     log.info("precheck.dry_run_present", node_id=row["node_id"])
                     self.stats.skipped_present += 1
                     continue
-                state.mark_uploaded(self.conn, row["node_id"], hit.asset_id,
+                state.mark_uploaded(self.conn, self.account, row["node_id"], hit.asset_id,
                                     is_duplicate=True, sha1=row["claimed_sha1"])
                 log.transition(row["node_id"], state.DISCOVERED, state.UPLOADED,
                                asset_id=hit.asset_id, reason="already in immich",
@@ -235,6 +300,150 @@ class Pipeline:
             candidate = bucket / f"{stem}-{suffix}{ext}"
         return candidate
 
+    def _plan_batches(self, rows: list[sqlite3.Row],
+                      batch_size: int) -> list[list[sqlite3.Row]]:
+        """Group rows into one-invocation batches.
+
+        `filesystem download path... localFolder` takes any number of source
+        paths but **one destination folder**, and the CLI names each file
+        itself. Two constraints follow, and both are enforced here rather than
+        left to the backend:
+
+        * **One source folder per batch.** Names are unique within a folder,
+          so nothing can collide in the destination.
+        * **No two files with the same name in one batch.** A name can repeat
+          across folders, and an undecryptable name falls back to a node uid,
+          so uniqueness is checked rather than assumed. Anything that would
+          collide -- or whose name is not a safe basename -- gets a batch of
+          its own, which is the v1 behaviour and always safe.
+
+        `batch_size` of 1 restores v1 exactly: one invocation per file.
+        """
+        if batch_size <= 1:
+            return [[row] for row in rows]
+
+        # dict preserves insertion order, so folders stay in the order the
+        # selection produced them and the oldest files are still fetched first.
+        by_folder: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            by_folder.setdefault(posixpath.dirname(row["remote_path"] or ""),
+                                 []).append(row)
+
+        batches: list[list[sqlite3.Row]] = []
+        for group in by_folder.values():
+            current: list[sqlite3.Row] = []
+            names: set[str] = set()
+            for row in group:
+                name = row["remote_name"] or ""
+                unsafe = (not name) or name != proton.safe_filename(name)
+                if unsafe or name in names:
+                    batches.append([row])
+                    continue
+                current.append(row)
+                names.add(name)
+                if len(current) >= batch_size:
+                    batches.append(current)
+                    current, names = [], set()
+            if current:
+                batches.append(current)
+        return batches
+
+    def _node_for(self, row: sqlite3.Row) -> RemoteNode:
+        return RemoteNode(node_id=row["node_id"], path=row["remote_path"],
+                          name=row["remote_name"], size=row["remote_size"],
+                          modified=row["remote_modified"], is_folder=False)
+
+    def _promote(self, row: sqlite3.Row, scratch: Path) -> int:
+        """Check one downloaded file and move it into ready/. Returns bytes.
+
+        Raises ProtonError or OSError, which the caller charges to the row --
+        this is the same set of checks v1 did per file, unchanged by batching.
+        """
+        size = row["remote_size"] or 0
+        actual = scratch.stat().st_size
+        if size and actual != size:
+            raise ProtonError(f"size mismatch: remote {size} bytes, got {actual}")
+        if actual == 0:
+            raise ProtonError("downloaded file is empty")
+        digest = sha1_file(scratch)
+        claimed = _row_get(row, "claimed_sha1")
+        if claimed and claimed != digest:
+            # Proton reports sha1Verified: false, so the claim is the
+            # uploader's word. Our own digest is what Immich gets.
+            log.warn("download.digest_mismatch", node_id=row["node_id"],
+                     claimed=claimed, actual=digest)
+        target = self._ready_path(row, digest)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(scratch, target)  # same filesystem: atomic
+
+        state.mark_downloaded(self.conn, self.account, row["node_id"],
+                              str(target), digest)
+        log.transition(row["node_id"], state.DOWNLOADING, state.DOWNLOADED,
+                       local_path=str(target), sha1=digest, bytes=actual)
+        return actual
+
+    def _fetch_batch(self, batch: list[sqlite3.Row],
+                     scratch_dir: Path) -> tuple[dict[str, Path], dict[str, str]]:
+        """Download a batch, then look at what is actually on disk.
+
+        Returns (landed, errors) keyed by node id. The exit code is never
+        trusted on its own: a batch that fails partway still leaves real files
+        behind, and throwing those away would mean re-transferring them.
+
+        When the batch call fails, whatever did not land is retried one file
+        at a time. That costs an extra pass over the failed batch and buys
+        exact attribution -- one unreadable file must not charge an attempt to
+        the other forty-nine.
+        """
+        landed: dict[str, Path] = {}
+        errors: dict[str, str] = {}
+        batch_error: str | None = None
+
+        try:
+            self.backend.download_many([self._node_for(r) for r in batch],
+                                       scratch_dir)
+        except AuthError as exc:
+            self.auth_ok = False
+            raise AuthFailure(str(exc)) from exc
+        except (ProtonError, OSError) as exc:
+            batch_error = str(exc)
+
+        for row in batch:
+            candidate = scratch_dir / (row["remote_name"] or "")
+            if candidate.is_file():
+                landed[row["node_id"]] = candidate
+
+        missing = [r for r in batch if r["node_id"] not in landed]
+        if batch_error and missing and len(batch) > 1:
+            log.warn("download.batch_failed_retrying_singly",
+                     batch=len(batch), missing=len(missing),
+                     detail=log.condense(batch_error, 300))
+            for row in missing:
+                single = (scratch_dir
+                          / hashlib.sha1(str(row["node_id"]).encode()).hexdigest()[:12]
+                          / (row["remote_name"] or "asset"))
+                try:
+                    self.backend.download(self._node_for(row), single)
+                except AuthError as exc:
+                    self.auth_ok = False
+                    raise AuthFailure(str(exc)) from exc
+                except (ProtonError, OSError) as exc:
+                    errors[row["node_id"]] = str(exc)
+                    continue
+                if single.is_file():
+                    landed[row["node_id"]] = single
+                else:
+                    errors[row["node_id"]] = "download reported success but produced nothing"
+        elif batch_error:
+            for row in missing:
+                errors[row["node_id"]] = batch_error
+        else:
+            for row in missing:
+                errors[row["node_id"]] = (
+                    f"not produced by the download "
+                    f"(expected {row['remote_name']!r} in the batch folder)")
+        return landed, errors
+
     def download(self, limit: int | None = None, max_bytes: int | None = None,
                  backfill: bool = False) -> Stats:
         default_limit, default_bytes = self._limits(backfill)
@@ -252,7 +461,7 @@ class Pipeline:
             return self.stats
 
         rows = state.select_for_download(
-            self.conn, limit=limit, max_bytes=max_bytes,
+            self.conn, self.account, limit=limit, max_bytes=max_bytes,
             max_attempts=int(self.cfg.get("limits.max_attempts", 5)),
             backoff_base_sec=int(self.cfg.get("limits.backoff_base_sec", 300)),
             backoff_cap_sec=int(self.cfg.get("limits.backoff_cap_sec", 86400)),
@@ -265,72 +474,94 @@ class Pipeline:
         if not self.dry_run:
             incoming.mkdir(parents=True, exist_ok=True)
 
+        batch_size = int(self.cfg.get("proton.download_batch_size", 25))
+        batches = self._plan_batches(rows, batch_size)
+        if batch_size > 1:
+            log.info("download.batched", files=len(rows), batches=len(batches),
+                     batch_size=batch_size)
+        breaker = self._breaker()
+
         budget = max_bytes
-        for row in rows:
-            node_id = row["node_id"]
-            size = row["remote_size"] or 0
-            if budget is not None and size > budget and self.stats.downloaded:
-                log.info("download.byte_cap_reached", downloaded=self.stats.downloaded)
-                break
-            if self._free_bytes() - size < floor:
-                log.warn("download.stopped_low_space", free_gb=round(self._free_bytes() / 1e9, 1))
+        for index, batch in enumerate(batches):
+            # The byte cap is applied at selection time too; this is the
+            # backstop for when the real sizes differ from the reported ones.
+            if budget is not None and self.stats.downloaded:
+                fitted, running = [], 0
+                for row in batch:
+                    size = row["remote_size"] or 0
+                    if running + size > budget:
+                        continue
+                    fitted.append(row)
+                    running += size
+                if not fitted:
+                    log.info("download.byte_cap_reached",
+                             downloaded=self.stats.downloaded)
+                    break
+                batch = fitted
+
+            batch_bytes = sum(r["remote_size"] or 0 for r in batch)
+            if self._free_bytes() - batch_bytes < floor:
+                log.warn("download.stopped_low_space",
+                         free_gb=round(self._free_bytes() / 1e9, 1))
                 self.stats.aborted.append("stopped early: free space floor reached")
                 break
 
             if self.dry_run:
-                log.info("download.dry_run", node_id=node_id, path=row["remote_path"])
-                self.stats.downloaded += 1
+                for row in batch:
+                    log.info("download.dry_run", node_id=row["node_id"],
+                             path=row["remote_path"])
+                    self.stats.downloaded += 1
                 continue
 
-            previous = row["status"]
-            state.mark_downloading(self.conn, node_id)
-            log.transition(node_id, previous, state.DOWNLOADING, path=row["remote_path"])
+            for row in batch:
+                state.mark_downloading(self.conn, self.account, row["node_id"])
+                log.transition(row["node_id"], row["status"], state.DOWNLOADING,
+                               path=row["remote_path"])
 
-            # One scratch folder per node: the Proton CLI downloads into a
-            # folder and picks the filename, and with "-c skip" a leftover file
-            # from another node could otherwise be promoted as this one.
-            scratch_dir = incoming / hashlib.sha1(str(node_id).encode()).hexdigest()[:12]
-            scratch = scratch_dir / row["remote_name"]
-            node = RemoteNode(node_id=node_id, path=row["remote_path"],
-                              name=row["remote_name"], size=row["remote_size"],
-                              modified=row["remote_modified"], is_folder=False)
+            # One scratch folder per batch. The CLI picks the filename and
+            # `--conflict-strategy skip` would keep a leftover from an earlier
+            # batch, so nothing is ever downloaded into a shared directory.
+            scratch_dir = incoming / f"b{index:05d}"
+            handled = 0
             try:
-                self.backend.download(node, scratch)
-                actual = scratch.stat().st_size
-                if size and actual != size:
-                    raise ProtonError(
-                        f"size mismatch: remote {size} bytes, got {actual}")
-                if actual == 0:
-                    raise ProtonError("downloaded file is empty")
-                digest = sha1_file(scratch)
-                claimed = _row_get(row, "claimed_sha1")
-                if claimed and claimed != digest:
-                    # Proton reports sha1Verified: false, so the claim is the
-                    # uploader's word. Our own digest is what Immich gets.
-                    log.warn("download.digest_mismatch", node_id=node_id,
-                             claimed=claimed, actual=digest)
-                target = self._ready_path(row, digest)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(scratch, target)  # same filesystem: atomic
-            except AuthError as exc:
-                # Leave the row in `downloading`; resume() resets it next run.
-                self.auth_ok = False
-                raise AuthFailure(str(exc)) from exc
-            except (ProtonError, OSError) as exc:
-                self._fail(node_id, "download", str(exc), state.DOWNLOADING)
-                continue
+                landed, errors = self._fetch_batch(batch, scratch_dir)
+                for row in batch:
+                    handled += 1
+                    node_id = row["node_id"]
+                    scratch = landed.get(node_id)
+                    if scratch is None:
+                        self._fail(node_id, "download",
+                                   errors.get(node_id, "download produced nothing"),
+                                   state.DOWNLOADING)
+                        if breaker.record_failure():
+                            break
+                        continue
+                    try:
+                        actual = self._promote(row, scratch)
+                    except (ProtonError, OSError) as exc:
+                        self._fail(node_id, "download", str(exc), state.DOWNLOADING)
+                        if breaker.record_failure():
+                            break
+                        continue
+                    breaker.record_success()
+                    self.stats.downloaded += 1
+                    self.stats.bytes_downloaded += actual
+                    if budget is not None:
+                        budget -= actual
             finally:
-                # Covers success (the file has been moved out), failure and
-                # the auth abort alike.
+                # Covers success (files have been moved out), failure and the
+                # auth abort alike.
                 shutil.rmtree(scratch_dir, ignore_errors=True)
 
-            state.mark_downloaded(self.conn, node_id, str(target), digest)
-            log.transition(node_id, state.DOWNLOADING, state.DOWNLOADED,
-                           local_path=str(target), sha1=digest, bytes=actual)
-            self.stats.downloaded += 1
-            self.stats.bytes_downloaded += actual
-            if budget is not None:
-                budget -= actual
+            if breaker.tripped:
+                # Rows this batch never got to go back on the queue now, not
+                # at the next run's resume(): a pass that stops deliberately
+                # should leave no row looking in-flight. No attempt charged --
+                # they were never tried.
+                state.rewind(self.conn, self.account,
+                             [r["node_id"] for r in batch[handled:]])
+                self._trip(breaker, "download")
+                break
 
         if not self.dry_run:
             _remove_if_empty(incoming)
@@ -370,7 +601,7 @@ class Pipeline:
     def push(self, limit: int | None = None, dry_run: bool | None = None) -> Stats:
         dry = self.dry_run if dry_run is None else dry_run
         rows = state.select_for_upload(
-            self.conn, limit=limit,
+            self.conn, self.account, limit=limit,
             max_attempts=int(self.cfg.get("limits.max_attempts", 5)),
             backoff_base_sec=int(self.cfg.get("limits.backoff_base_sec", 300)),
             backoff_cap_sec=int(self.cfg.get("limits.backoff_cap_sec", 86400)),
@@ -410,7 +641,7 @@ class Pipeline:
                 if dry:
                     log.info("push.dry_run_duplicate", node_id=row["node_id"])
                     continue
-                state.mark_uploaded(self.conn, row["node_id"], hit.asset_id, is_duplicate=True)
+                state.mark_uploaded(self.conn, self.account, row["node_id"], hit.asset_id, is_duplicate=True)
                 log.transition(row["node_id"], row["status"], state.UPLOADED,
                                asset_id=hit.asset_id, duplicate=True)
                 self.stats.duplicates += 1
@@ -433,7 +664,7 @@ class Pipeline:
             return self.stats
 
         for row in pending:
-            state.mark_uploading(self.conn, row["node_id"])
+            state.mark_uploading(self.conn, self.account, row["node_id"])
             log.transition(row["node_id"], row["status"], state.UPLOADING)
 
         mode = self.cfg.get("immich.upload_mode", "cli")
@@ -447,7 +678,10 @@ class Pipeline:
         return self.stats
 
     def _push_via_api(self, rows: list[sqlite3.Row]) -> None:
+        breaker = self._breaker()
+        handled = 0
         for row in rows:
+            handled += 1
             try:
                 result = self.client.upload_file(
                     row["local_path"], row["sha1"], device_asset_id=row["node_id"])
@@ -455,18 +689,29 @@ class Pipeline:
                 raise AuthFailure(f"immich: {exc}") from exc
             except (ImmichError, OSError) as exc:
                 self._fail(row["node_id"], "upload", str(exc), state.UPLOADING)
+                if breaker.record_failure():
+                    break
                 continue
             if not result.asset_id:
                 self._fail(row["node_id"], "upload", "no asset id returned",
                            state.UPLOADING)
+                if breaker.record_failure():
+                    break
                 continue
-            state.mark_uploaded(self.conn, row["node_id"], result.asset_id,
+            breaker.record_success()
+            state.mark_uploaded(self.conn, self.account, row["node_id"], result.asset_id,
                                 is_duplicate=result.duplicate)
             log.transition(row["node_id"], state.UPLOADING, state.UPLOADED,
                            asset_id=result.asset_id, duplicate=result.duplicate)
             self.stats.uploaded += 1
             if result.duplicate:
                 self.stats.duplicates += 1
+        if breaker.tripped:
+            # Same as download: put the rows never reached back to
+            # `downloaded` now, attempts untouched.
+            state.rewind(self.conn, self.account,
+                         [r["node_id"] for r in rows[handled:]])
+            self._trip(breaker, "push")
 
     def _push_via_cli(self, rows: list[sqlite3.Row]) -> None:
         batch, mapping = self._build_batch(rows)
@@ -502,7 +747,7 @@ class Pipeline:
                 if not (hit and hit.asset_id):
                     hit = self.client.find_by_checksum(row["sha1"], row["remote_name"])
                 if hit and hit.asset_id:
-                    state.mark_uploaded(self.conn, row["node_id"], hit.asset_id,
+                    state.mark_uploaded(self.conn, self.account, row["node_id"], hit.asset_id,
                                         is_duplicate=False)
                     log.transition(row["node_id"], state.UPLOADING, state.UPLOADED,
                                    asset_id=hit.asset_id)
@@ -515,10 +760,11 @@ class Pipeline:
 
     # -- Phase 4: verify ---------------------------------------------------
     def verify(self, limit: int | None = None) -> Stats:
-        rows = state.select_for_verify(self.conn, limit=limit)
+        rows = state.select_for_verify(self.conn, self.account, limit=limit)
         if not rows:
             log.info("verify.nothing_to_do")
             return self.stats
+        breaker = self._breaker()
         for row in rows:
             node_id = row["node_id"]
             asset_id = row["immich_asset_id"]
@@ -529,39 +775,50 @@ class Pipeline:
                     asset = self.client.get_asset(hit.asset_id) if hit.asset_id else None
                     if asset:
                         self.conn.execute(
-                            "UPDATE assets SET immich_asset_id=? WHERE node_id=?",
-                            (asset.get("id"), node_id))
+                            "UPDATE assets SET immich_asset_id=?"
+                            " WHERE account=? AND node_id=?",
+                            (asset.get("id"), self.account, node_id))
                         self.conn.commit()
             except ImmichAuthError as exc:
                 raise AuthFailure(f"immich: {exc}") from exc
             except ImmichError as exc:
                 self._fail(node_id, "verify", str(exc), state.UPLOADED)
+                if breaker.record_failure():
+                    break
                 continue
 
             if not asset:
                 self._fail(node_id, "verify", "asset not found server-side",
                            state.UPLOADED)
+                if breaker.record_failure():
+                    break
                 continue
             remote_sum = asset.get("checksum") or (asset.get("exifInfo") or {}).get("checksum")
             if remote_sum and not immich_mod.checksums_match(row["sha1"], remote_sum):
                 self._fail(node_id, "verify",
                            f"checksum mismatch (local {row['sha1']}, remote {remote_sum})",
                            state.UPLOADED)
+                if breaker.record_failure():
+                    break
                 continue
             if not remote_sum:
                 log.warn("verify.no_remote_checksum", node_id=node_id,
                          asset_id=asset.get("id"))
-            state.mark_verified(self.conn, node_id)
+            breaker.record_success()
+            state.mark_verified(self.conn, self.account, node_id,
+                                immich_checksum=remote_sum)
             log.transition(node_id, state.UPLOADED, state.VERIFIED,
                            asset_id=asset.get("id"))
             self.stats.verified += 1
+        if breaker.tripped:
+            self._trip(breaker, "verify")
         log.info("verify.done", verified=self.stats.verified, failed=self.stats.failed)
         return self.stats
 
     # -- Phase 4b: reap ----------------------------------------------------
     def reap(self, keep_days: int | None = None) -> Stats:
         keep = int(self.cfg.get("reap.keep_days", 7)) if keep_days is None else keep_days
-        rows = state.select_for_reap(self.conn, keep_days=keep)
+        rows = state.select_for_reap(self.conn, self.account, keep_days=keep)
         for row in rows:
             local = row["local_path"]
             if self.dry_run:
@@ -573,16 +830,16 @@ class Pipeline:
             except OSError as exc:
                 log.warn("reap.unlink_failed", node_id=row["node_id"], error=str(exc))
                 continue
-            state.mark_purged(self.conn, row["node_id"])
+            state.mark_purged(self.conn, self.account, row["node_id"])
             log.transition(row["node_id"], state.VERIFIED, state.PURGED, path=local)
             self.stats.purged += 1
 
         # Rows matched by claimed digest never had a file; nothing to delete,
         # but they should still reach a terminal state.
-        for row in state.select_verified_without_file(self.conn):
+        for row in state.select_verified_without_file(self.conn, self.account):
             if self.dry_run:
                 continue
-            state.mark_purged(self.conn, row["node_id"])
+            state.mark_purged(self.conn, self.account, row["node_id"])
             log.transition(row["node_id"], state.VERIFIED, state.PURGED,
                            downloaded=False)
             self.stats.purged += 1
@@ -610,10 +867,223 @@ class Pipeline:
                 except OSError:
                     continue
 
-    # -- Phase 5: run everything ------------------------------------------
+    # -- Phase 5: reconcile ------------------------------------------------
+    def reconcile(self) -> Stats:
+        """Stage for deletion anything this account put in Immich and someone
+        has since moved to Immich's trash.
+
+        Read-only towards Proton. The only write is a row in `staged_deletes`
+        plus the asset's status, and both are idempotent -- a photo sitting in
+        Immich's trash for a week is staged once, on the first sync that sees
+        it, not once per night.
+
+        Why the list lives here and not in Immich: **Immich empties its trash
+        after about 30 days.** A list recomputed from the server on each view
+        would silently lose anything not acted on before that purge, while the
+        file stayed in Proton with nothing left to say so. Recording on first
+        sighting is the whole point of the table.
+        """
+        if not self.cfg.get("reconcile.enabled", True):
+            log.debug("reconcile.disabled")
+            return self.stats
+
+        types = list(self.cfg.get("reconcile.types", ["IMAGE", "VIDEO"]) or [])
+        try:
+            trashed = self.client.search_trashed(
+                types=types,
+                page_size=int(self.cfg.get("reconcile.page_size", 250)),
+                max_pages=int(self.cfg.get("reconcile.max_pages", 400)),
+            )
+        except ImmichAuthError as exc:
+            raise AuthFailure(f"immich: {exc}") from exc
+        except ImmichError as exc:
+            # Never fail a whole sync over the delete queue: the photos are
+            # already safely uploaded, and the next run will scan again.
+            log.warn("reconcile.unavailable", detail=log.condense(str(exc), 300))
+            self.stats.aborted.append(f"reconcile: {exc}")
+            return self.stats
+
+        if not trashed:
+            log.info("reconcile.done", trashed_in_immich=0, staged=0)
+            return self.stats
+
+        by_asset = {str(a.get("id")): a for a in trashed if a.get("id")}
+        rows = state.find_by_asset_ids(self.conn, self.account, list(by_asset))
+        for asset_id, row in rows.items():
+            if self.dry_run:
+                if row["status"] not in state.DELETE_STATUSES:
+                    log.info("reconcile.dry_run_stage", node_id=row["node_id"],
+                             path=row["remote_path"])
+                    self.stats.staged += 1
+                continue
+            if state.stage_delete(self.conn, self.account, row):
+                self.stats.staged += 1
+                log.transition(row["node_id"], row["status"],
+                               state.STAGED_FOR_DELETE, asset_id=asset_id,
+                               path=row["remote_path"], reason="trashed in immich")
+
+        log.info("reconcile.done", trashed_in_immich=len(by_asset),
+                 matched=len(rows), staged=self.stats.staged,
+                 total_staged=state.count_staged(self.conn, self.account),
+                 dry_run=self.dry_run)
+        return self.stats
+
+    # -- Phase 6: execute the staged deletions -----------------------------
+    def execute_deletes(self, ids: Iterable[int] | None = None,
+                        limit: int | None = None,
+                        dry_run: bool | None = None) -> Stats:
+        """Trash the named staged rows in Proton. The only destructive path.
+
+        Every rule here exists because a mistake is a lost photo:
+
+        * **Trash, never permanent.** `filesystem trash`, so Proton's trash is
+          the undo. `filesystem delete` and `empty-trash` are never called.
+        * **Ids, never paths.** What to delete is resolved out of
+          `staged_deletes`; a caller supplies row ids and nothing else. A path
+          from a request body is never passed to the CLI.
+        * **Re-resolve before touching anything.** The node id currently at
+          the staged path must equal the node id that was staged. A path since
+          reused for a different file is skipped and flagged, not deleted.
+        * **Capped.** `delete.batch_cap` bounds every invocation regardless of
+          what was asked for.
+        * **Verified afterwards.** If the node is still sitting there, the row
+          becomes `delete_failed` rather than quietly claiming success.
+        * **Audited.** Every attempt appends a row to `deletions`, which is
+          never updated or deleted.
+        """
+        dry = self.dry_run if dry_run is None else dry_run
+        action = str(getattr(self.cfg, "delete_action", "mark_only"))
+        cap = int(self.cfg.get("delete.batch_cap", 50))
+        if limit is not None:
+            cap = min(cap, max(int(limit), 0))
+
+        if ids is None:
+            rows = state.staged_deletes(self.conn, self.account, limit=cap)
+        else:
+            rows = [r for r in state.get_staged(self.conn, self.account, list(ids))
+                    if r["state"] == state.STAGED][:cap]
+
+        if not rows:
+            log.info("delete.nothing_to_do", action=action)
+            return self.stats
+
+        log.info("delete.start", count=len(rows), action=action, dry_run=dry,
+                 cap=cap)
+
+        for row in rows:
+            staged_id = int(row["id"])
+            node_id = row["node_id"]
+            path = row["remote_path"]
+
+            if action == "mark_only":
+                # Nothing is called on Proton. The row records that the
+                # operator is doing the deletion themselves, which is the
+                # honest state for a Photos-section library the CLI may refuse.
+                if dry:
+                    log.info("delete.dry_run_mark_only", node_id=node_id, path=path)
+                    self.stats.delete_skipped += 1
+                    continue
+                state.mark_remote_trashed(self.conn, self.account, row,
+                                          "mark_only")
+                self.stats.trashed += 1
+                log.transition(node_id, state.STAGED_FOR_DELETE,
+                               state.REMOTE_TRASHED, path=path,
+                               action="mark_only")
+                continue
+
+            if not path:
+                self._flag_delete(row, "no remote path recorded; cannot re-resolve")
+                continue
+
+            # --- pre-flight: is the staged node still the node at that path?
+            try:
+                current = self.backend.resolve(path)
+            except AuthError as exc:
+                self.auth_ok = False
+                raise AuthFailure(str(exc)) from exc
+            except ProtonError as exc:
+                self._flag_delete(row, f"could not resolve: {log.condense(str(exc), 300)}")
+                continue
+
+            if current is None:
+                # Already gone from Proton -- someone deleted it by hand, or a
+                # previous pass succeeded and we crashed before recording it.
+                # Not a failure: the desired end state is the actual one.
+                if dry:
+                    log.info("delete.dry_run_already_gone", node_id=node_id, path=path)
+                    self.stats.delete_skipped += 1
+                    continue
+                state.mark_remote_trashed(self.conn, self.account, row,
+                                          "already_absent")
+                self.stats.trashed += 1
+                log.transition(node_id, state.STAGED_FOR_DELETE,
+                               state.REMOTE_TRASHED, path=path,
+                               reason="already absent in proton")
+                continue
+
+            if current.node_id != node_id:
+                # The path has been reused. Deleting what is there now would
+                # destroy a file nobody asked about.
+                self._flag_delete(
+                    row,
+                    f"path now holds a different node ({current.node_id}, "
+                    f"staged {node_id}); refusing to trash it")
+                continue
+
+            if dry:
+                log.info("delete.dry_run", node_id=node_id, path=path,
+                         name=row["remote_name"])
+                self.stats.delete_skipped += 1
+                continue
+
+            # --- execute
+            state.mark_deleting(self.conn, self.account, node_id, staged_id)
+            log.transition(node_id, state.STAGED_FOR_DELETE, state.DELETING,
+                           path=path)
+            try:
+                self.backend.trash(path)
+            except AuthError as exc:
+                self.auth_ok = False
+                raise AuthFailure(str(exc)) from exc
+            except ProtonError as exc:
+                self._flag_delete(row, log.condense(str(exc), 500))
+                continue
+
+            # --- verify: the node must no longer be at that path
+            try:
+                after = self.backend.resolve(path)
+            except ProtonError as exc:
+                log.warn("delete.verify_unavailable", node_id=node_id,
+                         detail=str(exc)[:200])
+                after = None
+            if after is not None and after.node_id == node_id:
+                self._flag_delete(row, "trash reported success but the node is "
+                                       "still at that path")
+                continue
+
+            state.mark_remote_trashed(self.conn, self.account, row, "trashed")
+            self.stats.trashed += 1
+            log.transition(node_id, state.DELETING, state.REMOTE_TRASHED,
+                           path=path)
+
+        log.info("delete.done", trashed=self.stats.trashed,
+                 failed=self.stats.delete_failed,
+                 skipped=self.stats.delete_skipped, dry_run=dry)
+        return self.stats
+
+    def _flag_delete(self, row, error: str) -> None:
+        """A staged row that could not be trashed. Never silently dropped: it
+        stays visible in the UI with the reason, and the audit table records
+        the attempt."""
+        state.mark_delete_failed(self.conn, self.account, row, error)
+        self.stats.delete_failed += 1
+        log.error("delete.failed", node_id=row["node_id"],
+                  path=row["remote_path"], error=error[:400])
+
+    # -- Phase 7: run everything ------------------------------------------
     def run(self, backfill: bool = False) -> Stats:
-        state.start_run(self.conn, self.run_id)
-        reset = state.resume(self.conn)
+        state.start_run(self.conn, self.account, self.run_id)
+        reset = state.resume(self.conn, self.account)
         if reset:
             log.info("run.resumed", **{k: v for k, v in reset.items()})
         self.pull()
@@ -623,6 +1093,9 @@ class Pipeline:
         self.push()
         self.verify()
         self.reap()
+        # Last, and never destructive: reconcile only adds to the staged list.
+        # Deleting is a separate, manual step.
+        self.reconcile()
         return self.stats
 
 

@@ -36,6 +36,14 @@ DEFAULTS: dict[str, Any] = {
         # (handy for spreading a backfill over several nights).
         # `proton-drive filesystem list /` prints the top-level sections.
         "roots": ["/my-files/Photos"],
+        # Files per `filesystem download` invocation. The CLI costs ~1.2 s of
+        # Bun and SDK startup per call whatever it does, so a 25k-file
+        # backfill spends most of a working day just starting processes; one
+        # call per batch is the only lever on that. Batches are grouped by
+        # source folder and never contain two files of the same name, because
+        # they all land in one destination folder. Set to 1 to go back to one
+        # invocation per file.
+        "download_batch_size": 25,
         "timeout_sec": 900,
         "max_depth": 25,
         # Preferred filter: the CLI reports mediaType (image/jpeg, video/mp4).
@@ -68,6 +76,10 @@ DEFAULTS: dict[str, Any] = {
             "list": ["filesystem", "list", "{path}", "--json"],
             "download": ["filesystem", "download", "--conflict-strategy", "skip",
                          "{path}", "{dest_dir}"],
+            # v2, for the delete path. `trash` is reversible; `delete` and
+            # `empty-trash` are not and are never invoked.
+            "info": ["filesystem", "info", "{path}", "--json"],
+            "trash": ["filesystem", "trash", "{path}"],
         },
         "rclone": {
             "binary": "rclone",
@@ -105,12 +117,75 @@ DEFAULTS: dict[str, Any] = {
         # reports the digest as unverified (sha1Verified: false).
         "precheck_claimed_digests": False,
     },
+    # v2: one account for now; `accounts:` turns this into a list. Everything
+    # that belongs to a Proton identity -- session, staging subtree, Immich key
+    # -- is resolved through an Account object, never through a global.
+    "account": {
+        "name": "default",
+    },
+    "accounts": None,
+    "state": {
+        # One state.sqlite for every account; rows are scoped by an `account`
+        # column. Defaults to <staging.root>/.state, and per-account configs
+        # are pinned back to the shared one so they cannot fork the DB.
+        "dir": None,
+    },
+    "reconcile": {
+        # Runs as the last step of every `run`: ask Immich what is in its trash
+        # and stage the matching Proton nodes for deletion. Never mutates
+        # Proton -- it only ever adds rows to the staged list.
+        "enabled": True,
+        # /search/metadata takes one type per request.
+        "types": ["IMAGE", "VIDEO"],
+        "page_size": 250,
+        # Stop after this many pages per type; a runaway pagination bug would
+        # otherwise loop against the server all night.
+        "max_pages": 400,
+    },
+    "delete": {
+        # "mark_only" records that you deleted it in Proton yourself.
+        # "execute" calls `proton-drive filesystem trash`.
+        #
+        # Proton's support docs say items in the Photos section cannot be
+        # deleted from desktop apps. That is unverified from the CLI, so the
+        # safe default is mark_only; /my-files/... roots are the execute case.
+        "action": "mark_only",
+        # Hard cap per invocation, whatever the UI asks for.
+        "batch_cap": 50,
+    },
+    "web": {
+        "bind": "127.0.0.1",
+        "port": 8080,
+        # "subprocess" = a jobs table plus one worker thread in this process.
+        # "systemd"    = systemctl start <unit>, via a narrow sudoers entry.
+        "job_runner": "subprocess",
+        "systemd_unit": "proton-to-immich-pipeline@{account}.service",
+        "systemctl": "systemctl",
+        "sudo": "sudo",
+        # scrypt hash from `sync.py web-password`. Set PIS_WEB_PASSWORD to
+        # supply a plaintext password instead; it is hashed at load time and
+        # never written anywhere.
+        "password_hash": "",
+        "session_hours": 168,
+        # Cookie signing key. Generated and kept in the state dir when unset,
+        # so sessions survive a restart.
+        "secret_file": None,
+        "poll_active_sec": 3,
+        "poll_idle_sec": 30,
+    },
     "limits": {
         "max_files": 500,
         "max_bytes": 20_000_000_000,
         "max_attempts": 5,
         "backoff_base_sec": 300,
         "backoff_cap_sec": 86400,
+        # Global circuit breaker: stop a pass after this many consecutive
+        # failures. Per-asset backoff does not help when Proton starts
+        # rate-limiting mid-backfill -- every file fails in quick succession
+        # and each burns an attempt, so one bad night quarantines hundreds of
+        # files that were never broken. Tripping leaves the rows not reached
+        # with their attempts intact. 0 disables it.
+        "consecutive_failures": 25,
     },
     "backfill": {
         "max_files": 5000,
@@ -150,6 +225,31 @@ DEFAULTS: dict[str, Any] = {
 # Enforced by the CLI itself; it exits with
 # "Invalid PROTON_DRIVE_CREDENTIALS_STORE: ... Expected one of: ..."
 CREDENTIALS_STORES = ("keychain", "unsafe_file", "pass")
+
+# The account a single-account install owns. Its lock and status.json keep
+# their v1 filenames so an existing deployment's paths and HA sensors survive
+# the upgrade.
+DEFAULT_ACCOUNT = "default"
+
+DELETE_ACTIONS = ("mark_only", "execute")
+JOB_RUNNERS = ("subprocess", "systemd")
+
+# Shorthand keys accepted in an `accounts:` entry, mapped onto the dotted
+# config paths they stand for. The plan writes accounts this way; the long
+# nested form works too and both merge into the same thing.
+ACCOUNT_SHORTHAND = {
+    "proton_cache_dir": "proton.cache_dir",
+    "proton_secrets": "proton.secrets_file",
+    "proton_root": "proton.roots",
+    "proton_roots": "proton.roots",
+    "staging_dir": "staging.root",
+    "immich_api_key_file": "immich.api_key_file",
+    "immich_api_key": "immich.api_key",
+    "immich_url": "immich.url",
+    "album_name": "immich.album_name",
+    "delete_action": "delete.action",
+    "credentials_store": "proton.credentials_store",
+}
 
 
 class ConfigError(Exception):
@@ -322,7 +422,13 @@ class Config:
 
     @property
     def state_dir(self) -> Path:
-        return self.staging / ".state"
+        """Where state.sqlite lives. Shared by every account.
+
+        Defaults under staging, but stays explicit for an Account so that
+        giving one its own staging subtree cannot fork the database.
+        """
+        configured = self.get("state.dir")
+        return Path(configured) if configured else self.staging / ".state"
 
     @property
     def db_path(self) -> Path:
@@ -330,7 +436,11 @@ class Config:
 
     @property
     def lock_path(self) -> Path:
-        return self.state_dir / "sync.lock"
+        """One lock per account -- accounts run sequentially by timer, but a
+        forced run for one must not be refused because another is working."""
+        name = self.account_name
+        stem = "sync" if name == DEFAULT_ACCOUNT else f"sync-{name}"
+        return self.state_dir / f"{stem}.lock"
 
     @property
     def incoming_dir(self) -> Path:
@@ -352,9 +462,88 @@ class Config:
     @property
     def status_path(self) -> Path:
         configured = self.get("report.status_path")
-        return Path(configured) if configured else self.state_dir / "status.json"
+        if configured:
+            return Path(configured)
+        name = self.account_name
+        stem = "status" if name == DEFAULT_ACCOUNT else f"status-{name}"
+        return self.state_dir / f"{stem}.json"
+
+    # -- account identity --------------------------------------------------
+    @property
+    def account_name(self) -> str:
+        return str(self.get("account.name") or DEFAULT_ACCOUNT)
+
+    @property
+    def delete_action(self) -> str:
+        return str(self.get("delete.action") or "mark_only")
+
+    def immich_api_key(self) -> str:
+        """The key for this account, read from a file when one is named.
+
+        A file rather than a literal is how two accounts keep two keys without
+        either appearing in the config on the SSD. Read on demand, never
+        cached into the config data, so it cannot be logged with it.
+        """
+        path = self.get("immich.api_key_file")
+        if path:
+            try:
+                return Path(path).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ConfigError(
+                    f"cannot read immich.api_key_file {path}: {exc}") from exc
+        return str(self.get("immich.api_key", ""))
+
+    # -- accounts ----------------------------------------------------------
+    @property
+    def accounts(self) -> list["Account"]:
+        """Every account this config describes, in config order.
+
+        There is always at least one. A bare config yields a single account
+        named by `account.name`; an `accounts:` list yields one per entry,
+        each a full Config in its own right whose Proton session, staging
+        subtree and Immich key are the same object -- which is the whole point.
+        """
+        return build_accounts(self)
+
+    def account(self, name: str | None) -> "Account":
+        found = self.accounts
+        if name is None:
+            if len(found) > 1:
+                raise ConfigError(
+                    f"this config has {len(found)} accounts "
+                    f"({', '.join(a.account_name for a in found)}); "
+                    f"name one with --account")
+            return found[0]
+        for candidate in found:
+            if candidate.account_name == name:
+                return candidate
+        raise ConfigError(
+            f"unknown account {name!r}; configured: "
+            f"{', '.join(a.account_name for a in found)}")
 
     def validate(self) -> list[str]:
+        """Config problems, in the voice of something a human has to fix.
+
+        With an `accounts:` list the per-identity checks run against each
+        account's merged view, not the shared base -- an Immich key that lives
+        only in an account entry is not a missing key. The cross-account
+        checks then run once over the whole set.
+        """
+        entries = self.get("accounts")
+        if not entries:
+            return self._validate_one()
+        try:
+            accounts = self.accounts
+        except ConfigError as exc:
+            return [str(exc)]
+        problems: list[str] = []
+        for account in accounts:
+            problems += [f"accounts[{account.account_name}]: {p}"
+                         for p in account._validate_one()]
+        return problems + self._validate_cross_account(accounts)
+
+    def _validate_one(self) -> list[str]:
+        """Checks that make sense for exactly one account's settings."""
         problems = []
         url = str(self.get("immich.url", ""))
         if not url:
@@ -363,9 +552,10 @@ class Config:
             problems.append(
                 f"immich.url must include the /api suffix (got {url!r})"
             )
-        if not self.get("immich.api_key"):
+        if not (self.get("immich.api_key") or self.get("immich.api_key_file")):
             problems.append(
-                "immich.api_key is empty (set it in the config or via IMMICH_API_KEY)"
+                "immich.api_key is empty (set it in the config, point "
+                "immich.api_key_file at a file, or export IMMICH_API_KEY)"
             )
         if not self.get("proton.roots"):
             problems.append("proton.roots is empty -- nothing to walk")
@@ -377,7 +567,147 @@ class Config:
         if store and store not in CREDENTIALS_STORES:
             problems.append(
                 f"proton.credentials_store must be one of {', '.join(CREDENTIALS_STORES)}")
+        if self.delete_action not in DELETE_ACTIONS:
+            problems.append(
+                f"delete.action must be one of {', '.join(DELETE_ACTIONS)} "
+                f"(got {self.delete_action!r})")
+        runner = self.get("web.job_runner")
+        if runner and runner not in JOB_RUNNERS:
+            problems.append(
+                f"web.job_runner must be one of {', '.join(JOB_RUNNERS)} "
+                f"(got {runner!r})")
         return problems
+
+    def _validate_cross_account(self, found: list["Account"]) -> list[str]:
+        """The hard rule, enforced: no two accounts may share a staging subtree
+        or an Immich key. Either mistake uploads one person's photos into the
+        other's library, which is tedious to unpick after the fact."""
+        problems: list[str] = []
+        if len(found) < 2:
+            return problems
+        for field, label in (("staging", "staging.root"),
+                             ("cache", "proton.cache_dir")):
+            seen: dict[str, str] = {}
+            for account in found:
+                key = str(account.staging if field == "staging"
+                          else account.proton_cache_dir)
+                if key in seen:
+                    problems.append(
+                        f"accounts {seen[key]!r} and {account.account_name!r} "
+                        f"share {label} {key!r}; each account needs its own")
+                seen[key] = account.account_name
+        keys: dict[str, str] = {}
+        for account in found:
+            literal = str(account.get("immich.api_key") or "")
+            key_file = str(account.get("immich.api_key_file") or "")
+            token = key_file or literal
+            if not token:
+                continue
+            if token in keys:
+                problems.append(
+                    f"accounts {keys[token]!r} and {account.account_name!r} "
+                    f"share one Immich API key; each person needs their own user")
+            keys[token] = account.account_name
+        return problems
+
+
+class Account(Config):
+    """One Proton identity and everything that belongs to it.
+
+    The v2 plan's hard rule: *the Proton session, the staging dir and the
+    Immich API key travel as one object, never as separate globals.* This is
+    that object. It is a full Config, so every `cfg.get("proton.…")` call site
+    in the pipeline keeps working unchanged -- it just resolves against this
+    account's merged view instead of a shared one.
+
+    The failure mode being designed out is uploading one person's photos into
+    the other's library. No code path should ever take a staging path from one
+    Account and a key from another, and because both come off the same object
+    there is nothing to mismatch.
+    """
+
+    def __init__(self, data: dict[str, Any], name: str, path: Path | None = None,
+                 explicit: bool = False):
+        super().__init__(data, path)
+        self.set("account.name", name)
+        # True when this account came from an `accounts:` list rather than
+        # being the implicit single account. Decides whether its status.json
+        # keeps the v1 filename.
+        self.explicit = explicit
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<Account {self.account_name} staging={self.staging}>"
+
+
+def _expand_shorthand(entry: dict[str, Any]) -> dict[str, Any]:
+    """Turn an `accounts:` entry into an ordinary nested config overlay."""
+    overlay: dict[str, Any] = {}
+    for key, value in entry.items():
+        if key == "name":
+            continue
+        dotted = ACCOUNT_SHORTHAND.get(key)
+        if dotted is None:
+            # Already a nested section (proton:, immich:, staging:, …).
+            overlay[key] = value
+            continue
+        if dotted == "proton.roots" and not isinstance(value, list):
+            value = [value]
+        node = overlay
+        parts = dotted.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    return overlay
+
+
+def build_accounts(cfg: Config) -> list[Account]:
+    """Resolve a config into one Account per identity.
+
+    A bare config is a single account: the same data, named by `account.name`.
+    An `accounts:` list merges each entry over the shared config, so global
+    `proton:` and `immich:` settings stay in one place and an entry only names
+    what differs.
+
+    Every account is pinned to the shared `state.dir`, whatever it does with
+    staging. One database, rows scoped by account -- splitting it per account
+    would make the UI's cross-account view impossible and lose the guarantee
+    that a node id is only ever interpreted against its own volume.
+    """
+    shared_state_dir = str(cfg.get("state.dir") or (Path(
+        cfg.get("staging.root", "/mnt/immich/staging")) / ".state"))
+
+    entries = cfg.get("accounts")
+    if not entries:
+        data = copy.deepcopy(cfg.data)
+        data.pop("accounts", None)
+        data.setdefault("state", {})["dir"] = shared_state_dir
+        return [Account(data, str(cfg.get("account.name") or DEFAULT_ACCOUNT),
+                        cfg.path)]
+
+    if not isinstance(entries, list):
+        raise ConfigError("accounts: must be a list of account entries")
+
+    base = copy.deepcopy(cfg.data)
+    base.pop("accounts", None)
+    out: list[Account] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"accounts[{index}] must be a map with at least a name "
+                f"(got {type(entry).__name__}); the built-in YAML parser "
+                f"cannot read maps inside lists -- install PyYAML")
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            raise ConfigError(f"accounts[{index}] has no name")
+        if name in seen:
+            raise ConfigError(f"duplicate account name {name!r}")
+        seen.add(name)
+        data = deep_merge(base, _expand_shorthand(entry))
+        data.setdefault("state", {})["dir"] = shared_state_dir
+        # A per-account status.json, unless the entry named one itself.
+        out.append(Account(data, name, cfg.path, explicit=True))
+    return out
 
 
 def apply_env(cfg: Config) -> None:
@@ -390,6 +720,8 @@ def apply_env(cfg: Config) -> None:
         cfg.set("proton.cache_dir", os.environ["PROTON_DRIVE_CACHE_DIR"])
     if os.environ.get("PIS_STAGING_ROOT"):
         cfg.set("staging.root", os.environ["PIS_STAGING_ROOT"])
+    if os.environ.get("PIS_ACCOUNT"):
+        cfg.set("account.name", os.environ["PIS_ACCOUNT"])
 
 
 def load(path: str | Path | None) -> Config:

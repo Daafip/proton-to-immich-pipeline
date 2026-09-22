@@ -1,5 +1,16 @@
 # proton-to-immich-pipeline -- copy to config.yaml and edit.
 # Every key here is optional; anything omitted falls back to src/config.py DEFAULTS.
+#
+# This is the single-account shape. For two people, see
+# config.accounts.example.yaml -- that form needs PyYAML installed, because
+# the built-in fallback parser cannot read maps inside a list.
+
+# Who these photos belong to. One name, used to scope every row in
+# state.sqlite. "default" keeps the v1 filenames for the lock and status.json,
+# so an existing install can be upgraded without touching anything else;
+# any other name gets sync-<name>.lock and status-<name>.json.
+account:
+  name: default
 
 staging:
   root: /mnt/immich/staging
@@ -39,6 +50,20 @@ proton:
   #   - "/my-files/Photos/Photos from 2025"
   #   - "/my-files/Photos/Photos from 2026"
 
+  # Files per `filesystem download` call. The CLI costs ~1.2 s of Bun and SDK
+  # startup per invocation whatever it does, so one call per file is ~8 hours
+  # of pure startup for a 25k-file backfill; at 25 that becomes ~21 minutes.
+  #
+  # Batches are grouped by source folder and never contain two files with the
+  # same name, because they all land in one destination folder and the
+  # conflict strategy would silently keep the wrong one.
+  #
+  # Set to 1 to go back to one invocation per file -- that is the escape hatch
+  # if the first backfill night misbehaves. Nothing is lost either way: a file
+  # is size-checked and sha1'd before it leaves the scratch folder.
+  download_batch_size: 25
+  # Per-invocation budget. Scales with the batch automatically, so this stays
+  # the time one file is allowed.
   timeout_sec: 900
   max_depth: 25
   extensions:
@@ -78,6 +103,18 @@ proton:
       - skip
       - "{path}"
       - "{dest_dir}"
+    # Used only by the delete queue. `info` re-resolves a node before it is
+    # touched; `trash` is reversible. `filesystem delete` and `empty-trash`
+    # are permanent and are never invoked by this pipeline.
+    info:
+      - filesystem
+      - info
+      - "{path}"
+      - --json
+    trash:
+      - filesystem
+      - trash
+      - "{path}"
   rclone:
     binary: rclone
     remote: "protondrive:"
@@ -116,6 +153,13 @@ limits:
   max_bytes: 20000000000
   max_attempts: 5
   backoff_base_sec: 300
+  # Global circuit breaker: stop the pass after this many failures in a row,
+  # in download, push and verify. Per-asset backoff does not help when Proton
+  # or Immich goes down mid-backfill -- every file fails in quick succession,
+  # each burns an attempt, and after five such nights they are all
+  # quarantined. A single success resets the count, so scattered bad files do
+  # not trip it. Rows never reached keep their attempts. 0 disables it.
+  consecutive_failures: 25
 
 backfill:
   max_files: 5000
@@ -125,6 +169,70 @@ reap:
   # Keep verified originals in staging this long. 0 = purge right after verify.
   keep_days: 7
   scratch_max_age_hours: 48
+
+# Ask Immich what is in its trash at the end of every run, and stage the
+# matching Proton files for deletion. Reconcile never touches Proton -- it
+# only ever adds rows to the staged list, which `sync.py staged` prints.
+#
+# Immich empties its own trash after ~30 days, so the list has to live in
+# state.sqlite from first sighting: recomputing it from the server would
+# silently drop anything you had not got to, while the file stayed in Proton.
+# Extend or disable the auto-empty in Immich under
+# Administration -> Settings -> Trash so a staged photo can still be looked up.
+reconcile:
+  enabled: true
+  # /search/metadata takes one type per request.
+  types:
+    - IMAGE
+    - VIDEO
+  page_size: 250
+  max_pages: 400
+
+delete:
+  # What `sync.py delete-staged` (and the UI's execute button) actually does.
+  #
+  #   mark_only -- nothing is sent to Proton. The queue is a to-do list: you
+  #                delete the files in Proton yourself, then close the rows
+  #                out. `sync.py staged --csv` gives you the paths.
+  #   execute   -- runs `proton-drive filesystem trash`, which is reversible.
+  #                Every node is re-resolved and compared with what was staged
+  #                first, and verified afterwards.
+  #
+  # mark_only is the default on purpose. Proton's support docs say items in
+  # the Photos section cannot be deleted from desktop apps, and that is
+  # unverified from the CLI. A /my-files/... root -- what proton.roots ships
+  # with -- is the execute case. Try it with `--dry-run` first, then on a
+  # couple of junk files.
+  #
+  # The rclone backend cannot trash, only delete permanently, so it stays
+  # mark_only whatever this says.
+  action: mark_only
+  # Hard cap per invocation, whatever the UI or the CLI asks for.
+  batch_cap: 50
+
+# The web UI: `sync.py serve`. Standard library only, no build step.
+web:
+  # 127.0.0.1 is the safe default. Point this at the LAN address (or 0.0.0.0)
+  # to let someone else use it -- `serve` refuses a non-loopback bind with no
+  # password rather than publishing the delete queue.
+  bind: 127.0.0.1
+  port: 8080
+  # How a "Sync now" click actually runs:
+  #   subprocess -- a jobs table plus one worker thread in the serve process,
+  #                 which spawns `sync.py run`. No sudo, works from a checkout.
+  #   systemd    -- `systemctl start proton-to-immich-pipeline@<account>` via
+  #                 a narrow NOPASSWD sudoers entry (see systemd/sudoers.example).
+  #                 systemd then owns the lock, the logging and the exit code.
+  job_runner: subprocess
+  systemd_unit: proton-to-immich-pipeline@{account}.service
+  # scrypt hash from `sync.py web-password`. Leave empty and set
+  # PIS_WEB_PASSWORD_HASH in the environment instead (systemd/env.web).
+  # Required for any bind other than loopback.
+  password_hash: ""
+  session_hours: 168
+  # Poll intervals the page uses: fast while a job runs, slow when idle.
+  poll_active_sec: 3
+  poll_idle_sec: 30
 
 report:
   # Defaults to <staging.root>/.state/status.json.

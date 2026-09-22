@@ -1,0 +1,10 @@
+# Install to /etc/proton-to-immich-pipeline/env.web  (chmod 640, root:protonsync)
+# Read only by the web UI service. No Immich or Proton credentials belong here.
+
+# The shared web password, as an scrypt hash from `sync.py web-password`.
+# Equivalent to setting web.password_hash in the config; the env wins.
+#PIS_WEB_PASSWORD_HASH=scrypt$32768$8$1$...$...
+
+# Or a plaintext password, hashed at startup and never written to disk.
+# Simpler, but it sits in this file in the clear -- prefer the hash.
+#PIS_WEB_PASSWORD=change-me

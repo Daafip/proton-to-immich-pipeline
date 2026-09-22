@@ -1,0 +1,67 @@
+[Unit]
+# Templated unit, one instance per account: %i is the account name, exactly as
+# it appears under `accounts:` in the config.
+#
+#   systemctl enable --now proton-to-immich-pipeline@david.timer
+#   systemctl enable --now proton-to-immich-pipeline@mirjam.timer
+#
+# Use this instead of the single proton-to-immich-pipeline.service once the
+# config lists accounts. Running both would process `default` as well.
+Description=Proton Drive -> Immich sync (%i)
+Documentation=file:/opt/proton-to-immich-pipeline/README.md
+After=network-online.target mnt-immich.mount docker.service
+Wants=network-online.target
+# The SSD is mounted nofail, so refuse to run if staging is not there:
+# downloading into an unmounted mountpoint would fill the VM disk.
+RequiresMountsFor=/mnt/immich
+
+[Service]
+Type=oneshot
+User=protonsync
+Group=protonsync
+# immich.upload_mode: cli talks to the docker socket, which is root-equivalent.
+#SupplementaryGroups=docker
+WorkingDirectory=/opt/proton-to-immich-pipeline
+
+# Shared settings first, then this account's, so the per-account file wins.
+# The `-` prefix means "skip if absent".
+EnvironmentFile=-/etc/proton-to-immich-pipeline/env
+EnvironmentFile=-/etc/proton-to-immich-pipeline/env.%i
+Environment=PIS_CONFIG=/etc/proton-to-immich-pipeline/config.yaml
+
+# IMPORTANT: do NOT put IMMICH_API_KEY in the shared env file once there is
+# more than one account -- it would apply to every account and upload one
+# person's photos into the other's library. Give each account its own
+# `immich_api_key_file:` in the config instead, or set the key in this
+# account's env.%i only. `sync.py status` refuses a config where two accounts
+# share a key.
+
+# The Proton session is isolated by cache dir, which the config sets per
+# account (proton.cache_dir). PROTON_DRIVE_CREDENTIALS_STORE: unsafe_file
+# keeps the session in that directory, so two accounts cannot collide on the
+# single fixed keyring service name the CLI uses.
+ExecStart=/usr/bin/python3 /opt/proton-to-immich-pipeline/sync.py --account %i run
+
+TimeoutStartSec=8h
+Nice=10
+IOSchedulingClass=idle
+
+# exit 1 = partial failure (some assets failed), still a completed run.
+# exit 2 = auth failure, exit 3 = another run holds this account's lock.
+# exit 4 (config fault) is deliberately absent: it must show as failed.
+SuccessExitStatus=0 1 3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/mnt/immich/staging
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

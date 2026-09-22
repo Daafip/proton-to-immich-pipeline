@@ -1,0 +1,29 @@
+[Unit]
+# One timer per account. Stagger them so two accounts never download
+# concurrently: each holds only its own lock, so nothing else would stop them
+# competing for Proton bandwidth and the staging free-space floor.
+#
+# Set the offset per instance with a drop-in rather than editing this file:
+#
+#   systemctl edit proton-to-immich-pipeline@mirjam.timer
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=*-*-* 04:45:00
+#
+# An empty OnCalendar= first is required -- systemd appends otherwise, and the
+# unit would fire at both times.
+Description=Nightly Proton Drive -> Immich sync (%i)
+Documentation=file:/opt/proton-to-immich-pipeline/README.md
+
+[Timer]
+# Nightly, after the phone has had all day to back up to Proton.
+OnCalendar=*-*-* 03:15:00
+# Spread load and avoid a thundering herd against Proton's API. Keep this
+# well under the gap between two accounts' offsets.
+RandomizedDelaySec=20m
+# If the VM was off at 03:15, run once it comes back.
+Persistent=true
+Unit=proton-to-immich-pipeline@%i.service
+
+[Install]
+WantedBy=timers.target
