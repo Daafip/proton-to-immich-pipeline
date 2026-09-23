@@ -1141,6 +1141,50 @@ def recent_runs(conn: sqlite3.Connection, account: str,
     ).fetchall()
 
 
+PROBLEM_STATUSES = (FAILED, QUARANTINED, DELETE_FAILED)
+
+
+def recent_problems(conn: sqlite3.Connection, account: str,
+                    limit: int = 50) -> list[sqlite3.Row]:
+    """Assets carrying an error, newest first.
+
+    `last_error` is written for every failure and, until now, was readable
+    only by opening the database. A hundred failures are almost always one
+    cause repeated, which is what `problem_summary` is for -- this is the
+    detail behind it.
+    """
+    placeholders = ",".join("?" * len(PROBLEM_STATUSES))
+    return conn.execute(
+        f"SELECT node_id, remote_path, remote_name, status, attempts,"
+        f" last_attempt, last_error FROM assets"
+        f" WHERE account=? AND status IN ({placeholders})"
+        f" ORDER BY last_attempt DESC, node_id LIMIT ?",
+        (account, *PROBLEM_STATUSES, limit),
+    ).fetchall()
+
+
+def problem_summary(conn: sqlite3.Connection, account: str,
+                    limit: int = 10) -> list[dict[str, Any]]:
+    """The distinct errors and how many assets each hit.
+
+    Grouped on the message with the varying tail cut off, because "126 failed"
+    is not actionable and "126 x size mismatch" is. Grouping happens in SQL on
+    a prefix so one bad night does not pull 25k rows into memory.
+    """
+    placeholders = ",".join("?" * len(PROBLEM_STATUSES))
+    rows = conn.execute(
+        f"SELECT substr(last_error, 1, 120) AS reason, status,"
+        f"       COUNT(*) AS assets, MAX(last_attempt) AS latest"
+        f"  FROM assets"
+        f" WHERE account=? AND status IN ({placeholders})"
+        f"   AND last_error IS NOT NULL"
+        f" GROUP BY reason, status"
+        f" ORDER BY assets DESC LIMIT ?",
+        (account, *PROBLEM_STATUSES, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def accounts(conn: sqlite3.Connection) -> list[str]:
     """Accounts the database has actually seen. The config is authoritative;
     this is for spotting rows left behind by a renamed account."""

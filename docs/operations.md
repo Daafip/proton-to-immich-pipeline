@@ -722,11 +722,35 @@ running `sync.py agent` for each account.
 The existing `flock` still applies either way: a forced run during a scheduled
 one exits 3 cleanly rather than racing.
 
+### Seeing why something failed
+
+The status tiles say *how many*; three places say *why*:
+
+| | |
+|---|---|
+| **Why things failed** panel in the UI | the distinct errors and how many assets each hit, newest first, with the individual rows folded underneath. `126 failed` becomes `126 × size mismatch: remote 604740 bytes, got 0`. |
+| `agent.done` in the container logs | a non-zero exit logs the run's output in its `detail` field. `docker compose logs <account> \| grep agent.done` |
+| the run itself, in the foreground | `docker compose run --rm <account> run` — every phase, live |
+
+More from the CLI:
+
+```bash
+docker compose run --rm default status            # counts, per account
+docker compose run --rm default status --json     # the same, machine-readable
+docker compose run --rm default -v run            # add the executed commands
+docker compose run --rm default staged            # the delete queue
+```
+
+Quarantined assets have used up `limits.max_attempts` and are not retried.
+Fix the cause, then `sync.py requeue` puts them back in play — `--now` also
+ignores the backoff.
+
 ### Endpoints
 
 ```
 GET  /api/config                    poll intervals, accounts, whether to log in
 GET  /api/accounts                  per account: last run, backlog, staged, …
+GET  /api/problems?account=         distinct errors + the assets carrying them
 GET  /api/runs?account=             recent rows from `runs`
 GET  /api/jobs?account=             recent jobs   ·  GET /api/jobs/<id>
 POST /api/jobs                      {type: sync|reconcile|delete, account}
@@ -1426,6 +1450,7 @@ everything, restore the relevant file, and downgrade the code.
 | `mqtt.transport_failed`, then `mqtt.published` | Normal: the first transport was unavailable and the second worked. |
 | Nothing at all about MQTT in the journal | `mqtt.enabled` is false. `-v` shows `mqtt.disabled`. |
 | `Unsupported callback API version` | paho-mqtt 2.x with an older build of this pipeline. Fixed — both 1.x and 2.x are handled now. |
+| `Node not found: *` | A glob in `proton.roots`. The CLI takes a path, not a pattern, and nothing expands one — so it looks for a folder literally called `*`. Name the parent instead: **every root is walked recursively**, so `/my-files/Photos` already covers everything beneath it. The config check now refuses this up front. |
 | `agent.done` with a non-zero `exit_code` | The `detail` field on that same line carries the run's output — that is where the reason is. `exit 1` = some or all assets failed; `exit 2` = Proton session gone, run `login` again; `exit 3` = a run was already in progress; `exit 4` = config fault. |
 | "It runs, but nothing happens" | Run it in the foreground and watch: `docker compose run --rm <account> run`. Most often the Proton roots in `config.yaml` do not match the real folder names — `docker compose run --rm <account> pull --dry-run` reports zero discovered, and `proton-drive filesystem list /my-files` shows what is actually there. |
 | `circuit.tripped` | Too many consecutive failures — usually Proton or Immich being down, not your files. The pass stopped on purpose; rows it never reached kept their attempts. Fix the cause and re-run. |

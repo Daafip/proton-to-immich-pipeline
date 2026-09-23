@@ -554,6 +554,30 @@ class Api:
                              row["staged_at"], row["state"], row["error"] or ""])
         return buffer.getvalue()
 
+    def get_problems(self, account_name: str | None,
+                     limit: int = 50) -> dict[str, Any]:
+        """Why assets failed, grouped and in detail.
+
+        The counts on the status card say *how many*; this says *why*, which
+        was previously only readable by opening the database by hand.
+        """
+        account = self.account(account_name)
+        empty = {"account": account.account_name, "summary": [],
+                 "assets": [], "pending": True}
+        try:
+            conn = self.reader(account.account_name)
+        except PendingPipeline:
+            return empty
+        try:
+            return {
+                "account": account.account_name,
+                "summary": state.problem_summary(conn, account.account_name),
+                "assets": [dict(r) for r in state.recent_problems(
+                    conn, account.account_name, limit=limit)],
+            }
+        finally:
+            conn.close()
+
     # -- write routes ------------------------------------------------------
     def create_job(self, account_name: str | None, job_type: str,
                    payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -808,6 +832,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not tail.isdigit():
                     raise ValueError("job id must be a number")
                 return self._json(api.get_job(int(tail), account))
+            if path == "/api/problems":
+                return self._json(api.get_problems(
+                    account, _limit(query, 50, 500)))
             if path == "/api/staged-deletes":
                 return self._json(api.get_staged(
                     account, include_all=query.get("all") == "1"))

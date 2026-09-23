@@ -189,6 +189,15 @@
       <div id="staged-body"></div>
     </section>
 
+    <section class="panel" id="problems-panel" hidden>
+      <div class="card-head">
+        <h2>Why things failed</h2>
+        <div class="spacer"></div>
+        <span class="faint" id="problems-account"></span>
+      </div>
+      <div id="problems-body"></div>
+    </section>
+
     <section class="panel">
       <h2>Recent runs</h2>
       <div class="scroll"><table id="runs"><thead><tr>
@@ -423,6 +432,71 @@ function renderRuns(runs) {
       el("td", { text: r.exit_code === null ? "…" : String(r.exit_code) }),
     ]));
   }
+}
+
+function renderProblems(data) {
+  const panel = $("#problems-panel");
+  const host = $("#problems-body");
+  host.textContent = "";
+  const summary = (data && data.summary) || [];
+  const assets = (data && data.assets) || [];
+  // Nothing wrong is the normal case; an empty panel would just be noise.
+  panel.hidden = summary.length === 0 && assets.length === 0;
+  if (panel.hidden) return;
+  $("#problems-account").textContent = data.account || "";
+
+  // The grouped view first: a hundred failures are almost always one cause.
+  const body = el("tbody");
+  for (const row of summary) {
+    body.appendChild(el("tr", { class: row.status === "quarantined" ? "failed" : "" }, [
+      el("td", { text: fmtNum(row.assets) }),
+      el("td", {}, [el("span", { class: "pill " + (row.status === "quarantined" ? "bad" : "warn"), text: row.status })]),
+      el("td", { class: "err mono", text: row.reason || "(no message)" }),
+      el("td", { title: row.latest, text: fmtWhen(row.latest) }),
+    ]));
+  }
+  host.appendChild(el("div", { class: "scroll" }, [
+    el("table", {}, [
+      el("thead", {}, [el("tr", {}, [
+        el("th", { text: "assets" }), el("th", { text: "state" }),
+        el("th", { text: "reason" }), el("th", { text: "last tried" }),
+      ])]),
+      body,
+    ]),
+  ]));
+
+  if (summary.some((r) => r.status === "quarantined")) {
+    host.appendChild(el("div", { class: "note" }, [
+      "Quarantined assets have used up their attempts and will not be retried. "
+      + "Fix the cause, then `sync.py requeue` puts them back in play.",
+    ]));
+  }
+
+  // Then the individual rows, folded away.
+  const rows = el("tbody");
+  for (const a of assets) {
+    rows.appendChild(el("tr", { class: a.status === "quarantined" ? "failed" : "" }, [
+      el("td", { text: a.remote_name || "–" }),
+      el("td", { class: "path mono", text: a.remote_path || "–" }),
+      el("td", { text: a.status }),
+      el("td", { text: fmtNum(a.attempts) }),
+      el("td", { title: a.last_attempt, text: fmtWhen(a.last_attempt) }),
+      el("td", { class: "err mono", text: (a.last_error || "").slice(0, 300) }),
+    ]));
+  }
+  host.appendChild(el("details", { style: "margin-top:14px" }, [
+    el("summary", { class: "muted", text: `The ${assets.length} most recent, individually` }),
+    el("div", { class: "scroll", style: "margin-top:8px" }, [
+      el("table", {}, [
+        el("thead", {}, [el("tr", {}, [
+          el("th", { text: "file" }), el("th", { text: "proton path" }),
+          el("th", { text: "state" }), el("th", { text: "tries" }),
+          el("th", { text: "last tried" }), el("th", { text: "error" }),
+        ])]),
+        rows,
+      ]),
+    ]),
+  ]));
 }
 
 function renderStaged() {
@@ -697,6 +771,8 @@ async function refresh() {
       const live = new Set(S.staged.staged.filter((r) => r.state === "staged").map((r) => r.id));
       for (const id of [...S.selected]) if (!live.has(id)) S.selected.delete(id);
       renderStaged();
+      renderProblems(
+        await api(`/api/problems?account=${encodeURIComponent(S.account)}`));
     }
 
     const runs = [];

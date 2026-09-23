@@ -103,6 +103,9 @@ accounts:
   # A fifth person is a fifth entry. Add anything that genuinely differs --
   # a different Immich, different roots, a different delete_action -- under
   # their own name; leave it out and they inherit the shared settings.
+  # proton_roots are PATHS, not patterns -- a `*` is expanded by nothing and
+  # the CLI reports `Node not found: *`. Each entry is walked recursively, so
+  # one parent covers everything beneath it.
   - name: default
     proton_roots:
       - /my-files/Photos

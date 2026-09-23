@@ -99,6 +99,43 @@ class TestConfig(unittest.TestCase):
         cfg.set("immich.url", "http://vm:2283/api")
         self.assertEqual(cfg.validate(), [])
 
+    def with_roots(self, *roots):
+        data = copy.deepcopy(DEFAULTS)
+        data["immich"]["url"] = "http://vm:2283/api"
+        data["immich"]["api_key"] = "k"
+        data["proton"]["roots"] = list(roots)
+        return Config(data)
+
+    def test_a_glob_in_a_root_is_refused_with_an_explanation(self):
+        """The CLI takes a path, not a pattern. `/my-files/Photos/*` makes it
+        look for a folder literally named `*` and report `Node not found: *`,
+        which does not hint at the actual problem."""
+        problems = self.with_roots("/my-files/Photos/*").validate()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not patterns", problems[0])
+        self.assertIn("recursively", problems[0],
+                      "say what to do instead, not just what is wrong")
+
+    def test_every_glob_character_is_caught(self):
+        for root in ("/a/*", "/a/?", "/a/[12]", "/a/2025-*/raw"):
+            with self.subTest(root=root):
+                self.assertTrue(
+                    any("patterns" in p
+                        for p in self.with_roots(root).validate()), root)
+
+    def test_one_bad_root_among_good_ones_is_still_caught(self):
+        problems = self.with_roots("/my-files/Photos",
+                                   "/my-files/Camera/*").validate()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("/my-files/Camera/*", problems[0])
+
+    def test_ordinary_roots_are_untouched(self):
+        """Spaces, hyphens and non-ASCII are all fine in a Proton folder."""
+        for root in ("/my-files/Photos", "/my-files/Photos from 2025",
+                     "/my-files/Fotos - privé", "/"):
+            with self.subTest(root=root):
+                self.assertEqual(self.with_roots(root).validate(), [], root)
+
     def test_env_override(self):
         import os
         os.environ["IMMICH_API_KEY"] = "from-env"

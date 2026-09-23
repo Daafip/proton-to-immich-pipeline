@@ -259,6 +259,10 @@ CREDENTIALS_STORES = ("keychain", "unsafe_file", "pass")
 # the upgrade.
 DEFAULT_ACCOUNT = "default"
 
+# A root reaches the CLI as a literal path. Neither the shell (it comes from
+# YAML) nor the CLI expands these, so one in a root is always a mistake.
+GLOB_CHARS = ("*", "?", "[")
+
 DELETE_ACTIONS = ("mark_only", "execute")
 JOB_RUNNERS = ("subprocess", "systemd", "queue")
 
@@ -640,8 +644,20 @@ class Config:
                 "immich.api_key is empty (set it in the config, point "
                 "immich.api_key_file at a file, or export IMMICH_API_KEY)"
             )
-        if not self.get("proton.roots"):
+        roots = self.get("proton.roots") or []
+        if not roots:
             problems.append("proton.roots is empty -- nothing to walk")
+        for root in roots:
+            hit = next((c for c in GLOB_CHARS if c in str(root)), None)
+            if hit:
+                # The CLI takes a path, not a pattern: it looks for a folder
+                # literally named `*` and reports `Node not found: *`, which
+                # is a long way from "globs are not a thing here".
+                problems.append(
+                    f"proton.roots entry {root!r} contains {hit!r}: roots are "
+                    f"paths, not patterns, and nothing expands them. Name the "
+                    f"parent folder -- every root is walked recursively -- or "
+                    f"list the subfolders individually")
         if self.get("proton.backend") not in ("proton-cli", "rclone"):
             problems.append("proton.backend must be 'proton-cli' or 'rclone'")
         if self.get("immich.upload_mode") not in ("cli", "api"):

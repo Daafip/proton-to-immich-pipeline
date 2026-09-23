@@ -222,6 +222,67 @@ class TestApiReads(WebTest):
             conn.close()
 
 
+class TestApiProblems(WebTest):
+    """`last_error` is written for every failure and used to be readable only
+    by opening the database by hand."""
+
+    def fail_asset(self, node_id, stage, error, times=1):
+        state.upsert_discovered(self.conn, ACCOUNT, node_id,
+                                f"/Photos/{node_id}.jpg", f"{node_id}.jpg",
+                                100, "2026-01-01T00:00:00+00:00")
+        for _ in range(times):
+            state.mark_failed(self.conn, ACCOUNT, node_id, stage, error, 5)
+
+    def test_one_cause_repeated_is_reported_as_one_row(self):
+        """'126 failed' is not actionable; '126 x size mismatch' is."""
+        for i in range(12):
+            self.fail_asset(f"n{i}", "download", "size mismatch: got 0")
+        summary = self.api().get_problems(ACCOUNT)["summary"]
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["assets"], 12)
+        self.assertIn("size mismatch", summary[0]["reason"])
+        self.assertEqual(summary[0]["status"], state.FAILED)
+
+    def test_distinct_causes_are_separated_and_ranked(self):
+        for i in range(5):
+            self.fail_asset(f"a{i}", "download", "size mismatch")
+        for i in range(2):
+            self.fail_asset(f"b{i}", "upload", "immich 500")
+        summary = self.api().get_problems(ACCOUNT)["summary"]
+        self.assertEqual([r["assets"] for r in summary], [5, 2],
+                         "commonest first")
+
+    def test_quarantined_assets_are_distinguished_from_failed(self):
+        self.fail_asset("q", "upload", "immich 500", times=5)
+        summary = self.api().get_problems(ACCOUNT)["summary"]
+        self.assertEqual(summary[0]["status"], state.QUARANTINED)
+
+    def test_the_detail_rows_carry_the_path_and_the_error(self):
+        self.fail_asset("n1", "download", "size mismatch: remote 100, got 0")
+        asset = self.api().get_problems(ACCOUNT)["assets"][0]
+        self.assertEqual(asset["remote_path"], "/Photos/n1.jpg")
+        self.assertIn("size mismatch", asset["last_error"])
+        self.assertEqual(asset["attempts"], 1)
+
+    def test_a_healthy_account_reports_nothing(self):
+        self.seed_asset()
+        problems = self.api().get_problems(ACCOUNT)
+        self.assertEqual(problems["summary"], [])
+        self.assertEqual(problems["assets"], [])
+
+    def test_a_pipeline_that_never_ran_is_pending_not_an_error(self):
+        self.cfg.set("accounts", [{"name": ACCOUNT},
+                                  {"name": "mirjam",
+                                   "staging_dir": self.tmp.name + "/m",
+                                   "immich_api_key": "other"}])
+        self.assertTrue(self.api().get_problems("mirjam")["pending"])
+
+    def test_the_limit_is_capped(self):
+        for i in range(30):
+            self.fail_asset(f"n{i}", "download", f"error {i}")
+        self.assertEqual(len(self.api().get_problems(ACCOUNT, limit=5)["assets"]), 5)
+
+
 class TestApiJobs(WebTest):
     def test_a_job_is_queued_not_run(self):
         result = self.api().create_job(ACCOUNT, "sync")
@@ -518,6 +579,19 @@ class TestHttpRoutes(HttpTest):
         self.assertEqual(status, 200)
         self.assertIn(payload["state"], (state.JOB_QUEUED, state.JOB_RUNNING,
                                          state.JOB_DONE, state.JOB_FAILED))
+
+    def test_problems_is_served_over_http(self):
+        row = self.seed_asset("n1")
+        state.mark_failed(self.conn, ACCOUNT, "n1", "download", "boom", 5)
+        status, payload, _ = self.get("/api/problems")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["summary"][0]["assets"], 1)
+        self.assertIn("boom", payload["assets"][0]["last_error"])
+        del row
+
+    def test_problems_needs_a_session(self):
+        self.cookie = None
+        self.assertEqual(self.request("/api/problems")[0], 401)
 
     def test_a_non_numeric_job_id_is_a_400(self):
         self.assertEqual(self.request("/api/jobs/../../etc/passwd")[0], 400)

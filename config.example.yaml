@@ -43,7 +43,9 @@ proton:
   roots:
     - /my-files/Photos
 
-  # Or list folders individually to sync a subset -- one year per night keeps
+  # Paths, never patterns: a `*` is not expanded by anything and the CLI
+  # reports `Node not found: *`. One parent already covers everything under
+  # it. List folders individually to sync a subset -- one year per night keeps
   # a backfill within the per-run caps and the staging free-space floor:
   #
   # roots:
