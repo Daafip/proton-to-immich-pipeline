@@ -126,6 +126,17 @@ so nothing has to reach back into the container. The `-p` is only there to
 make the short link usable. Do the two logins one at a time; they would
 otherwise both want port 8399.
 
+**Re-authenticating later, from the UI.** Each account card shows the Proton
+session state (*signed in*, *signed out* or *not checked yet*) and when it was
+last established. **Check** queues a `status --probe` job, which checks the
+session, updates `status.json` and publishes to MQTT. **Re-authenticate**
+queues a `login` job: the pipeline starts `auth login`, and within a few
+seconds the card shows an **Open Proton sign-in** button, which works on any
+device. Once you finish, the card switches to *signed in* by itself, and Home
+Assistant's *Proton auth* sensor clears at the same moment. The link expires
+after `proton.login_timeout_sec` (300 s by default). It is never written to
+the logs or kept in the job's final detail.
+
 Every command works with `PIS_WEB_PASSWORD_HASH` still empty — `web-password`
 in particular, which is the one that produces it. `serve` is what refuses to
 start without a password on a non-loopback bind (exit 4,

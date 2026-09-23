@@ -261,6 +261,12 @@ class JobWorker(threading.Thread):
             return argv + ["run"]
         if job_type == "reconcile":
             return argv + ["reconcile"]
+        if job_type == "login":
+            # No redirect server: the UI shows the link, and the port would
+            # not be published from a pipeline container anyway.
+            return argv + ["login", "--no-serve", "--job-id", str(int(job["id"]))]
+        if job_type == "probe":
+            return argv + ["status", "--probe"]
         if job_type == "delete":
             payload = json.loads(job["payload"] or "{}")
             argv.append("delete-staged")
@@ -443,6 +449,7 @@ class Api:
                 job = state.active_job(conn, name)
                 last = state.recent_jobs(conn, name, limit=1)
                 status["active_job"] = dict(job) if job else None
+                status["sign_in"] = _sign_in(job)
                 status["last_job"] = dict(last[0]) if last else None
                 out.append(status)
             finally:
@@ -455,8 +462,13 @@ class Api:
             data = json.loads(account.status_path.read_text())
         except (OSError, json.JSONDecodeError):
             return {}
-        return {k: data.get(k) for k in ("auth_ok", "immich_ok")
-                if data.get(k) is not None}
+        out = {k: data.get(k) for k in ("auth_ok", "immich_ok")
+               if data.get(k) is not None}
+        # When the flags were last established: a days-old "signed in" is
+        # a different claim from one made a minute ago.
+        if data.get("generated_at"):
+            out["auth_checked_at"] = data["generated_at"]
+        return out
 
     def get_runs(self, account_name: str | None, limit: int = 20) -> dict[str, Any]:
         account = self.account(account_name)
@@ -905,6 +917,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  ".svg": "image/svg+xml", ".png": "image/png",
                  ".ico": "image/x-icon"}
         self._send(200, body, types.get(target.suffix, "application/octet-stream"))
+
+
+def _sign_in(job) -> dict[str, Any] | None:
+    """The Proton sign-in link of a running login job, if it has one yet.
+
+    The job writes it into `detail` as JSON once `auth login` prints it; until
+    then (queued, or the CLI still starting) there is nothing to show.
+    """
+    if job is None or job["type"] != "login" or job["state"] != state.JOB_RUNNING:
+        return None
+    try:
+        progress = json.loads(job["detail"] or "")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(progress, dict) or not progress.get("sign_in_url"):
+        return None
+    return {"url": str(progress["sign_in_url"]),
+            "expires_at": progress.get("expires_at")}
 
 
 def _limit(query: dict[str, str], default: int, cap: int) -> int:

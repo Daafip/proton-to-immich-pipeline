@@ -154,5 +154,31 @@ class TestDefaults(unittest.TestCase):
         ip = login_mod.local_ip()
         self.assertTrue(ip is None or ip.count(".") == 3)
 
+class TestLoginFromTheUi(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.cfg = load(None)
+        self.cfg.set("staging.root", str(self.dir))
+
+    def test_the_url_goes_to_the_callback_not_stdout(self):
+        import contextlib
+        import io
+        self.cfg.set("proton.binary", str(fake_cli(self.dir,
+            "import json\n"
+            f"print(json.dumps({{'signInUrl': {SIGN_IN_URL!r}}}), flush=True)\n")))
+        seen = []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = login_mod.run_login(self.cfg, serve=False, timeout=10,
+                                       on_url=lambda url, exp: seen.append((url, exp)))
+        self.assertEqual(code, 0)
+        self.assertEqual(seen[0][0], SIGN_IN_URL)
+        self.assertTrue(seen[0][1].endswith("Z"))
+        self.assertNotIn(SIGN_IN_URL, out.getvalue(),
+                         "stdout lands in the job detail and the logs")
+
+
 if __name__ == "__main__":
     unittest.main()

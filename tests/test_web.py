@@ -784,5 +784,53 @@ class TestServeRefusesUnsafeBind(WebTest):
                                    require_auth=False), 4)
 
 
+class TestReauth(WebTest):
+    """Re-auth from the UI: the job runs `sync.py login` in the pipeline and
+    the sign-in link travels back through the job row."""
+
+    def worker(self):
+        return web.JobWorker(self.cfg, self.api().accounts, None)
+
+    def test_login_and_probe_are_job_types(self):
+        for job_type in ("login", "probe"):
+            result = self.api().create_job(ACCOUNT, job_type)
+            self.assertFalse(result["rejected"], job_type)
+            state.finish_job(self.conn, result["job"]["id"], 0)
+
+    def test_login_job_runs_login_without_a_redirect_server(self):
+        job_id = state.create_job(self.conn, ACCOUNT, "login")
+        argv = self.worker().argv_for(state.get_job(self.conn, job_id))
+        self.assertEqual(argv[-4:], ["login", "--no-serve", "--job-id", str(job_id)])
+
+    def test_probe_job_runs_status_probe(self):
+        job_id = state.create_job(self.conn, ACCOUNT, "probe")
+        argv = self.worker().argv_for(state.get_job(self.conn, job_id))
+        self.assertEqual(argv[-2:], ["status", "--probe"])
+
+    def test_the_sign_in_link_reaches_the_page_while_the_job_runs(self):
+        job_id = state.create_job(self.conn, ACCOUNT, "login")
+        state.claim_job(self.conn)
+        row = self.api().get_accounts()["accounts"][0]
+        self.assertIsNone(row["sign_in"], "no link before the CLI prints one")
+
+        state.set_job_progress(self.conn, job_id, {
+            "sign_in_url": "https://account.proton.me/x#p",
+            "expires_at": "2026-09-23T12:00:00Z"})
+        row = self.api().get_accounts()["accounts"][0]
+        self.assertEqual(row["sign_in"]["url"], "https://account.proton.me/x#p")
+
+        state.finish_job(self.conn, job_id, 0, "signed in")
+        row = self.api().get_accounts()["accounts"][0]
+        self.assertIsNone(row["sign_in"], "a finished login shows no link")
+
+    def test_auth_status_says_when_it_was_checked(self):
+        self.cfg.status_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.status_path.write_text(json.dumps(
+            {"auth_ok": False, "generated_at": "2026-09-23T10:00:00Z"}))
+        row = self.api().get_accounts()["accounts"][0]
+        self.assertIs(row["auth_ok"], False)
+        self.assertEqual(row["auth_checked_at"], "2026-09-23T10:00:00Z")
+
+
 if __name__ == "__main__":
     unittest.main()

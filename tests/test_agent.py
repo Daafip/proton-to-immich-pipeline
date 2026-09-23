@@ -300,5 +300,17 @@ class TestLoop(AgentTest):
         self.assertEqual(agent.run(), 0)
 
 
+class TestReauthJobs(AgentTest):
+    def test_login_and_probe_jobs_map_to_their_commands(self):
+        agent = self.agent()
+        conn = self.conns["david"]
+        login_id = state.create_job(conn, "david", "login")
+        probe_id = state.create_job(conn, "david", "probe")
+        self.assertEqual(agent.argv(state.get_job(conn, login_id))[-4:],
+                         ["login", "--no-serve", "--job-id", str(login_id)])
+        self.assertEqual(agent.argv(state.get_job(conn, probe_id))[-2:],
+                         ["status", "--probe"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -174,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="just print the URL, start no server")
     p_login.add_argument("--timeout", type=int,
                          help="seconds to wait for the sign-in (default 300)")
+    p_login.add_argument("--job-id", type=int, help=argparse.SUPPRESS)
 
     p_requeue = sub.add_parser("requeue", parents=[common], help="put failed/quarantined rows back in play")
     p_requeue.add_argument("node_ids", nargs="*")
@@ -303,6 +304,23 @@ def _status_for(cfg, conn, args) -> dict:
         # broker -- the only thing that published was a full `run`.
         return report.publish(conn, cfg, auth_ok=auth_ok, immich_ok=immich_ok)
     return report.build_status(conn, cfg, auth_ok=auth_ok, immich_ok=immich_ok)
+
+
+def _record_auth(cfg, conn, auth_ok: bool) -> None:
+    """Rewrite status.json (and MQTT) with a fresh auth_ok.
+
+    Without this a successful sign-in left the UI and Home Assistant showing
+    "signed out" until the next nightly run.
+    """
+    immich_ok = None
+    try:
+        immich_ok = json.loads(cfg.status_path.read_text()).get("immich_ok")
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
+        report.publish(conn, cfg, auth_ok=auth_ok, immich_ok=immich_ok)
+    except Exception as exc:  # noqa: BLE001 - never fail a login on reporting
+        log.warn("report.failed", detail=str(exc)[:200])
 
 
 def _status_exit(status: dict) -> int:
@@ -706,8 +724,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "login":
         from src.login import run_login
         try:
-            return run_login(cfg, port=args.port, bind=args.bind,
-                             serve=not args.no_serve, timeout=args.timeout)
+            on_url = None
+            if args.job_id:
+                # Started from the UI: hand it the link through the job row.
+                def on_url(url: str, expires_at: str) -> None:
+                    state.set_job_progress(conn, args.job_id, {
+                        "sign_in_url": url, "expires_at": expires_at})
+            code = run_login(cfg, port=args.port, bind=args.bind,
+                             serve=not args.no_serve, timeout=args.timeout,
+                             on_url=on_url)
+            if code == 0:
+                _record_auth(cfg, conn, True)
+            return code
         finally:
             conn.close()
 

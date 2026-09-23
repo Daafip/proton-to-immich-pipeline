@@ -130,6 +130,12 @@
   }
   .note.bad { border-color: var(--bad); }
   .note.ok { border-color: var(--ok); }
+  .auth { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0 0; }
+  .auth .label { font-size: 13px; }
+  .auth .label.ok { color: var(--ok); }
+  .auth .label.bad { color: var(--bad); }
+  .btn-link.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink);
+                      padding: 7px 13px; font-size: 14px; }
   #toast {
     position: fixed; left: 50%; transform: translateX(-50%);
     bottom: calc(18px + env(safe-area-inset-bottom, 0px));
@@ -330,6 +336,7 @@ const fmtDate = (iso) => {
 // ---------------------------------------------------------------- render
 function statusPill(s) {
   const job = s.active_job;
+  if (job && job.type === "login") return { cls: "warn", text: "waiting for sign-in" };
   if (job) return { cls: "warn", text: `${job.type} ${job.state}` };
   if (s.auth_ok === false) return { cls: "bad", text: "proton signed out" };
   if (s.stale) return { cls: "warn", text: "stale" };
@@ -372,6 +379,8 @@ function renderCards() {
       el("span", { class: "faint", text: `last success ${fmtWhen(s.last_success)}` }),
     ]);
 
+    const auth = renderAuth(s, busy);
+
     const kids = [
       el("div", { class: "card-head" }, [
         el("h2", { text: s.account }),
@@ -381,6 +390,7 @@ function renderCards() {
       ]),
       stats,
       actions,
+      ...auth,
     ];
 
     if (s.delete_failed > 0) {
@@ -392,7 +402,8 @@ function renderCards() {
     // and the exit code cannot tell those apart. It is recorded as `done`,
     // so keying off the state alone hid the reason completely.
     const job = s.last_job;
-    if (!busy && job && job.exit_code !== null && job.exit_code !== 0) {
+    // A failed probe is "signed out", which the auth row already says.
+    if (!busy && job && job.type !== "probe" && job.exit_code !== null && job.exit_code !== 0) {
       const fatal = job.state === "failed";
       kids.push(el("div", { class: "note bad" }, [
         el("strong", { text: fatal
@@ -403,6 +414,80 @@ function renderCards() {
     }
     host.appendChild(el("section", { class: "panel" }, kids));
   }
+}
+
+// The Proton session: whether it works, when that was last established, and
+// the two ways to change it. A re-auth runs `auth login` in the pipeline
+// (the only place the session lives); its sign-in link comes back through
+// the job row and is shown here.
+function renderAuth(s, busy) {
+  const job = s.active_job;
+  const signingIn = job && job.type === "login";
+  const known = s.auth_ok === true || s.auth_ok === false;
+  const label = s.auth_ok === true ? "Proton: signed in"
+    : s.auth_ok === false ? "Proton: signed out" : "Proton: not checked yet";
+  const immich = s.immich_ok === true ? "Immich: ok"
+    : s.immich_ok === false ? "Immich: unreachable" : null;
+
+  const row = el("div", { class: "auth" }, [
+    el("span", { class: "label " + (s.auth_ok === true ? "ok" : s.auth_ok === false ? "bad" : ""),
+                 text: label }),
+    immich ? el("span", { class: "faint", text: "· " + immich }) : null,
+    el("span", { class: "faint", text: known && s.auth_checked_at
+      ? `· checked ${fmtWhen(s.auth_checked_at)}` : "" }),
+    el("span", { class: "spacer" }),
+    el("button", {
+      class: "small", text: "Check",
+      disabled: busy ? "disabled" : null,
+      title: "Probe Proton and Immich now and refresh this status",
+      onclick: () => startJob(s.account, "probe"),
+    }),
+    el("button", {
+      class: s.auth_ok === false ? "primary small" : "small",
+      text: signingIn ? "signing in…" : "Re-authenticate",
+      disabled: busy ? "disabled" : null,
+      title: "Start a new Proton sign-in for this account",
+      onclick: () => reauth(s.account),
+    }),
+  ]);
+  const out = [row];
+
+  if (signingIn) {
+    if (s.sign_in && s.sign_in.url) {
+      const expires = s.sign_in.expires_at ? new Date(s.sign_in.expires_at) : null;
+      const left = expires ? Math.max(0, Math.round((expires - Date.now()) / 60000)) : null;
+      out.push(el("div", { class: "note" }, [
+        el("strong", { text: "Finish the sign-in at Proton. " }),
+        el("span", { text: "Open the link on any device — phone is fine — and sign in as "
+          + `${s.account}'s Proton account. This page updates by itself when it is done.` }),
+        el("div", { class: "row", style: "margin-top:8px" }, [
+          el("a", { class: "btn-link primary", href: s.sign_in.url, target: "_blank",
+                    rel: "noopener noreferrer", text: "Open Proton sign-in" }),
+          el("button", { class: "small", text: "Copy link",
+                         onclick: () => showCopyBox(s.sign_in.url) }),
+          left !== null ? el("span", { class: "faint", text: `expires in ~${left} min` }) : null,
+        ]),
+      ]));
+    } else {
+      out.push(el("div", { class: "note", text: job.state === "queued"
+        ? "Sign-in queued — waiting for the pipeline to pick it up…"
+        : "Starting the Proton CLI — the sign-in link appears here in a moment…" }));
+    }
+  } else if (s.auth_ok === false) {
+    out.push(el("div", { class: "note bad", text:
+      "The Proton session has expired or was never set up. Nothing syncs for this "
+      + "account until you re-authenticate." }));
+  }
+  return out;
+}
+
+async function reauth(account) {
+  const ok = await confirmDialog(
+    `Re-authenticate ${account}?`,
+    "This starts a new Proton sign-in. You get a link to open and sign in with; "
+    + "the current session is replaced once you finish.",
+    "Start sign-in");
+  if (ok) startJob(account, "login");
 }
 
 function stat(key, value, cls = "") {

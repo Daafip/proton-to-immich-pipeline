@@ -78,7 +78,7 @@ JOB_QUEUED = "queued"
 JOB_RUNNING = "running"
 JOB_DONE = "done"
 JOB_FAILED = "failed"
-JOB_TYPES = ("sync", "reconcile", "delete")
+JOB_TYPES = ("sync", "reconcile", "delete", "login", "probe")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -1060,6 +1060,19 @@ def finish_job(conn: sqlite3.Connection, job_id: int, exit_code: int,
         (JOB_DONE if exit_code in (0, 1) else JOB_FAILED, utcnow(), exit_code,
          detail[:4000] if detail else None, job_id),
     )
+    conn.commit()
+
+
+def set_job_progress(conn: sqlite3.Connection, job_id: int,
+                     progress: dict[str, Any]) -> None:
+    """Something a running job needs the UI to see before it finishes.
+
+    Only the Proton sign-in uses it: the URL exists only while `auth login`
+    is waiting, and the UI is the one showing it. Stored as JSON in `detail`,
+    which finish_job() overwrites with the outcome.
+    """
+    conn.execute("UPDATE jobs SET detail=? WHERE id=? AND state=?",
+                 (json.dumps(progress), job_id, JOB_RUNNING))
     conn.commit()
 
 

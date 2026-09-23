@@ -16,8 +16,9 @@ import shutil
 import socket
 import subprocess
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
+from typing import Any, Callable
 
 from . import log
 from .proton import ProtonCliBackend, ProtonError
@@ -102,8 +103,14 @@ def print_qr(url: str) -> bool:
 
 
 def run_login(cfg, port: int | None = None, bind: str = "0.0.0.0",
-              serve: bool = True, timeout: int | None = None) -> int:
-    """Drive the sign-in. Returns a process exit code."""
+              serve: bool = True, timeout: int | None = None,
+              on_url: Callable[[str, str], None] | None = None) -> int:
+    """Drive the sign-in. Returns a process exit code.
+
+    `on_url(url, expires_at)` is the UI's route: the job runner passes it, and
+    the URL then goes to the job row instead of stdout -- stdout ends up in
+    the job's `detail` and the logs, and the link should not outlive its use.
+    """
     backend = ProtonCliBackend(cfg)
     port = port or int(cfg.get("proton.login_redirect_port", 8399))
     timeout = timeout or int(cfg.get("proton.login_timeout_sec", 300))
@@ -113,6 +120,12 @@ def run_login(cfg, port: int | None = None, bind: str = "0.0.0.0",
     except ProtonError as exc:
         log.error("login.failed_to_start", detail=str(exc)[:400])
         return 2
+
+    if on_url is not None:
+        expires = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+        on_url(url, expires.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        log.info("login.waiting", seconds=timeout, via="ui")
+        return _wait(proc, timeout)
 
     httpd = None
     if serve:
@@ -148,27 +161,34 @@ def run_login(cfg, port: int | None = None, bind: str = "0.0.0.0",
     print("  (the browser does not call back here -- the CLI polls Proton)")
     print()
 
-    code = 2
     try:
-        proc.wait(timeout=timeout)
-        code = proc.returncode or 0
+        code = _wait(proc, timeout)
         if code == 0:
-            log.info("login.succeeded")
             print("  Signed in. Verify it survives a reboot:")
             print("      sudo reboot && sync.py status --probe")
-        else:
-            stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
-            log.error("login.failed", exit_code=code, detail=stderr[:400])
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        log.error("login.timed_out", seconds=timeout)
-        code = 2
-    except KeyboardInterrupt:
-        proc.kill()
-        log.warn("login.interrupted")
-        code = 2
     finally:
         if httpd is not None:
             httpd.shutdown()
             httpd.server_close()
+    return code
+
+
+def _wait(proc: subprocess.Popen, timeout: int) -> int:
+    """Wait for `auth login` to finish and log how it ended."""
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        log.error("login.timed_out", seconds=timeout)
+        return 2
+    except KeyboardInterrupt:
+        proc.kill()
+        log.warn("login.interrupted")
+        return 2
+    code = proc.returncode or 0
+    if code == 0:
+        log.info("login.succeeded")
+    else:
+        stderr = (proc.stderr.read() or "").strip() if proc.stderr else ""
+        log.error("login.failed", exit_code=code, detail=stderr[:400])
     return code

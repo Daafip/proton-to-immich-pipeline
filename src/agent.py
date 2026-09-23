@@ -127,6 +127,12 @@ class Agent:
             return argv + ["run"]
         if job_type == "reconcile":
             return argv + ["reconcile"]
+        if job_type == "login":
+            # No redirect server: the UI shows the link, and the port would
+            # not be published from a pipeline container anyway.
+            return argv + ["login", "--no-serve", "--job-id", str(int(job["id"]))]
+        if job_type == "probe":
+            return argv + ["status", "--probe"]
         if job_type == "delete":
             payload = json.loads(job["payload"] or "{}")
             argv.append("delete-staged")
