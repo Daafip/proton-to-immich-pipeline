@@ -328,6 +328,181 @@ class TestReconcile(DeleteTest):
 # C4 -- the puller must never resurrect a staged row
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# withdrawing a staged row again
+#
+# The queue was append-only, so it could end up contradicting the one signal
+# it is built on: photos restored in Immich stayed queued for deletion in
+# Proton. The hard part is that "restored" and "purged by Immich's 30-day
+# sweep" both look like *absent from the trash listing*, and they need
+# opposite outcomes -- so nothing is withdrawn without positive proof the
+# asset is back in the library.
+# ---------------------------------------------------------------------------
+
+class TestCancelRestored(DeleteTest):
+    def stage_one(self):
+        self.sync(2)
+        asset_id = self.trash_in_immich("node-1")
+        self.pipe(run_id="r2").reconcile()
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
+        return asset_id
+
+    def test_restoring_in_immich_withdraws_the_pending_deletion(self):
+        """The symptom this is for: a queue listing photos that are plainly
+        in Immich and not in its trash."""
+        self.stage_one()
+        self.server.restore_asset(
+            state.get(self.conn, ACCOUNT, "node-1")["immich_asset_id"])
+
+        pipeline = self.pipe(run_id="r3")
+        pipeline.reconcile()
+
+        self.assertEqual(pipeline.stats.cancelled, 1)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"],
+                         state.PURGED, "back to an ordinary completed asset")
+        self.assertEqual(self.backend.trash_calls, [])
+        self.assertIn("/Photos/IMG_0.jpg", self.backend.files)
+
+    def test_emptying_the_trash_in_immich_withdraws_everything(self):
+        """Restoring every photo at once is the same signal as restoring one.
+
+        This is the path that used to be skipped entirely: an empty trash
+        returned before any withdrawal could happen.
+        """
+        self.sync(3)
+        for node_id in ("node-1", "node-2"):
+            self.trash_in_immich(node_id)
+        self.pipe(run_id="r2").reconcile()
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 2)
+
+        for node_id in ("node-1", "node-2"):
+            self.server.restore_asset(
+                state.get(self.conn, ACCOUNT, node_id)["immich_asset_id"])
+
+        pipeline = self.pipe(run_id="r3")
+        pipeline.reconcile()
+        self.assertEqual(pipeline.stats.cancelled, 2)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0)
+
+    def test_a_purge_is_not_a_restore(self):
+        """The distinction the whole method turns on. Immich deletes its trash
+        after ~30 days; the staged row is then the only surviving record that
+        the Proton original should go, so it must not be withdrawn."""
+        self.stage_one()
+        self.server.empty_trash()
+
+        pipeline = self.pipe(run_id="r3")
+        pipeline.reconcile()
+
+        self.assertEqual(pipeline.stats.cancelled, 0)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
+
+    def test_a_failed_lookup_changes_nothing(self):
+        """An unreachable Immich must not quietly drain the queue."""
+        self.stage_one()
+        self.server.restore_asset(
+            state.get(self.conn, ACCOUNT, "node-1")["immich_asset_id"])
+
+        pipeline = self.pipe(run_id="r3", client=FakeImmichClient(
+            self.server, fail_asset_lookup=True))
+        pipeline.reconcile()
+
+        self.assertEqual(pipeline.stats.cancelled, 0)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
+
+    def test_a_truncated_trash_scan_withdraws_nothing(self):
+        """With a capped scan, "not in the trash" and "not reached yet" are
+        the same answer, and one of them deletes photos."""
+        self.stage_one()
+        client = FakeImmichClient(self.server)
+        client.trash_scan_complete = False
+        # The trash listing comes back empty, which would otherwise look like
+        # every staged photo having been restored.
+        self.server.trash.clear()
+
+        pipeline = self.pipe(run_id="r3", client=client)
+        pipeline.reconcile()
+
+        self.assertEqual(pipeline.stats.cancelled, 0)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
+        self.assertEqual(client.asset_lookups, [], "not even asked")
+
+    def test_rows_already_executed_are_never_withdrawn(self):
+        """The Proton file is already in Proton's trash. Sending the asset
+        back would have the puller download it all over again."""
+        self.stage_one()
+        self.cfg.set("delete.action", "execute")
+        self.pipe(run_id="r3").execute_deletes(dry_run=False)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"],
+                         state.REMOTE_TRASHED)
+
+        self.server.restore_asset(
+            state.get(self.conn, ACCOUNT, "node-1")["immich_asset_id"])
+        pipeline = self.pipe(run_id="r4")
+        pipeline.reconcile()
+
+        self.assertEqual(pipeline.stats.cancelled, 0)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"],
+                         state.REMOTE_TRASHED)
+
+    def test_a_dry_run_reports_without_writing(self):
+        self.stage_one()
+        self.server.restore_asset(
+            state.get(self.conn, ACCOUNT, "node-1")["immich_asset_id"])
+
+        self.pipe(run_id="r3", dry_run=True).reconcile()
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
+
+    def test_it_can_be_turned_off(self):
+        """For anyone who wants the queue to stay an append-only record."""
+        self.stage_one()
+        self.cfg.set("reconcile.cancel_restored", False)
+        self.server.restore_asset(
+            state.get(self.conn, ACCOUNT, "node-1")["immich_asset_id"])
+
+        pipeline = self.pipe(run_id="r3")
+        pipeline.reconcile()
+        self.assertEqual(pipeline.stats.cancelled, 0)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
+
+    def test_the_steady_state_makes_no_lookups(self):
+        """Nothing left the trash, so there is nothing to ask about."""
+        self.stage_one()
+        self.client.asset_lookups.clear()
+        self.pipe(run_id="r3").reconcile()
+        self.assertEqual(self.client.asset_lookups, [])
+
+
+class TestInImmichCount(DeleteTest):
+    def test_staging_does_not_empty_the_in_immich_count(self):
+        """`uploaded_total` counted exactly the statuses staging moves a row
+        out of, so the number the UI shows as "in immich" fell by one for
+        every photo staged -- a library with 499 photos in it read
+        `in immich 0, staged 499`."""
+        self.sync(3)
+        self.assertEqual(state.uploaded_total(self.conn, ACCOUNT), 3)
+
+        self.trash_in_immich("node-1")
+        self.pipe(run_id="r2").reconcile()
+
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
+        self.assertEqual(state.uploaded_total(self.conn, ACCOUNT), 3,
+                         "staged for deletion in Proton, still in Immich")
+
+    def test_it_survives_the_deletion_itself(self):
+        """Deleting the Proton original does not remove the Immich asset."""
+        self.sync(2)
+        self.trash_in_immich("node-1")
+        self.pipe(run_id="r2").reconcile()
+        self.cfg.set("delete.action", "execute")
+        self.pipe(run_id="r3").execute_deletes(dry_run=False)
+
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"],
+                         state.REMOTE_TRASHED)
+        self.assertEqual(state.uploaded_total(self.conn, ACCOUNT), 2)
+
+
 class TestNoRedownload(DeleteTest):
     def stage_one(self):
         self.sync(2)

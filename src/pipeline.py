@@ -9,10 +9,11 @@ Nothing is read from a module-level default, so there is no way to pair one
 account's staging directory with another's API key.
 
 `reconcile` and `execute_deletes` are the v2 additions, and they are
-deliberately asymmetric: reconcile runs unattended at the end of every sync
-and only ever *adds* to the staged list, while execute_deletes -- the only
-destructive code in the pipeline -- runs when a human asks and re-checks every
-node against Proton before touching it.
+deliberately asymmetric: reconcile runs unattended at the end of every sync and
+never touches Proton -- it keeps the staged list in step with Immich's trash,
+adding what has been trashed and withdrawing what has been restored -- while
+execute_deletes, the only destructive code in the pipeline, runs when a human
+asks and re-checks every node against Proton before touching it.
 """
 
 from __future__ import annotations
@@ -56,6 +57,9 @@ class Stats:
     # Assets Immich recognised by checksum but held in its trash, brought back
     # into the library rather than recorded as an upload that never happened.
     restored: int = 0
+    # Staged rows taken back off the queue because the asset left Immich's
+    # trash -- someone restored it, so the Proton original must not be deleted.
+    cancelled: int = 0
     trashed: int = 0
     delete_failed: int = 0
     delete_skipped: int = 0
@@ -976,7 +980,14 @@ class Pipeline:
             return self.stats
 
         if not trashed:
-            log.info("reconcile.done", trashed_in_immich=0, staged=0)
+            # An empty trash is the strongest possible "nothing should be
+            # deleted": every pending row is stale by definition. Returning
+            # here without cancelling is what let an emptied trash leave the
+            # queue full.
+            cancelled = self.cancel_restored(set())
+            log.info("reconcile.done", trashed_in_immich=0, staged=0,
+                     cancelled=cancelled,
+                     total_staged=state.count_staged(self.conn, self.account))
             return self.stats
 
         by_asset = {str(a.get("id")): a for a in trashed if a.get("id")}
@@ -1020,12 +1031,106 @@ class Pipeline:
                         "empty or restore Immich's trash if they should not "
                         "be deleted from Proton"))
 
+        cancelled = self.cancel_restored(set(by_asset))
+
         log.info("reconcile.done", trashed_in_immich=len(by_asset),
                  matched=len(rows), staged=self.stats.staged,
+                 cancelled=cancelled,
                  staged_without_uploading=never_uploaded,
                  total_staged=state.count_staged(self.conn, self.account),
                  dry_run=self.dry_run)
         return self.stats
+
+    def cancel_restored(self, trashed_ids: set[str]) -> int:
+        """Withdraw pending deletions for photos that are back in the library.
+
+        The queue used to be append-only -- "reconcile only ever adds" -- which
+        made it disagree with the very signal it is built on. Restoring a photo
+        in Immich is how a person says "no, keep this one", and yet the Proton
+        original stayed queued, so a queue could sit there listing hundreds of
+        photos plainly present in Immich and not in its trash. Under
+        `delete.action: execute` those originals would then be trashed in
+        Proton despite having been explicitly rescued.
+
+        Absence from the trash listing is *not* enough to act on, because two
+        opposite situations produce it:
+
+        * restored -- the asset is live again, so withdraw the deletion;
+        * purged   -- Immich's 30-day sweep deleted it, so the staged row is
+          now the only record that the Proton original should go, and it must
+          survive. That is the whole reason this list is stored rather than
+          recomputed from the server on each view.
+
+        So a row is withdrawn only on **positive proof of life**: Immich is
+        asked about the asset directly and must answer that it holds it and it
+        is not trashed. Anything else -- missing, still trashed, an error, no
+        asset id to ask about -- leaves the row exactly as it was. Errors
+        change nothing.
+
+        Only `staged_for_delete` rows are revalidated. `deleting`,
+        `remote_trashed` and `delete_failed` are left alone: their Proton file
+        may already be gone, and sending those back would have the puller
+        download them all over again.
+        """
+        if not self.cfg.get("reconcile.cancel_restored", True):
+            return 0
+        if not getattr(self.client, "trash_scan_complete", True):
+            log.warn("reconcile.cancel_skipped", account=self.account,
+                     detail=("the trash scan hit reconcile.max_pages, so "
+                             "'not in the trash' cannot be told apart from "
+                             "'not reached yet' -- nothing was unstaged"))
+            return 0
+
+        pending = state.staged_deletes(self.conn, self.account)
+        candidates = [r for r in pending
+                      if str(r["immich_asset_id"] or "") not in trashed_ids
+                      and r["immich_asset_id"]]
+        if not candidates:
+            return 0
+
+        # One lookup per candidate, and a candidate only exists when something
+        # actually left the trash since the last pass -- in the steady state
+        # this list is empty and no request is made at all. The cap is for the
+        # pathological case where it is not.
+        cap = int(self.cfg.get("reconcile.cancel_check_max", 5000))
+        if cap and len(candidates) > cap:
+            log.warn("reconcile.cancel_check_capped", account=self.account,
+                     candidates=len(candidates), cap=cap)
+            candidates = candidates[:cap]
+
+        restored: list[int] = []
+        purged = unknown = 0
+        for row in candidates:
+            try:
+                where = self.client.asset_state(str(row["immich_asset_id"]))
+            except ImmichAuthError as exc:
+                raise AuthFailure(f"immich: {exc}") from exc
+            except ImmichError:
+                where = "unknown"
+            if where == "live":
+                restored.append(int(row["id"]))
+            elif where == "missing":
+                purged += 1
+            else:
+                unknown += 1
+
+        if purged or unknown:
+            log.info("reconcile.cancel_kept", account=self.account,
+                     purged_by_immich=purged, unverifiable=unknown,
+                     detail="left on the queue; only a live asset withdraws one")
+        if not restored:
+            return 0
+        if self.dry_run:
+            log.info("reconcile.dry_run_cancel", account=self.account,
+                     rows=len(restored))
+            return len(restored)
+
+        count = state.unstage(self.conn, self.account, restored)
+        self.stats.cancelled += count
+        log.info("reconcile.cancelled_restored", account=self.account,
+                 rows=count,
+                 detail="back in immich's library; proton original kept")
+        return count
 
     # -- Phase 6: execute the staged deletions -----------------------------
     def execute_deletes(self, ids: Iterable[int] | None = None,

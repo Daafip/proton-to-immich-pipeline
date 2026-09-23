@@ -171,20 +171,39 @@ class FakeImmichServer:
         return str(asset_id)
 
     def empty_trash(self) -> None:
-        """Immich's 30-day auto-purge: the asset stops being discoverable."""
+        """Immich's 30-day auto-purge: the assets are deleted outright.
+
+        Not just dropped from the trash listing -- the server no longer has
+        them at all, which is what makes a purge distinguishable from someone
+        restoring a photo.
+        """
+        purged = set(self.trash)
+        self.by_checksum = {checksum: asset_id
+                            for checksum, asset_id in self.by_checksum.items()
+                            if asset_id not in purged}
         self.trash.clear()
+
+    def restore_asset(self, asset_id: str) -> None:
+        """What "someone changed their mind in Immich" looks like."""
+        self.trash.pop(str(asset_id), None)
 
 
 class FakeImmichClient:
     def __init__(self, server: FakeImmichServer, fail_precheck: bool = False,
-                 fail_trash_search: bool = False, fail_restore: bool = False):
+                 fail_trash_search: bool = False, fail_restore: bool = False,
+                 fail_asset_lookup: bool = False):
         self.server = server
         self.fail_precheck = fail_precheck
         self.fail_trash_search = fail_trash_search
         self.fail_restore = fail_restore
+        self.fail_asset_lookup = fail_asset_lookup
+        self.asset_lookups: list[str] = []
         self.uploaded: list[str] = []
         self.trash_queries: list[tuple] = []
         self.restored: list[str] = []
+        # Mirrors the real client: False means the returned list is a prefix
+        # of the trash, so absence from it proves nothing.
+        self.trash_scan_complete = True
 
     def ping(self) -> bool:
         return True
@@ -220,6 +239,18 @@ class FakeImmichClient:
         if self.fail_trash_search:
             raise ImmichError("search/metadata unavailable")
         return set(self.server.trash)
+
+    def asset_state(self, asset_id: str) -> str:
+        from src.immich import ImmichError
+        asset_id = str(asset_id)
+        self.asset_lookups.append(asset_id)
+        if self.fail_asset_lookup:
+            raise ImmichError("asset lookup unavailable")
+        if asset_id in self.server.trash:
+            return "trashed"
+        if asset_id in set(self.server.by_checksum.values()):
+            return "live"
+        return "missing"
 
     def restore_from_trash(self, asset_ids, chunk: int = 200) -> int:
         """Restoring takes the asset back out of the trash, which is exactly

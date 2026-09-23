@@ -558,7 +558,13 @@ pull → download → push → verify → reap → reconcile
 `reconcile` runs as the last step of every `run`. It asks Immich what is in its
 trash, matches those asset ids against the rows this account uploaded, and
 records each match in `staged_deletes`. **It never calls a Proton mutation.**
-The only thing it can do is add to a list.
+The only thing it can do is write a list.
+
+It keeps that list in step with the trash **in both directions**. Restore a
+photo in Immich and the pending deletion is withdrawn on the next run, because
+restoring is how you say "no, keep this one" — and a queue that went on listing
+photos you had visibly rescued was contradicting the one signal the feature
+reads. See [Withdrawing a staged row](#withdrawing-a-staged-row).
 
 > **A checksum match is not proof the photo is in the library.**
 > `/assets/bulk-upload-check` — the endpoint `push` uses to avoid re-sending
@@ -600,6 +606,30 @@ written on first sighting and stays until you act on it.
 Extend or disable the auto-empty under **Administration → Settings → Trash**,
 so a staged photo can still be looked up in Immich before you decide.
 
+### Withdrawing a staged row
+
+Restore a photo in Immich and the next `reconcile` takes it back off the queue:
+the asset goes back to `purged` — an ordinary completed asset — and the Proton
+original is left alone. Nothing to run by hand.
+
+The subtlety is that **an asset can leave the trash in two opposite ways**, and
+from the trash listing alone they look identical:
+
+| How it left the trash | What it means | What happens to the staged row |
+|---|---|---|
+| Someone **restored** it | "Keep this one" | **Withdrawn.** The Proton original stays. |
+| Immich's 30-day sweep **purged** it | The asset is gone from the server; the staged row is now the only record that the original was meant to go | **Kept.** |
+
+So a row is withdrawn only on **positive proof of life**: Immich is asked about
+that asset directly and has to answer that it holds it and it is not trashed.
+Anything else — purged, still trashed, an API error, a truncated trash scan —
+leaves the row exactly as it was. Errors never drain the queue.
+
+That costs one lookup per row that has left the trash since the last pass, so
+in the steady state it makes no requests at all. `reconcile.cancel_check_max`
+(default 5000) caps it; `reconcile.cancel_restored: false` turns the whole
+thing off if you would rather the queue stayed an append-only record.
+
 ### Executing it
 
 `delete.action` decides what "execute" means, per account:
@@ -626,8 +656,9 @@ python3 sync.py unstage --all --resync        # ...and sync them again properly
 ```
 
 `unstage` alone returns the asset to `purged` — right when the photo *is* in
-Immich and you trashed it by accident: restore it there, unstage here, and
-nothing is re-downloaded.
+Immich and you trashed it by accident. Restoring it in Immich is usually enough
+on its own, since the next `reconcile` withdraws the row for you; `unstage` is
+the manual version for when you do not want to wait for a run.
 
 `--resync` returns it to `discovered` instead, so the whole pipeline runs
 again. That is the recovery path for rows that were **never really uploaded**;
@@ -778,6 +809,21 @@ docker compose run --rm default staged            # the delete queue
 Quarantined assets have used up `limits.max_attempts` and are not retried.
 Fix the cause, then `sync.py requeue` puts them back in play — `--now` also
 ignores the backoff.
+
+### What the numbers on a card mean
+
+| | Counts |
+|---|---|
+| **backlog** | Seen in Proton, not yet safely in Immich: `discovered`, `downloading`, `downloaded`, `uploading`, `failed`. |
+| **in immich** | Everything that reached Immich and is still there. **Includes rows staged for deletion and already deleted from Proton** — staging is about the Proton original, the Immich asset stays put. |
+| **failed** | Will be retried, after a backoff. |
+| **quarantined** | Used up `limits.max_attempts`; not retried until `requeue`. |
+| **staged** | Pending rows in the delete queue: trashed in Immich, Proton original not yet dealt with. |
+
+`in immich` used to count only the three pre-staging statuses, which is exactly
+the set staging moves a row *out* of — so every photo staged took one off the
+number, and a night that staged 499 read `in immich 0, staged 499` for a
+library that plainly had 499 photos in it. The counts now add up.
 
 ### Endpoints
 
@@ -1485,6 +1531,8 @@ everything, restore the relevant file, and downgrade the code.
 | Nothing at all about MQTT in the journal | `mqtt.enabled` is false. `-v` shows `mqtt.disabled`. |
 | `Unsupported callback API version` | paho-mqtt 2.x with an older build of this pipeline. Fixed — both 1.x and 2.x are handled now. |
 | `staged` climbing by `limits.max_files` a run while `in immich` stays 0 | Every file is being matched to an asset in Immich's **trash** and queued for deletion instead of landing in the library. Fixed by `immich.restore_trashed_duplicates` (default `true`); to recover rows already queued, `sync.py unstage --all --resync`. |
+| The queue lists photos you can see in Immich, and they are **not** in its trash | They were trashed when the row was written and have since been restored. The next `reconcile` withdraws them — `reconcile.cancelled_restored` in the log says how many. Nothing to run by hand. |
+| A staged photo is in Immich but `reconcile` will not withdraw the row | Withdrawal needs Immich to confirm the asset is live. Check for `reconcile.cancel_kept` (`purged_by_immich` = Immich deleted it; `unverifiable` = the lookup failed) or `reconcile.cancel_skipped` (the trash scan hit `reconcile.max_pages`). |
 | `push.matched_trashed_assets` | Immich recognised these checksums but the assets are in its trash. With the default setting they are restored and the run continues; it is worth knowing how many. |
 | `push.restore_failed` | `POST /trash/restore/assets` was refused — the path has moved between Immich versions. The assets are failed rather than recorded as uploaded. Restore them in the Immich UI, then `sync.py requeue`. |
 | `reconcile.staged_without_uploading` | Photos were staged that this pipeline never uploaded. With the default settings this should no longer happen; if it does, check `sync.py staged` before executing anything. |

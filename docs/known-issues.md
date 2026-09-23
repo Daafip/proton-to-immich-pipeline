@@ -205,6 +205,16 @@ mutation at all.
   uploaded, so the bad outcome is a stuck asset, not a phantom one.
 
 
+- **`GET /assets/{id}`.** `reconcile` calls this to decide whether an asset
+  that has left Immich's trash was **restored** (withdraw the pending deletion)
+  or **purged by the 30-day sweep** (keep it queued — the staged row is the
+  only record left). The two are indistinguishable from the trash listing, so
+  the lookup is what separates them. A 404 is read as purged; every other
+  error is read as "unknown" and changes nothing, so the failure mode is a row
+  that stays on the queue, never one that is silently dropped. Not exercised
+  against a live server: if the response shape differs, watch for
+  `reconcile.cancel_kept` with a high `unverifiable` count.
+
 - **Immich's trash query.** `POST /search/metadata` with `isTrashed: true`,
   paginated by `page`/`nextPage`, one request per `type`. The field names and
   the pagination shape are read off the API, not observed. If they are wrong,

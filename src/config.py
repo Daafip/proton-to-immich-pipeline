@@ -155,8 +155,19 @@ DEFAULTS: dict[str, Any] = {
     "reconcile": {
         # Runs as the last step of every `run`: ask Immich what is in its trash
         # and stage the matching Proton nodes for deletion. Never mutates
-        # Proton -- it only ever adds rows to the staged list.
+        # Proton -- the only Proton-side write is `delete-staged`, run
+        # separately.
         "enabled": True,
+        # Take a pending row back off the queue once its asset is no longer in
+        # Immich's trash. Restoring a photo in Immich is how you say "no, keep
+        # it", so leaving it queued for deletion in Proton contradicts the one
+        # signal this whole feature reads. Turn it off only if you want the
+        # queue to be an append-only record of what was ever trashed.
+        "cancel_restored": True,
+        # Cap on the per-asset "is it back in the library?" lookups one pass
+        # will make. Only rows that have left the trash since the last pass are
+        # ever checked, so this is normally zero requests.
+        "cancel_check_max": 5000,
         # /search/metadata takes one type per request.
         "types": ["IMAGE", "VIDEO"],
         "page_size": 250,

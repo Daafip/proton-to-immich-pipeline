@@ -173,8 +173,13 @@ reap:
   scratch_max_age_hours: 48
 
 # Ask Immich what is in its trash at the end of every run, and stage the
-# matching Proton files for deletion. Reconcile never touches Proton -- it
-# only ever adds rows to the staged list, which `sync.py staged` prints.
+# matching Proton files for deletion. Reconcile never touches Proton -- the
+# staged list, which `sync.py staged` prints, is its only output.
+#
+# It keeps that list in step with the trash in both directions: restore a photo
+# in Immich and the pending deletion is withdrawn on the next run. A row is
+# only ever withdrawn on positive proof the asset is back in the library, so
+# Immich purging its trash (below) is never mistaken for a restore.
 #
 # Immich empties its own trash after ~30 days, so the list has to live in
 # state.sqlite from first sighting: recomputing it from the server would

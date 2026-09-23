@@ -32,7 +32,13 @@ from . import log
 
 
 class ImmichError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        # The HTTP status when there was one. Reconcile needs 404 ("Immich has
+        # no such asset") told apart from 500 ("ask again later"), and matching
+        # on message text for that is how a server reword becomes a deleted
+        # photo.
+        self.status = status
 
 
 class ImmichConfigError(ImmichError):
@@ -121,6 +127,10 @@ class ImmichClient:
         self.timeout = int(cfg.get("immich.http_timeout_sec", 120))
         self.device_id = str(cfg.get("immich.device_id", "proton-to-immich-pipeline"))
         self._checksum_format: str | None = None
+        # Set by every search_trashed(): False when pagination hit max_pages,
+        # so the list returned is a prefix of the trash rather than all of it.
+        # Callers that reason about *absence* from the trash must check this.
+        self.trash_scan_complete = True
 
     # -- transport ---------------------------------------------------------
     def _request(
@@ -150,7 +160,8 @@ class ImmichClient:
             detail = exc.read().decode("utf-8", "replace")[:500]
             if exc.code in (401, 403):
                 raise ImmichAuthError(f"{exc.code} {detail}") from exc
-            raise ImmichError(f"{method} {url} -> {exc.code}: {detail}") from exc
+            raise ImmichError(f"{method} {url} -> {exc.code}: {detail}",
+                              status=exc.code) from exc
         except urllib.error.URLError as exc:
             raise ImmichError(f"{method} {url} failed: {exc.reason}") from exc
         if not payload:
@@ -261,6 +272,7 @@ class ImmichClient:
         nextPage cannot loop against the API all night.
         """
         seen: dict[str, dict[str, Any]] = {}
+        self.trash_scan_complete = True
         for asset_type in types:
             page: Any = 1
             for _ in range(max_pages):
@@ -286,6 +298,8 @@ class ImmichClient:
                     break
                 page = next_page
             else:
+                # Ran out of pages with the server still offering more.
+                self.trash_scan_complete = False
                 log.warn("immich.trash_pagination_capped", type=asset_type,
                          pages=max_pages)
         log.debug("immich.trash_scanned", assets=len(seen))
@@ -298,6 +312,36 @@ class ImmichClient:
         return {str(a["id"]) for a in self.search_trashed(
             types=types, page_size=page_size, max_pages=max_pages)
             if a.get("id")}
+
+    def asset_state(self, asset_id: str) -> str:
+        """Where one asset stands: "live", "trashed", "missing" or "unknown".
+
+        Reconcile needs to tell two situations apart that look identical from
+        the trash listing alone, because in both the asset is simply absent
+        from it:
+
+        * someone **restored** the photo -- it is back in the library, and the
+          Proton original must not be deleted after all;
+        * Immich's 30-day purge **deleted** it -- it is gone from the server
+          entirely, and the staged row is now the only surviving record that
+          the Proton original was meant to go.
+
+        "unknown" is returned for any error that is not a 404, and the caller
+        treats it as "changed nothing".
+        """
+        try:
+            payload = self._request("GET", f"/assets/{asset_id}", timeout=30)
+        except ImmichAuthError:
+            raise
+        except ImmichError as exc:
+            if exc.status == 404:
+                return "missing"
+            log.debug("immich.asset_lookup_failed", asset_id=str(asset_id),
+                      detail=log.condense(str(exc), 200))
+            return "unknown"
+        if not isinstance(payload, dict) or not payload.get("id"):
+            return "unknown"
+        return "trashed" if payload.get("isTrashed") else "live"
 
     def restore_from_trash(self, asset_ids: Sequence[str],
                            chunk: int = 200) -> int:

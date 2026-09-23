@@ -33,9 +33,11 @@ checksum**, and nothing is transferred twice: every node is tracked by its
 Proton node id in SQLite.
 
 Deleting a photo in Immich stages the Proton copy for deletion too — but
-**scanning is automatic and deleting is not**. `reconcile` only ever adds to a
+**scanning is automatic and deleting is not**. `reconcile` only ever writes a
 list; trashing in Proton takes a deliberate `--yes` (or a confirmation in the
-UI), re-resolves every node first, and is reversible.
+UI), re-resolves every node first, and is reversible. Restore the photo in
+Immich and the pending deletion is withdrawn on the next run, so the list
+always agrees with what you can see in Immich.
 
 **Status:** `login → pull → download → push` has run end to end on a Debian VM
 against `cli-drive@0.8.0` and `immich-server:v3` (2026-09-21). `verify`, `reap`,

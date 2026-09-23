@@ -792,8 +792,9 @@ def stage_delete(conn: sqlite3.Connection, account: str, row: sqlite3.Row,
                  now: str | None = None) -> bool:
     """Record one asset as trashed in Immich and therefore a deletion candidate.
 
-    Idempotent, and never a mutation on Proton's side -- reconcile only ever
-    adds to this list. Returns True when the row was newly staged.
+    Idempotent, and never a mutation on Proton's side. Returns True when the
+    row was newly staged. The matching withdrawal is Pipeline.cancel_restored,
+    which takes a row back off once its asset leaves Immich's trash.
     """
     if row["status"] in DELETE_STATUSES:
         return False
@@ -1130,11 +1131,26 @@ def backlog(conn: sqlite3.Connection, account: str) -> int:
     return row["c"]
 
 
+# Everything below counts as "this is in Immich". The delete-queue statuses
+# belong here: a row only ever enters that queue *from* STAGEABLE_STATUSES, so
+# being in Immich is the precondition for staging, and what the queue tracks is
+# the fate of the Proton original -- the Immich asset stays put.
+IN_IMMICH_STATUSES = (*STAGEABLE_STATUSES, *DELETE_STATUSES)
+
+
 def uploaded_total(conn: sqlite3.Connection, account: str) -> int:
-    """Everything that reached Immich and stayed there, across all runs."""
+    """Everything that reached Immich and stayed there, across all runs.
+
+    This counted only UPLOADED/VERIFIED/PURGED, which is STAGEABLE_STATUSES
+    exactly -- the set staging moves a row *out* of. So every photo staged for
+    deletion decremented the number the UI calls "in immich" and incremented
+    "staged", and a night that staged 499 photos displayed `in immich 0,
+    staged 499` for a library that plainly had 499 photos in it.
+    """
+    placeholders = ",".join("?" * len(IN_IMMICH_STATUSES))
     row = conn.execute(
-        "SELECT COUNT(*) c FROM assets WHERE account=? AND status IN (?,?,?)",
-        (account, UPLOADED, VERIFIED, PURGED),
+        f"SELECT COUNT(*) c FROM assets WHERE account=? AND status IN ({placeholders})",
+        (account, *IN_IMMICH_STATUSES),
     ).fetchone()
     return row["c"]
 
