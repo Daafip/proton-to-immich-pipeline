@@ -80,6 +80,14 @@ web:
   # From PIS_WEB_PASSWORD_HASH in .env.
   password_hash: ""
 
+# Home Assistant via MQTT discovery. Off unless enabled here.
+# host/port/username/password come from MQTT_* in .env (see .env.example);
+# values written here are used only when those are empty. The container
+# image ships paho-mqtt, so there is nothing to install.
+mqtt:
+  enabled: true
+  discovery_prefix: homeassistant
+
 # WHY THE FIRST ACCOUNT IS CALLED "default"
 #
 # An existing single-account install already has every row in its database

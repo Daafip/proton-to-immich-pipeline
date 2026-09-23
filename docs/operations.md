@@ -1163,6 +1163,17 @@ success, plus two `problem` binary sensors:
 `mqtt.host` defaults to `127.0.0.1`, which is the VM itself — point it at the
 broker (the Home Assistant host, if you run the Mosquitto add-on).
 
+**Where the broker settings go:**
+
+- **Docker:** `mqtt.enabled: true` in `config.yaml` (the `mqtt:` block in
+  `config.docker.yaml`), and the broker itself in `.env`:
+  `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`. Then
+  `docker compose up -d` so the containers pick up the new environment.
+  Inside a container `127.0.0.1` is the container, not the host.
+- **Bare metal:** the `mqtt:` block in `config.yaml` (see
+  `config.example.yaml`), or the same `MQTT_*` variables in the env file the
+  systemd unit loads. The environment wins over the file.
+
 ### Testing it
 
 ```bash

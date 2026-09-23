@@ -875,6 +875,13 @@ def apply_env(cfg: Config) -> None:
         cfg.set("staging.root", os.environ["PIS_STAGING_ROOT"])
     if os.environ.get("PIS_ACCOUNT"):
         cfg.set("account.name", os.environ["PIS_ACCOUNT"])
+    # MQTT: the broker password is a secret like the Immich key, and the
+    # host differs per deployment, so both can come from .env.
+    for var, dotted in (("MQTT_HOST", "mqtt.host"), ("MQTT_PORT", "mqtt.port"),
+                        ("MQTT_USERNAME", "mqtt.username"),
+                        ("MQTT_PASSWORD", "mqtt.password")):
+        if os.environ.get(var):
+            cfg.set(dotted, os.environ[var])
 
 
 def load(path: str | Path | None) -> Config:

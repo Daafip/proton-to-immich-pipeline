@@ -24,6 +24,7 @@ it instead of the agent.
 
 from __future__ import annotations
 
+import json
 import random
 import signal
 import subprocess
@@ -141,17 +142,20 @@ class Agent:
     def execute(self, argv: list[str]) -> tuple[int, str]:
         log.info("agent.exec", account=self.account, argv=" ".join(argv[-3:]))
         started = time.monotonic()
+        output = ""
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=self.timeout, check=False,
                                   cwd=str(ROOT))
             code = proc.returncode
+            output = f"{proc.stdout}\n{proc.stderr}"
             detail = log.condense(f"{proc.stderr}\n{proc.stdout}", 3000)
         except FileNotFoundError as exc:
             code, detail = 4, f"{argv[0]} not found: {exc}"
         except subprocess.TimeoutExpired:
             code, detail = 1, f"timed out after {self.timeout}s"
         seconds = round(time.monotonic() - started, 1)
+        _relay_report_lines(output)
         if code == 0:
             log.info("agent.done", account=self.account, exit_code=code,
                      seconds=seconds)
@@ -227,6 +231,29 @@ class Agent:
             conn.close()
         log.info("agent.stopped", account=self.account)
         return 0
+
+
+RELAYED_EVENTS = ("mqtt.", "report.")
+
+
+def _relay_report_lines(output: str) -> None:
+    """Re-print the child's MQTT and status lines as they were written.
+
+    The child's output is captured, and a clean run's is deliberately not
+    dumped into the log. That also swallowed `mqtt.published` and
+    `mqtt.publish_failed`, so in a container there was no way to tell from
+    `docker logs` whether anything reached the broker.
+    """
+    for line in output.splitlines():
+        try:
+            event = str(json.loads(line).get("event", ""))
+        except (ValueError, AttributeError):
+            # Text logs: "[warn] mqtt.publish_failed host=..."
+            parts = line.split(" ", 2)
+            event = parts[1] if len(parts) > 1 and line.startswith("[") else ""
+        if event.startswith(RELAYED_EVENTS):
+            warn = '"level": "warn"' in line or line.startswith("[warn]")
+            print(line, file=sys.stderr if warn else sys.stdout, flush=True)
 
 
 def run_agent(cfg, config_path: str | None = None) -> int:

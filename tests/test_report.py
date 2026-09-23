@@ -43,6 +43,9 @@ def make_paho(api_version_required: bool, fail_on: str | None = None):
         def wait_for_publish(self, timeout=None):
             return True
 
+        def is_published(self):
+            return fail_on != "puback"
+
     class Client:
         def __init__(self, callback_api_version=None, *a, **kw):
             if api_version_required and callback_api_version is None:
@@ -65,6 +68,9 @@ def make_paho(api_version_required: bool, fail_on: str | None = None):
 
         def loop_start(self):
             module.ORDER.append("loop_start")
+            # The broker's answer: 5 is "not authorised".
+            if fail_on != "no_connack":
+                self.on_connect(self, None, {}, 5 if fail_on == "refused" else 0)
 
         def publish(self, topic, payload, retain=False, qos=0):
             module.SENT.append((topic, payload, retain, qos))
@@ -185,6 +191,22 @@ class TestPahoVersions(ReportTest):
         failed = self.events_named("mqtt.transport_failed")
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0]["transport"], "paho-mqtt")
+
+    def test_a_refused_login_is_a_failure_not_a_success(self):
+        """connect() only opens the socket. A broker that answers CONNACK
+        "not authorised" used to drop every message while the pipeline
+        logged `mqtt.published`."""
+        self.install_paho(api_version_required=True, fail_on="refused")
+        self.assertFalse(self.publish())
+        self.assertFalse(self.events_named("mqtt.published"))
+        detail = self.events_named("mqtt.transport_failed")[0]["detail"]
+        self.assertIn("refused", detail)
+
+    def test_a_message_without_puback_is_a_failure(self):
+        self.install_paho(api_version_required=True, fail_on="puback")
+        self.assertFalse(self.publish())
+        self.assertIn("PUBACK",
+                      self.events_named("mqtt.transport_failed")[0]["detail"])
 
     def test_no_client_at_all_says_which_to_install(self):
         self.assertFalse(self.publish())

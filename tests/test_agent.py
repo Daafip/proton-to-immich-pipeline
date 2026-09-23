@@ -13,6 +13,7 @@ subprocess call is replaced so the tests stay fast and offline.
 import copy
 import sys
 import tempfile
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -245,6 +246,19 @@ class TestTakeJob(AgentTest):
         self.assertEqual(done[0][0], "info")
         self.assertNotIn("detail", done[0][1],
                          "do not dump a successful run's output every night")
+
+    def test_mqtt_lines_from_a_clean_run_reach_the_log(self):
+        """A clean run's output is not dumped, but whether MQTT published
+        is exactly what `docker logs` has to show."""
+        import contextlib
+        import io
+        published = json.dumps({"level": "info", "event": "mqtt.published"})
+        noise = json.dumps({"level": "info", "event": "transition"})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.run_for_real(0, f"{noise}\n{published}\n")
+        self.assertIn('"mqtt.published"', out.getvalue())
+        self.assertNotIn('"transition"', out.getvalue())
 
     def test_a_failing_run_is_recorded_not_swallowed(self):
         state.create_job(self.conns["david"], "david", "sync")

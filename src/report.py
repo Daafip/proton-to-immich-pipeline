@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -221,14 +222,35 @@ class MqttPublisher:
         api = getattr(mqtt, "CallbackAPIVersion", None)
         client = mqtt.Client(api.VERSION1) if api is not None else mqtt.Client()
 
+        # connect() only opens the TCP socket; the broker's verdict arrives
+        # later in CONNACK. Without waiting for it, a refused login (wrong
+        # password, ACL) dropped every message and still logged
+        # `mqtt.published` -- wait_for_publish() just times out quietly.
+        connack: dict[str, Any] = {}
+        connected = threading.Event()
+
+        def on_connect(_client, _userdata, _flags, rc, *_rest):
+            connack["rc"] = rc
+            connected.set()
+
+        client.on_connect = on_connect
         if self.username:
             client.username_pw_set(self.username, self.password)
         client.connect(self.host, self.port, keepalive=30)
         client.loop_start()
         try:
+            if not connected.wait(timeout=10):
+                raise RuntimeError("no CONNACK from the broker within 10s")
+            rc = connack["rc"]
+            if rc != 0:
+                describe = getattr(mqtt, "connack_string", None)
+                reason = describe(rc) if describe else f"rc={rc}"
+                raise RuntimeError(f"broker refused the connection: {reason}")
             for topic, payload in messages:
                 info = client.publish(topic, payload, retain=self.retain, qos=1)
                 info.wait_for_publish(timeout=10)
+                if not info.is_published():
+                    raise RuntimeError(f"no PUBACK for {topic!r} within 10s")
         finally:
             # disconnect *then* stop: the DISCONNECT packet is written by the
             # network loop, so stopping first leaves the broker seeing an

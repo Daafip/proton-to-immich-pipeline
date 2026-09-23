@@ -59,6 +59,11 @@ x-pipeline: &pipeline
     IMMICH_INSTANCE_URL: ${IMMICH_URL:-http://immich-server:2283/api}
     # Local time decides when agent.at fires.
     TZ: ${TZ:-Europe/Amsterdam}
+    # The broker, from .env. Empty means "use config.yaml".
+    MQTT_HOST: ${MQTT_HOST:-}
+    MQTT_PORT: ${MQTT_PORT:-}
+    MQTT_USERNAME: ${MQTT_USERNAME:-}
+    MQTT_PASSWORD: ${MQTT_PASSWORD:-}
   volumes:
     - ./config.yaml:/config/config.yaml:ro
     - ${PIS_STATE_DIR:-./state}:/state
