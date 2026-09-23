@@ -111,6 +111,24 @@ DEFAULTS: dict[str, Any] = {
         # Hardlink each batch into its own dir so a push only touches the rows
         # it selected. "ready" mounts staging/ready wholesale instead.
         "batch_mode": "hardlink",
+        # What to do when Immich recognises a file's checksum but the asset it
+        # matched is sitting in the TRASH.
+        #
+        # This is not "already present": the photo is not in the library, and
+        # re-uploading cannot fix it, because a trashed asset still owns its
+        # checksum and the upload is rejected as a duplicate. Restoring is the
+        # only route back.
+        #
+        #   true  -- restore it, then record the upload. The photo ends up in
+        #            the library, which is almost always what was meant.
+        #   false -- fail the asset with a clear error instead. Choose this if
+        #            Immich's trash is a deliberate "do not want these" pile:
+        #            reconcile then stages the Proton originals for deletion.
+        #
+        # Either way the asset is never recorded as uploaded while it is in
+        # the trash, which is what used to make the delete queue fill up with
+        # photos that had never been uploaded at all.
+        "restore_trashed_duplicates": True,
         # Ask Immich whether it already holds a file, using the sha1 Proton
         # reports at discovery, and skip downloading it if so. Saves an entire
         # transfer per already-imported file; off by default because Proton

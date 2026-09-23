@@ -291,6 +291,37 @@ class ImmichClient:
         log.debug("immich.trash_scanned", assets=len(seen))
         return list(seen.values())
 
+    def trashed_asset_ids(self, types: Sequence[str] = ("IMAGE", "VIDEO"),
+                          page_size: int = 250,
+                          max_pages: int = 400) -> set[str]:
+        """Just the ids of everything in the trash."""
+        return {str(a["id"]) for a in self.search_trashed(
+            types=types, page_size=page_size, max_pages=max_pages)
+            if a.get("id")}
+
+    def restore_from_trash(self, asset_ids: Sequence[str],
+                           chunk: int = 200) -> int:
+        """Bring assets back out of Immich's trash. Returns how many were sent.
+
+        Why this exists: Immich dedupes on checksum and a trashed asset still
+        owns its checksum, so re-uploading the same bytes is rejected as a
+        duplicate rather than putting the photo back. Restoring is the only
+        way to get it into the library again.
+
+        The endpoint is `POST /trash/restore/assets`, which has moved between
+        Immich versions. A failure here is reported, never swallowed: the
+        caller marks the asset failed rather than claiming an upload that did
+        not happen.
+        """
+        ids = [str(a) for a in asset_ids if a]
+        if not ids:
+            return 0
+        for start in range(0, len(ids), chunk):
+            batch = ids[start:start + chunk]
+            self._request("POST", "/trash/restore/assets", {"ids": batch})
+        log.info("immich.restored_from_trash", assets=len(ids))
+        return len(ids)
+
     def get_asset(self, asset_id: str) -> dict[str, Any] | None:
         try:
             return self._request("GET", f"/assets/{asset_id}")

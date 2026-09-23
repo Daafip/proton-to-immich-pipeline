@@ -196,6 +196,15 @@ mutation at all.
 
 ## 6. Untested corners of the v2 additions
 
+- **`POST /trash/restore/assets`.** `push` calls this when Immich recognises a
+  checksum but the matching asset is in the trash — without it the photo is
+  not in the library, and re-uploading cannot help, because the trashed asset
+  still owns the checksum. The endpoint has moved between Immich versions and
+  has not been exercised against a live server here. A failure is reported
+  (`push.restore_failed`) and the asset is failed rather than recorded as
+  uploaded, so the bad outcome is a stuck asset, not a phantom one.
+
+
 - **Immich's trash query.** `POST /search/metadata` with `isTrashed: true`,
   paginated by `page`/`nextPage`, one request per `type`. The field names and
   the pagination shape are read off the API, not observed. If they are wrong,

@@ -185,6 +185,104 @@ class TestReconcile(DeleteTest):
         self.assertEqual(len(pipeline.stats.aborted), 1)
         self.assertIn("reconcile", pipeline.stats.aborted[0])
 
+    def test_a_trashed_match_is_restored_and_really_uploaded(self):
+        """The bug this replaces: /assets/bulk-upload-check dedupes on
+        checksum and answers just as happily for an asset in the trash. The
+        row was recorded as uploaded, the photo was not in the library, and
+        reconcile then staged the Proton original for deletion -- all in one
+        run, on a trash entry that predated the pipeline.
+
+        Re-uploading cannot fix it either: a trashed asset still owns its
+        checksum, so the upload comes back as another duplicate. Restoring is
+        the only route into the library.
+        """
+        from tests.helpers import sha1_bytes
+        for i in range(3):
+            content = f"already-there-{i}".encode() * 10
+            self.backend.add(f"/Photos/OLD_{i}.jpg", content)
+            self.server.trash_asset(self.server.add(sha1_bytes(content)),
+                                    f"OLD_{i}.jpg")
+
+        pipeline = self.pipe(run_id="r1")
+        pipeline.run()
+
+        self.assertEqual(pipeline.stats.restored, 3)
+        self.assertEqual(pipeline.stats.uploaded, 3)
+        self.assertEqual(pipeline.stats.staged, 0,
+                         "nothing should be queued for deletion")
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0)
+        self.assertEqual(self.server.trash, {}, "they are back in the library")
+        # And the count people actually look at is no longer stuck at zero.
+        self.assertEqual(state.uploaded_total(self.conn, ACCOUNT), 3)
+
+    def test_without_restore_it_fails_rather_than_claiming_an_upload(self):
+        """`restore_trashed_duplicates: false` is for when the trash really is
+        a "do not want these" pile. The asset must still never be recorded as
+        uploaded while it is in the trash."""
+        from tests.helpers import sha1_bytes
+        self.cfg.set("immich.restore_trashed_duplicates", False)
+        content = b"already-there" * 10
+        self.backend.add("/Photos/OLD.jpg", content)
+        self.server.trash_asset(self.server.add(sha1_bytes(content)), "OLD.jpg")
+
+        pipeline = self.pipe(run_id="r1")
+        pipeline.run()
+
+        self.assertEqual(pipeline.stats.uploaded, 0)
+        self.assertEqual(pipeline.stats.restored, 0)
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        self.assertEqual(row["status"], state.FAILED)
+        self.assertIn("in the trash", row["last_error"])
+        self.assertEqual(state.uploaded_total(self.conn, ACCOUNT), 0)
+
+    def test_a_restore_failure_does_not_fake_an_upload(self):
+        """Older Immich versions move the endpoint. A failure has to surface,
+        not quietly become a successful-looking upload."""
+        from tests.helpers import sha1_bytes, FakeImmichClient
+        content = b"already-there" * 10
+        self.backend.add("/Photos/OLD.jpg", content)
+        self.server.trash_asset(self.server.add(sha1_bytes(content)), "OLD.jpg")
+
+        pipeline = self.pipe(run_id="r1", client=FakeImmichClient(
+            self.server, fail_restore=True))
+        pipeline.run()
+
+        self.assertEqual(pipeline.stats.uploaded, 0)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"],
+                         state.FAILED)
+
+    def test_a_live_duplicate_is_still_just_a_duplicate(self):
+        """An asset that is present and not trashed is a genuine duplicate --
+        no restore, no failure, no extra trash query cost beyond the one."""
+        from tests.helpers import sha1_bytes
+        content = b"genuinely-there" * 10
+        self.backend.add("/Photos/DUP.jpg", content)
+        self.server.add(sha1_bytes(content))          # present, NOT trashed
+
+        pipeline = self.pipe(run_id="r1")
+        pipeline.run()
+        self.assertEqual(pipeline.stats.duplicates, 1)
+        self.assertEqual(pipeline.stats.restored, 0)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"],
+                         state.PURGED)
+
+    def test_the_ordinary_case_does_not_warn(self):
+        """Uploaded by us, then trashed by a person: that is what the queue is
+        for, and it should stay quiet."""
+        from src import log
+        self.sync(2)
+        self.trash_in_immich("node-1")
+        events = []
+        original = log._emit
+        log._emit = lambda level, event, fields: events.append(
+            (level, event, fields))
+        try:
+            self.pipe(run_id="r2").reconcile()
+        finally:
+            log._emit = original
+        self.assertFalse([f for lvl, ev, f in events
+                          if ev == "reconcile.staged_without_uploading"])
+
     def test_dry_run_counts_but_writes_nothing(self):
         self.sync(2)
         self.trash_in_immich("node-1")
@@ -591,6 +689,46 @@ class TestUnstage(DeleteTest):
         row = state.staged_deletes(self.conn, ACCOUNT,
                                    states=(state.STAGE_FAILED,))[0]
         self.assertIn("simulated trash failure", row["error"])
+
+    def test_resync_sends_a_row_back_through_the_whole_pipeline(self):
+        """The recovery path for rows that were never really uploaded.
+
+        Plain unstage returns them to `purged`, which is terminal for the
+        puller -- nothing would ever retry them, and they would sit there
+        looking synced while absent from Immich.
+        """
+        self.sync(1)
+        self.trash_in_immich("node-1")
+        self.pipe(run_id="r2").reconcile()
+        ids = self.staged_ids()
+
+        self.assertEqual(state.unstage(self.conn, ACCOUNT, ids, resync=True), 1)
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        self.assertEqual(row["status"], state.DISCOVERED)
+        self.assertIsNone(row["immich_asset_id"], "forget what Immich matched")
+        self.assertIsNone(row["sha1"])
+        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0)
+
+        # And it genuinely goes round again, rather than being skipped.
+        pipeline = self.pipe(run_id="r3")
+        pipeline.pull()
+        pipeline.download()
+        self.assertEqual(pipeline.stats.downloaded, 1)
+
+    def test_plain_unstage_still_does_not_re_download(self):
+        """The other case: trashed in Immich by accident, restored there. The
+        asset is fine where it is and must not be fetched again."""
+        self.sync(1)
+        self.trash_in_immich("node-1")
+        self.pipe(run_id="r2").reconcile()
+        state.unstage(self.conn, ACCOUNT, self.staged_ids())
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"],
+                         state.PURGED)
+        pipeline = self.pipe(run_id="r3")
+        pipeline.pull()
+        pipeline.download()
+        self.assertEqual(pipeline.stats.downloaded, 0)
 
     def test_an_already_trashed_row_cannot_be_unstaged(self):
         self.cfg.set("delete.action", "execute")

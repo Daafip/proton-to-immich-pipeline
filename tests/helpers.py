@@ -177,12 +177,14 @@ class FakeImmichServer:
 
 class FakeImmichClient:
     def __init__(self, server: FakeImmichServer, fail_precheck: bool = False,
-                 fail_trash_search: bool = False):
+                 fail_trash_search: bool = False, fail_restore: bool = False):
         self.server = server
         self.fail_precheck = fail_precheck
         self.fail_trash_search = fail_trash_search
+        self.fail_restore = fail_restore
         self.uploaded: list[str] = []
         self.trash_queries: list[tuple] = []
+        self.restored: list[str] = []
 
     def ping(self) -> bool:
         return True
@@ -210,6 +212,26 @@ class FakeImmichClient:
         wanted = {str(t).upper() for t in types}
         return [dict(item) for item in self.server.trash.values()
                 if str(item.get("type", "IMAGE")).upper() in wanted]
+
+    def trashed_asset_ids(self, types=("IMAGE", "VIDEO"), page_size: int = 250,
+                          max_pages: int = 400) -> set:
+        from src.immich import ImmichError
+        self.trash_queries.append(tuple(types))
+        if self.fail_trash_search:
+            raise ImmichError("search/metadata unavailable")
+        return set(self.server.trash)
+
+    def restore_from_trash(self, asset_ids, chunk: int = 200) -> int:
+        """Restoring takes the asset back out of the trash, which is exactly
+        what makes the photo present in the library again."""
+        from src.immich import ImmichError
+        if self.fail_restore:
+            raise ImmichError("restore unavailable on this Immich version")
+        ids = [str(a) for a in asset_ids]
+        for asset_id in ids:
+            self.server.trash.pop(str(asset_id), None)
+        self.restored += ids
+        return len(ids)
 
     def find_by_checksum(self, sha1_hex: str, filename: str | None = None) -> UploadResult:
         asset_id = self.server.asset_id_for(sha1_hex)

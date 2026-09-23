@@ -203,7 +203,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_unstage = sub.add_parser(
         "unstage", parents=[common],
         help="take rows off the delete queue (restore them in Immich first)")
-    p_unstage.add_argument("ids", nargs="+", type=int)
+    p_unstage.add_argument("ids", nargs="*", type=int,
+                           help="staged row ids; omit with --all")
+    p_unstage.add_argument("--all", action="store_true",
+                           help="every row currently staged")
+    p_unstage.add_argument("--resync", action="store_true",
+                           help="send them back to `discovered` so the whole "
+                                "pipeline runs again, instead of back to "
+                                "`purged`. Use this for rows that were never "
+                                "really uploaded")
 
     # -- the web UI --------------------------------------------------------
     p_serve = sub.add_parser("serve", parents=[common],
@@ -507,9 +515,21 @@ def cmd_staged(cfg, conn, args) -> int:
 
 
 def cmd_unstage(cfg, conn, args) -> int:
-    count = state.unstage(conn, cfg.account_name, args.ids)
-    log.info("unstage.done", rows=count)
-    print(f"unstaged {count} row(s); they are ordinary completed assets again")
+    ids = list(args.ids)
+    if args.all:
+        ids = [int(r["id"]) for r in state.staged_deletes(
+            conn, cfg.account_name,
+            states=(state.STAGED, state.STAGE_FAILED))]
+    if not ids:
+        print("no rows selected; give ids or --all", file=sys.stderr)
+        return EXIT_PARTIAL
+    count = state.unstage(conn, cfg.account_name, ids, resync=args.resync)
+    log.info("unstage.done", rows=count, resync=args.resync)
+    if args.resync:
+        print(f"unstaged {count} row(s) and sent them back to `discovered`; "
+              f"the next run fetches and pushes them again")
+    else:
+        print(f"unstaged {count} row(s); they are ordinary completed assets again")
     return EXIT_OK
 
 

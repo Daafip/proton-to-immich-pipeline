@@ -560,6 +560,30 @@ trash, matches those asset ids against the rows this account uploaded, and
 records each match in `staged_deletes`. **It never calls a Proton mutation.**
 The only thing it can do is add to a list.
 
+> **A checksum match is not proof the photo is in the library.**
+> `/assets/bulk-upload-check` — the endpoint `push` uses to avoid re-sending
+> what is already there — answers on checksum alone and does not care that the
+> match is sitting in Immich's **trash**.
+>
+> Left alone, that means a photo this pipeline has never uploaded gets
+> recognised as present, recorded as an upload-duplicate, and staged for
+> deletion by the very next step — in a single run, on a trash entry that
+> predates the pipeline. The symptom is **`in immich` stuck at 0 while
+> `staged` climbs by `limits.max_files` every run**.
+>
+> `push` therefore checks the trash before believing a match:
+>
+> | `immich.restore_trashed_duplicates` | What happens |
+> |---|---|
+> | `true` (default) | The asset is **restored out of the trash**, then recorded as uploaded. The photo ends up in the library, which is almost always what was meant. |
+> | `false` | The asset is **failed** with a clear error. Choose this when Immich's trash is a deliberate "do not want these" pile. |
+>
+> Restoring, rather than re-uploading, because a trashed asset still owns its
+> checksum — sending the bytes again just produces another duplicate. Either
+> way the row is **never recorded as uploaded while the asset is in the
+> trash**, which is what used to fill the delete queue with photos that had
+> never been uploaded at all.
+
 ```bash
 python3 sync.py reconcile          # or just let `run` do it
 python3 sync.py staged             # what is waiting
@@ -598,7 +622,17 @@ python3 sync.py delete-staged                 # dry run, oldest batch_cap rows
 python3 sync.py delete-staged 14 15 --yes     # trash exactly those two
 python3 sync.py delete-staged --limit 5 --yes # the oldest five
 python3 sync.py unstage 14                    # take a row back off the queue
+python3 sync.py unstage --all --resync        # ...and sync them again properly
 ```
+
+`unstage` alone returns the asset to `purged` — right when the photo *is* in
+Immich and you trashed it by accident: restore it there, unstage here, and
+nothing is re-downloaded.
+
+`--resync` returns it to `discovered` instead, so the whole pipeline runs
+again. That is the recovery path for rows that were **never really uploaded**;
+`purged` is terminal for the puller, so those would otherwise sit there
+looking synced while absent from Immich.
 
 Every rule in that path exists because a mistake is a lost photo:
 
@@ -1450,6 +1484,10 @@ everything, restore the relevant file, and downgrade the code.
 | `mqtt.transport_failed`, then `mqtt.published` | Normal: the first transport was unavailable and the second worked. |
 | Nothing at all about MQTT in the journal | `mqtt.enabled` is false. `-v` shows `mqtt.disabled`. |
 | `Unsupported callback API version` | paho-mqtt 2.x with an older build of this pipeline. Fixed — both 1.x and 2.x are handled now. |
+| `staged` climbing by `limits.max_files` a run while `in immich` stays 0 | Every file is being matched to an asset in Immich's **trash** and queued for deletion instead of landing in the library. Fixed by `immich.restore_trashed_duplicates` (default `true`); to recover rows already queued, `sync.py unstage --all --resync`. |
+| `push.matched_trashed_assets` | Immich recognised these checksums but the assets are in its trash. With the default setting they are restored and the run continues; it is worth knowing how many. |
+| `push.restore_failed` | `POST /trash/restore/assets` was refused — the path has moved between Immich versions. The assets are failed rather than recorded as uploaded. Restore them in the Immich UI, then `sync.py requeue`. |
+| `reconcile.staged_without_uploading` | Photos were staged that this pipeline never uploaded. With the default settings this should no longer happen; if it does, check `sync.py staged` before executing anything. |
 | `Node not found: *` | A glob in `proton.roots`. The CLI takes a path, not a pattern, and nothing expands one — so it looks for a folder literally called `*`. Name the parent instead: **every root is walked recursively**, so `/my-files/Photos` already covers everything beneath it. The config check now refuses this up front. |
 | `agent.done` with a non-zero `exit_code` | The `detail` field on that same line carries the run's output — that is where the reason is. `exit 1` = some or all assets failed; `exit 2` = Proton session gone, run `login` again; `exit 3` = a run was already in progress; `exit 4` = config fault. |
 | "It runs, but nothing happens" | Run it in the foreground and watch: `docker compose run --rm <account> run`. Most often the Proton roots in `config.yaml` do not match the real folder names — `docker compose run --rm <account> pull --dry-run` reports zero discovered, and `proton-drive filesystem list /my-files` shows what is actually there. |

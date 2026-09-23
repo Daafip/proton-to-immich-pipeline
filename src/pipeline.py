@@ -53,6 +53,9 @@ class Stats:
     # v2: the delete queue. `staged` is what reconcile added this pass;
     # `trashed`/`delete_failed`/`delete_skipped` are what execute did.
     staged: int = 0
+    # Assets Immich recognised by checksum but held in its trash, brought back
+    # into the library rather than recorded as an upload that never happened.
+    restored: int = 0
     trashed: int = 0
     delete_failed: int = 0
     delete_skipped: int = 0
@@ -635,15 +638,43 @@ class Pipeline:
             log.warn("push.precheck_unavailable", detail=str(exc)[:200])
             known = {}
 
+        # A checksum match is not proof the photo is in the library: Immich
+        # dedupes on checksum and answers just as happily for an asset sitting
+        # in its trash. Recording that as an upload is what used to fill the
+        # delete queue with photos that had never been uploaded at all.
+        matched = {row["node_id"]: known[row["node_id"]].asset_id
+                   for row in rows
+                   if known.get(row["node_id"])
+                   and known[row["node_id"]].found
+                   and known[row["node_id"]].asset_id}
+        trashed, restored = self._resolve_trashed_matches(matched, dry)
+
         for row in rows:
             hit = known.get(row["node_id"])
             if hit and hit.found and hit.asset_id:
+                in_trash = hit.asset_id in trashed
+                if in_trash and hit.asset_id not in restored:
+                    # Not uploaded, and not restorable. Say so rather than
+                    # claim a success -- reconcile will then stage it, which
+                    # is the honest outcome when the trash is deliberate.
+                    if not dry:
+                        self._fail(row["node_id"], "upload",
+                                   f"immich already holds this checksum as "
+                                   f"asset {hit.asset_id}, but that asset is "
+                                   f"in the trash, so the photo is not in the "
+                                   f"library. Re-uploading cannot fix it (the "
+                                   f"checksum is taken); restore it in Immich, "
+                                   f"or set immich.restore_trashed_duplicates",
+                                   row["status"])
+                    continue
                 if dry:
-                    log.info("push.dry_run_duplicate", node_id=row["node_id"])
+                    log.info("push.dry_run_duplicate", node_id=row["node_id"],
+                             restored=in_trash)
                     continue
                 state.mark_uploaded(self.conn, self.account, row["node_id"], hit.asset_id, is_duplicate=True)
                 log.transition(row["node_id"], row["status"], state.UPLOADED,
-                               asset_id=hit.asset_id, duplicate=True)
+                               asset_id=hit.asset_id, duplicate=True,
+                               restored=in_trash)
                 self.stats.duplicates += 1
                 self.stats.uploaded += 1
             else:
@@ -676,6 +707,47 @@ class Pipeline:
         log.info("push.done", uploaded=self.stats.uploaded,
                  duplicates=self.stats.duplicates, failed=self.stats.failed)
         return self.stats
+
+    def _resolve_trashed_matches(self, matched: dict[str, str],
+                                 dry: bool) -> tuple[set[str], set[str]]:
+        """Work out which dedupe matches are in the trash, and revive them.
+
+        Returns (trashed asset ids, ids successfully restored). The trash is
+        queried only when there is at least one match to check, so the common
+        case -- a run of genuinely new files -- costs nothing.
+        """
+        if not matched:
+            return set(), set()
+        try:
+            trashed = self.client.trashed_asset_ids()
+        except ImmichAuthError as exc:
+            raise AuthFailure(f"immich: {exc}") from exc
+        except ImmichError as exc:
+            # Without the trash list every match looks live, which is the old
+            # behaviour. Say so; do not silently resume claiming uploads.
+            log.warn("push.trash_check_unavailable",
+                     detail=log.condense(str(exc), 300))
+            return set(), set()
+
+        hits = {asset for asset in matched.values() if asset in trashed}
+        if not hits:
+            return trashed, set()
+
+        log.info("push.matched_trashed_assets", assets=len(hits),
+                 detail="immich recognises these checksums but the assets are "
+                        "in its trash, so the photos are not in the library")
+        if dry or not self.cfg.get("immich.restore_trashed_duplicates", True):
+            return trashed, set()
+        try:
+            self.client.restore_from_trash(sorted(hits))
+        except ImmichAuthError as exc:
+            raise AuthFailure(f"immich: {exc}") from exc
+        except ImmichError as exc:
+            log.error("push.restore_failed", assets=len(hits),
+                      detail=log.condense(str(exc), 300))
+            return trashed, set()
+        self.stats.restored += len(hits)
+        return trashed, hits
 
     def _push_via_api(self, rows: list[sqlite3.Row]) -> None:
         breaker = self._breaker()
@@ -909,6 +981,7 @@ class Pipeline:
 
         by_asset = {str(a.get("id")): a for a in trashed if a.get("id")}
         rows = state.find_by_asset_ids(self.conn, self.account, list(by_asset))
+        never_uploaded = 0
         for asset_id, row in rows.items():
             if self.dry_run:
                 if row["status"] not in state.DELETE_STATUSES:
@@ -918,12 +991,38 @@ class Pipeline:
                 continue
             if state.stage_delete(self.conn, self.account, row):
                 self.stats.staged += 1
+                if row["is_duplicate"]:
+                    never_uploaded += 1
                 log.transition(row["node_id"], row["status"],
                                state.STAGED_FOR_DELETE, asset_id=asset_id,
                                path=row["remote_path"], reason="trashed in immich")
 
+        if never_uploaded:
+            # The surprising case, and the dangerous one at scale.
+            #
+            # /assets/bulk-upload-check dedupes on checksum and does not care
+            # whether the match is in the trash. So a photo this pipeline has
+            # never uploaded can be "recognised" as already present, marked
+            # uploaded-as-duplicate, and then staged for deletion by the very
+            # next step -- all in one run, on the strength of a trash entry
+            # that predates the pipeline entirely.
+            #
+            # That is a long way from "you deleted it in Immich, so delete it
+            # in Proton", which is what the queue is for. Staging still
+            # happens, because it may well be what was meant, but never
+            # silently.
+            log.warn(
+                "reconcile.staged_without_uploading",
+                account=self.account, assets=never_uploaded,
+                detail=("these were matched to assets ALREADY IN IMMICH'S "
+                        "TRASH by checksum -- this pipeline never uploaded "
+                        "them. Check `sync.py staged` before executing, and "
+                        "empty or restore Immich's trash if they should not "
+                        "be deleted from Proton"))
+
         log.info("reconcile.done", trashed_in_immich=len(by_asset),
                  matched=len(rows), staged=self.stats.staged,
+                 staged_without_uploading=never_uploaded,
                  total_staged=state.count_staged(self.conn, self.account),
                  dry_run=self.dry_run)
         return self.stats

@@ -870,21 +870,42 @@ def mark_delete_failed(conn: sqlite3.Connection, account: str, row: sqlite3.Row,
                     row["staged_at"], "failed", error=error, executed_at=now)
 
 
-def unstage(conn: sqlite3.Connection, account: str, ids: Sequence[int]) -> int:
-    """Take rows back off the queue and return the assets to `purged`.
+def unstage(conn: sqlite3.Connection, account: str, ids: Sequence[int],
+            resync: bool = False) -> int:
+    """Take rows back off the delete queue.
 
-    The escape hatch for a photo trashed in Immich by accident: restore it
-    there, then unstage here, and the next pull treats it as an ordinary
-    completed asset again rather than re-downloading it.
+    Two different situations, so two outcomes:
+
+    * default -- the asset goes back to `purged`. This is the escape hatch for
+      a photo trashed in Immich by accident: restore it there, unstage here,
+      and the next pull treats it as an ordinary completed asset rather than
+      downloading it all over again.
+
+    * `resync=True` -- the asset goes back to `discovered`, so the pipeline
+      fetches and pushes it from scratch. This is the recovery path for rows
+      that were never really uploaded: Immich recognised their checksum
+      against an asset already in its trash, recorded a duplicate, and
+      reconcile staged the Proton original. Sending those back to `purged`
+      would strand them, because `purged` is terminal for the puller and
+      nothing would ever retry them.
     """
     rows = get_staged(conn, account, ids)
     count = 0
+    now = utcnow()
     for row in rows:
         if row["state"] not in (STAGED, STAGE_FAILED):
             continue
         conn.execute("UPDATE staged_deletes SET state=? WHERE id=?",
                      (STAGE_CANCELLED, int(row["id"])))
-        _set_status(conn, account, row["node_id"], PURGED, local_path=None)
+        if resync:
+            # Clear everything the previous pass concluded: the local file is
+            # long reaped, and the asset id points at whatever Immich matched.
+            _set_status(conn, account, row["node_id"], DISCOVERED,
+                        local_path=None, sha1=None, immich_asset_id=None,
+                        immich_checksum=None, is_duplicate=0, attempts=0,
+                        last_error=None, last_attempt=now)
+        else:
+            _set_status(conn, account, row["node_id"], PURGED, local_path=None)
         count += 1
     conn.commit()
     return count
