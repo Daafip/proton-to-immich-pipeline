@@ -249,3 +249,92 @@ class TestBulkUploadCheck(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The trash query, and what happens when the server does not honour it
+#
+# `reconcile` turns this list into "delete the Proton original", so a wrong
+# answer here deletes photos. The failure is not hypothetical: `isTrashed` is
+# an unknown property on some Immich versions, validation strips unknown keys
+# rather than rejecting the request, and `withDeleted: True` then widens what
+# is left to the entire library.
+# ---------------------------------------------------------------------------
+
+class TestSearchTrashed(unittest.TestCase):
+    def build(self, pages):
+        """`pages` is a list of item-lists, served in order."""
+        client = immich.ImmichClient(cfg_with())
+        self.bodies = []
+        served = list(pages)
+
+        def responder(method, path, body=None, **kw):
+            self.bodies.append(body)
+            items = served.pop(0) if served else []
+            return {"assets": {"items": items, "nextPage": None}}
+
+        client._request = responder
+        return client
+
+    @staticmethod
+    def trashed(asset_id, **extra):
+        item = {"id": asset_id, "isTrashed": True, "type": "IMAGE"}
+        item.update(extra)
+        return item
+
+    def test_it_asks_for_trashed_assets(self):
+        client = self.build([[]])
+        client.search_trashed(types=("IMAGE",))
+        self.assertIs(self.bodies[0]["isTrashed"], True)
+        self.assertIs(self.bodies[0]["withDeleted"], True)
+
+    def test_trashed_assets_come_back(self):
+        client = self.build([[self.trashed("a"), self.trashed("b")]])
+        out = client.search_trashed(types=("IMAGE",))
+        self.assertEqual({a["id"] for a in out}, {"a", "b"})
+        self.assertTrue(client.trash_filter_verified)
+
+    def test_deletedat_counts_as_trashed(self):
+        """Not every version reports isTrashed."""
+        client = self.build([[{"id": "a", "deletedAt": "2026-09-01T00:00:00Z"}]])
+        self.assertEqual(len(client.search_trashed(types=("IMAGE",))), 1)
+
+    def test_a_status_field_counts_too(self):
+        client = self.build([[{"id": "a", "status": "trashed"}]])
+        self.assertEqual(len(client.search_trashed(types=("IMAGE",))), 1)
+
+    def test_a_library_returned_as_a_trash_list_is_refused(self):
+        """The bug this exists for. If `isTrashed` is ignored the server
+        answers with every asset it has, and reconcile would stage the lot --
+        every photo in the library queued for deletion from Proton."""
+        library = [{"id": f"asset-{i}", "isTrashed": False} for i in range(500)]
+        client = self.build([library])
+
+        out = client.search_trashed(types=("IMAGE",))
+
+        self.assertEqual(out, [], "staging nothing beats staging everything")
+        self.assertFalse(client.trash_filter_verified)
+
+    def test_assets_with_no_trash_marker_at_all_are_refused(self):
+        """Absence of evidence is not evidence of trashing."""
+        client = self.build([[{"id": "a"}, {"id": "b"}]])
+        self.assertEqual(client.search_trashed(types=("IMAGE",)), [])
+        self.assertFalse(client.trash_filter_verified)
+
+    def test_a_partly_honoured_filter_keeps_only_the_trashed_ones(self):
+        client = self.build([[self.trashed("a"), {"id": "b", "isTrashed": False}]])
+        out = client.search_trashed(types=("IMAGE",))
+        self.assertEqual([a["id"] for a in out], ["a"])
+        self.assertTrue(client.trash_filter_verified,
+                        "the filter clearly did something")
+
+    def test_an_empty_trash_is_not_a_refusal(self):
+        client = self.build([[]])
+        self.assertEqual(client.search_trashed(types=("IMAGE",)), [])
+        self.assertTrue(client.trash_filter_verified)
+
+    def test_trashed_asset_ids_inherits_the_verification(self):
+        library = [{"id": f"asset-{i}", "isTrashed": False} for i in range(10)]
+        client = self.build([library])
+        self.assertEqual(client.trashed_asset_ids(types=("IMAGE",)), set())
+

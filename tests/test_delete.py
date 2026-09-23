@@ -474,6 +474,97 @@ class TestCancelRestored(DeleteTest):
         self.assertEqual(self.client.asset_lookups, [])
 
 
+class TestServerIgnoresTheTrashFilter(DeleteTest):
+    """The reported symptom: `in immich 1,500 / staged 1,500` — every single
+    photo that reached Immich queued for deletion from Proton, while the
+    photos are plainly in the library and not in Immich's trash.
+
+    `reconcile` asks /search/metadata for `isTrashed: true`. An Immich that
+    does not know that property strips it instead of rejecting the request,
+    and `withDeleted: true` widens what remains to the whole library. Every
+    asset then looks trashed.
+    """
+    def ignoring_client(self):
+        return FakeImmichClient(self.server, ignores_trash_filter=True)
+
+    def test_the_whole_library_is_not_staged(self):
+        self.sync(5)
+        self.assertEqual(state.uploaded_total(self.conn, ACCOUNT), 5)
+
+        pipeline = self.pipe(run_id="r2", client=self.ignoring_client())
+        pipeline.reconcile()
+
+        self.assertEqual(pipeline.stats.staged, 0)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0)
+        self.assertEqual(state.uploaded_total(self.conn, ACCOUNT), 5)
+
+    def test_a_genuinely_trashed_photo_is_still_staged(self):
+        """Refusing must not become "the delete queue never works again": as
+        soon as one asset really is trashed, the filter has demonstrably done
+        something and the trashed ones are usable."""
+        self.sync(5)
+        self.trash_in_immich("node-1")
+
+        pipeline = self.pipe(run_id="r2", client=self.ignoring_client())
+        pipeline.reconcile()
+
+        self.assertEqual(pipeline.stats.staged, 1)
+        self.assertEqual([r["node_id"] for r in self.staged_rows()], ["node-1"])
+
+    def test_push_does_not_fake_restores_for_live_assets(self):
+        """`push` reads the same list. Every dedupe match would look trashed,
+        so it would "restore" live assets and count them as rescued."""
+        self.sync(3)
+        for i in range(3):
+            self.backend.add(f"/Photos/copy_{i}.jpg", f"content-{i}".encode() * 10)
+
+        pipeline = self.pipe(run_id="r2", client=self.ignoring_client())
+        pipeline.run()
+
+        self.assertEqual(pipeline.stats.restored, 0)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0)
+
+
+class TestRestoreIsVerified(DeleteTest):
+    def test_a_restore_that_does_nothing_is_not_an_upload(self):
+        """Immich answers 200 and leaves the asset in the trash. Trusting that
+        records an upload that never happened, and reconcile then stages the
+        Proton original on the very next step."""
+        from tests.helpers import sha1_bytes
+
+        class SilentlyIneffective(FakeImmichClient):
+            def restore_from_trash(self, asset_ids, chunk: int = 200):
+                self.restored += [str(a) for a in asset_ids]
+                return len(list(asset_ids))          # 200 OK, nothing moved
+
+        content = b"already-there" * 10
+        self.backend.add("/Photos/OLD.jpg", content)
+        self.server.trash_asset(self.server.add(sha1_bytes(content)), "OLD.jpg")
+
+        pipeline = self.pipe(run_id="r1", client=SilentlyIneffective(self.server))
+        pipeline.run()
+
+        self.assertEqual(pipeline.stats.restored, 0)
+        self.assertEqual(pipeline.stats.uploaded, 0)
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        self.assertEqual(row["status"], state.FAILED)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0,
+                         "never staged on the strength of a phantom upload")
+
+    def test_a_restore_that_works_still_counts(self):
+        from tests.helpers import sha1_bytes
+        content = b"already-there" * 10
+        self.backend.add("/Photos/OLD.jpg", content)
+        self.server.trash_asset(self.server.add(sha1_bytes(content)), "OLD.jpg")
+
+        pipeline = self.pipe(run_id="r1")
+        pipeline.run()
+
+        self.assertEqual(pipeline.stats.restored, 1)
+        self.assertEqual(pipeline.stats.uploaded, 1)
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 0)
+
+
 class TestInImmichCount(DeleteTest):
     def test_staging_does_not_empty_the_in_immich_count(self):
         """`uploaded_total` counted exactly the statuses staging moves a row

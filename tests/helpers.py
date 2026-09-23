@@ -191,12 +191,15 @@ class FakeImmichServer:
 class FakeImmichClient:
     def __init__(self, server: FakeImmichServer, fail_precheck: bool = False,
                  fail_trash_search: bool = False, fail_restore: bool = False,
-                 fail_asset_lookup: bool = False):
+                 fail_asset_lookup: bool = False,
+                 ignores_trash_filter: bool = False):
         self.server = server
         self.fail_precheck = fail_precheck
         self.fail_trash_search = fail_trash_search
         self.fail_restore = fail_restore
         self.fail_asset_lookup = fail_asset_lookup
+        self.ignores_trash_filter = ignores_trash_filter
+        self.trash_filter_verified = True
         self.asset_lookups: list[str] = []
         self.uploaded: list[str] = []
         self.trash_queries: list[tuple] = []
@@ -224,21 +227,30 @@ class FakeImmichClient:
 
     def search_trashed(self, types=("IMAGE", "VIDEO"), page_size: int = 250,
                        max_pages: int = 400) -> list[dict[str, Any]]:
-        from src.immich import ImmichError
+        """Goes through the real filtering, so a server that ignores
+        `isTrashed` is modelled end to end rather than assumed away."""
+        from src.immich import ImmichError, looks_trashed
         self.trash_queries.append(tuple(types))
         if self.fail_trash_search:
             raise ImmichError("search/metadata unavailable")
         wanted = {str(t).upper() for t in types}
-        return [dict(item) for item in self.server.trash.values()
-                if str(item.get("type", "IMAGE")).upper() in wanted]
+        items = [dict(item) for item in self.server.trash.values()
+                 if str(item.get("type", "IMAGE")).upper() in wanted]
+        if self.ignores_trash_filter:
+            # What an Immich that does not know the property actually does:
+            # strips it, answers the rest, and hands back the whole library.
+            items += [{"id": asset_id, "type": "IMAGE", "isTrashed": False}
+                      for asset_id in self.server.by_checksum.values()
+                      if asset_id not in self.server.trash]
+        trashed = [a for a in items if looks_trashed(a)]
+        self.trash_filter_verified = bool(trashed) or not items
+        return trashed if self.trash_filter_verified else []
 
     def trashed_asset_ids(self, types=("IMAGE", "VIDEO"), page_size: int = 250,
                           max_pages: int = 400) -> set:
-        from src.immich import ImmichError
-        self.trash_queries.append(tuple(types))
-        if self.fail_trash_search:
-            raise ImmichError("search/metadata unavailable")
-        return set(self.server.trash)
+        return {str(a["id"]) for a in self.search_trashed(
+            types=types, page_size=page_size, max_pages=max_pages)
+            if a.get("id")}
 
     def asset_state(self, asset_id: str) -> str:
         from src.immich import ImmichError

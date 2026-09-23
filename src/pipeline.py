@@ -750,8 +750,30 @@ class Pipeline:
             log.error("push.restore_failed", assets=len(hits),
                       detail=log.condense(str(exc), 300))
             return trashed, set()
-        self.stats.restored += len(hits)
-        return trashed, hits
+
+        # A 200 is not proof. Ask again: the photo is only in the library if
+        # the asset has actually left the trash, and recording an upload that
+        # did not happen is what fills the delete queue with photos nobody
+        # deleted.
+        try:
+            trashed = self.client.trashed_asset_ids()
+        except ImmichAuthError as exc:
+            raise AuthFailure(f"immich: {exc}") from exc
+        except ImmichError as exc:
+            log.warn("push.restore_unverified", assets=len(hits),
+                     detail=log.condense(str(exc), 300))
+            return trashed, set()
+
+        restored = {asset for asset in hits if asset not in trashed}
+        refused = hits - restored
+        if refused:
+            log.error(
+                "push.restore_ineffective", assets=len(refused),
+                detail=("immich accepted the restore and left these in the "
+                        "trash. They are failed rather than recorded as "
+                        "uploaded; restore them in the Immich UI and requeue"))
+        self.stats.restored += len(restored)
+        return trashed, restored
 
     def _push_via_api(self, rows: list[sqlite3.Row]) -> None:
         breaker = self._breaker()

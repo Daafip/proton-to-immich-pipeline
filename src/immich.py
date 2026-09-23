@@ -99,6 +99,20 @@ def _api_key(cfg) -> str:
     return str(cfg.get("immich.api_key", ""))
 
 
+def looks_trashed(asset: dict[str, Any]) -> bool:
+    """Does this asset, as Immich describes it, claim to be in the trash?
+
+    Checked against every asset a trash search returns, because the search
+    filter cannot be trusted to have been applied -- see `search_trashed`.
+    Three spellings across versions; any one of them is enough.
+    """
+    if asset.get("isTrashed") is True:
+        return True
+    if asset.get("deletedAt"):
+        return True
+    return str(asset.get("status", "")).strip().lower() in ("trashed", "deleted")
+
+
 @dataclass
 class UploadResult:
     asset_id: str | None = None
@@ -131,6 +145,9 @@ class ImmichClient:
         # so the list returned is a prefix of the trash rather than all of it.
         # Callers that reason about *absence* from the trash must check this.
         self.trash_scan_complete = True
+        # False when a trash search came back with nothing trashed in it, i.e.
+        # the server ignored the filter. Never act on such a result.
+        self.trash_filter_verified = True
 
     # -- transport ---------------------------------------------------------
     def _request(
@@ -270,6 +287,17 @@ class ImmichClient:
         Pagination is by `page`, and the server reports `nextPage` as a string
         or null. max_pages is a stop so a server that always returns a
         nextPage cannot loop against the API all night.
+
+        **Every returned asset is re-checked against `looks_trashed` and
+        anything that does not claim to be trashed is dropped.** The filter
+        this relies on is `isTrashed`, and an Immich that does not know that
+        property does not reject the request -- validation strips the unknown
+        key and answers the query that is left, which `withDeleted: True`
+        widens to *every asset of this type, deleted or not*. The caller then
+        stages the entire library for deletion, which is the worst thing this
+        program can do. So the answer is verified rather than trusted, and a
+        listing that comes back with nothing trashed in it at all is discarded
+        outright: staging nothing is recoverable, staging everything is not.
         """
         seen: dict[str, dict[str, Any]] = {}
         self.trash_scan_complete = True
@@ -302,8 +330,30 @@ class ImmichClient:
                 self.trash_scan_complete = False
                 log.warn("immich.trash_pagination_capped", type=asset_type,
                          pages=max_pages)
-        log.debug("immich.trash_scanned", assets=len(seen))
-        return list(seen.values())
+
+        trashed = [a for a in seen.values() if looks_trashed(a)]
+        ignored = len(seen) - len(trashed)
+        if ignored and not trashed:
+            # Not one of them is trashed: the filter was not applied at all,
+            # and this is the whole library. Refusing is the only safe answer.
+            self.trash_filter_verified = False
+            self.trash_scan_complete = False
+            log.error(
+                "immich.trash_filter_ignored", returned=len(seen), trashed=0,
+                detail=("/search/metadata answered a trash query with assets "
+                        "that are not trashed, so `isTrashed` was ignored by "
+                        "this Immich version and the result is the whole "
+                        "library. Nothing will be staged for deletion until "
+                        "this is fixed -- see docs/known-issues.md"))
+            return []
+        self.trash_filter_verified = True
+        if ignored:
+            log.warn("immich.trash_filter_partial", returned=len(seen),
+                     trashed=len(trashed), dropped=ignored,
+                     detail="assets came back that are not in the trash; "
+                            "they were dropped rather than staged")
+        log.debug("immich.trash_scanned", assets=len(trashed))
+        return trashed
 
     def trashed_asset_ids(self, types: Sequence[str] = ("IMAGE", "VIDEO"),
                           page_size: int = 250,

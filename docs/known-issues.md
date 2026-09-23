@@ -196,8 +196,10 @@ mutation at all.
 
 ## 6. Untested corners of the v2 additions
 
-- **`POST /trash/restore/assets`.** `push` calls this when Immich recognises a
-  checksum but the matching asset is in the trash — without it the photo is
+- **`POST /trash/restore/assets`.** Verified by re-reading the trash
+  afterwards rather than trusting the response, because a 200 that restores
+  nothing would otherwise be recorded as a successful upload. `push` calls
+  this when Immich recognises a checksum but the matching asset is in the trash — without it the photo is
   not in the library, and re-uploading cannot help, because the trashed asset
   still owns the checksum. The endpoint has moved between Immich versions and
   has not been exercised against a live server here. A failure is reported
@@ -216,11 +218,24 @@ mutation at all.
   `reconcile.cancel_kept` with a high `unverifiable` count.
 
 - **Immich's trash query.** `POST /search/metadata` with `isTrashed: true`,
-  paginated by `page`/`nextPage`, one request per `type`. The field names and
-  the pagination shape are read off the API, not observed. If they are wrong,
-  `reconcile` finds nothing and logs `reconcile.unavailable` or simply reports
-  zero — a quiet failure, so check `staged_deletes` after deliberately
-  trashing something.
+  paginated by `page`/`nextPage`, one request per `type`. The pagination shape
+  is read off the API, not observed.
+
+  **`isTrashed` is not honoured by every Immich version, and the failure is
+  silent and destructive.** An unknown property is stripped by validation
+  rather than rejected, so the request still succeeds — and `withDeleted:
+  true` widens what is left to *every asset of that type*. `reconcile` then
+  reads the whole library as "the trash" and stages every photo for deletion
+  from Proton. Observed in the field as `in immich 1,500 / staged 1,500` with
+  Immich's trash visibly empty.
+
+  Every returned asset is now re-checked against `isTrashed` / `deletedAt` /
+  `status` and dropped if it does not claim to be trashed; a listing with
+  nothing trashed in it is discarded entirely and logged as
+  `immich.trash_filter_ignored`. Staging nothing is recoverable, staging
+  everything is not. The delete queue is simply inert on such a server —
+  which is the right trade, but it does mean "trash it in Immich, it goes
+  from Proton" will not work there until the query is fixed.
 - **The `systemd` job runner.** `systemctl start` on a `Type=oneshot` unit is
   expected to block until the unit finishes and exit with its status, which is
   what the worker relies on. Untested here, and it needs the sudoers entry.
