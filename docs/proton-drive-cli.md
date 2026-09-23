@@ -52,7 +52,7 @@ Four things follow from that signature:
   downloads into its own empty scratch folder; belt-and-braces, the CLI runs
   with stdin on `/dev/null` so no prompt can hang a run.
 - **`download` accepts multiple paths per call.** Not yet exploited — see
-  [known-issues.md](known-issues.md#1-backfill-throughput).
+  [known-issues.md](known-issues.md#1-backfill-throughput--fixed-but-unverified-against-real-proton).
 - **`list` has no recursive flag**, so discovery is a breadth-first walk,
   depth-capped by `proton.max_depth`.
 
@@ -170,7 +170,8 @@ needed**. The CLI's own help says so: *"you can use different device to sign
 in"*.
 
 `sync.py login` reads that URL and serves it as a redirect on a LAN port so a
-phone can reach it — see [operations.md](operations.md#signing-in).
+phone can reach it — see [bare-metal.md](bare-metal.md#signing-in), or
+`docker compose run --rm <pipeline> login`.
 
 ### Detecting an expired session
 

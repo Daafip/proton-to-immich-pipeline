@@ -1,15 +1,14 @@
 # Running it
 
-Two ways to install it. Pick one:
+Docker: one container per pipeline plus one for the UI, a build and an `up`.
+It is the recommended install and the only sane way to run more than one
+pipeline.
 
-| | |
-|---|---|
-| **[Docker](#install-with-docker)** | One container per pipeline plus one for the UI. A build and an `up`. **Recommended**, and the only sane way to run two pipelines. |
-| **[By hand](#install-without-docker)** | A service account, the CLI binary, systemd units, env files. More steps, no daemon. |
-
-Everything after the install — signing in, the phases, the delete queue, the
-web UI, the backfill, migrations — is the same either way; only the command
-prefix differs.
+Installing **without Docker** — a service account, the CLI binary, an env file
+and systemd units — is a separate page:
+**[bare-metal.md](bare-metal.md)**. Everything on *this* page applies either
+way; only the command prefix differs, and that page opens with the
+translation table.
 
 ---
 
@@ -140,7 +139,8 @@ the host — the containers do not run as root.
 
 `docker compose run --rm <pipeline> login` prints a link; open it on any
 device. There is no loopback callback, so nothing needs forwarding — see
-[Signing in](#signing-in) for what that flow actually does.
+[bare-metal.md → Signing in](bare-metal.md#signing-in) for what that flow
+actually does.
 
 ### Where the secrets live
 
@@ -238,6 +238,28 @@ schedule, `agent.at`) and force-sync (the UI queues it, the agent runs it).
 the affected container is the whole update loop. `docker compose up -d` after
 a `git pull` + `docker compose build` is the whole upgrade loop.
 
+### Work through the phases
+
+Before trusting the nightly schedule, drive each phase by hand once and check
+it before moving on:
+
+```bash
+docker compose run --rm david pull --dry-run   # counts only, writes nothing
+docker compose run --rm david pull             # a second run must report zero new
+docker compose run --rm david download --limit 20
+docker compose run --rm david push
+docker compose run --rm david verify
+docker compose run --rm david reconcile        # stages nothing unless Immich's
+docker compose run --rm david status           # trash holds something of yours
+```
+
+After `push`, the 20 files should appear in the Immich UI *and* under
+`/mnt/immich/data/library/<user>/...` — the storage template is on, so that
+tree is human-readable; use it.
+
+Nothing else to hand over afterwards: each pipeline container is already
+running its own `agent`, so the nightly run starts at `agent.at` on its own.
+
 ### What the container layout fixes for free
 
 | Bare metal | Container |
@@ -265,16 +287,28 @@ Both pipelines join the Immich stack's docker network by name — `IMMICH_NETWOR
 in `.env`, which `docker network ls` will tell you. It is declared
 `external: true`, so a wrong name fails at `up` rather than at 03:15.
 
-`IMMICH_URL` is shared; `DAVID_IMMICH_API_KEY` and `MIRJAM_IMMICH_API_KEY` are
-not. Each key comes from that person's own Immich user (their Account Settings
-→ API Keys), and that is what keeps the two libraries apart.
+`IMMICH_URL` is shared; the **keys are not**. Each one is a file,
+`secrets/<account>.key`, taken from that person's own Immich user (their
+Account Settings → API Keys), and that is what keeps the two libraries apart.
+There is deliberately no `DAVID_IMMICH_API_KEY`-style variable per person —
+see [Where the secrets live](#where-the-secrets-live).
 
 If Immich is published on the host instead, delete the `networks:` blocks and
 point `IMMICH_URL` at the host address.
 
-For two separate Immich instances: set `DAVID_IMMICH_URL` /
-`MIRJAM_IMMICH_URL` in `.env` — they override the shared one per pipeline —
-and add a second external network.
+Someone on a **different Immich instance** overrides the shared URL in their
+own service block, which is one line:
+
+```yaml
+  bob:
+    <<: *pipeline
+    environment:
+      <<: *pipeline-env
+      PIS_ACCOUNT: bob
+      IMMICH_INSTANCE_URL: http://other-immich:2283/api
+```
+
+and gets a second `external:` network if that instance is on one.
 
 ### Pinning the CLI
 
@@ -292,215 +326,14 @@ A mismatch fails the build rather than the first run — the Dockerfile runs
 
 ---
 
----
-
-## Install without Docker
-
-The same thing by hand. Skip this entirely if you used Docker above.
-
-More to install, and the pieces the container layout gets for free have to be
-done yourself — but it keeps the single-binary, no-daemon shape, and it is the
-right choice if you are running exactly one pipeline and already have systemd
-timers you like.
-
-### On the VM
-
-The unit runs as an unprivileged service account of its own. **The Immich
-docker stack does not create a host user**, so make one — it owns staging and
-nothing else:
-
-```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin protonsync
-sudo install -d -o protonsync -g protonsync /mnt/immich/staging
-```
-
-Any existing account does just as well: point `User=`/`Group=` in the unit at
-whoever owns `/mnt/immich/staging`. `immich.upload_mode: cli` additionally
-needs the docker socket (`sudo usermod -aG docker protonsync`), which is
-root-equivalent on that host — `upload_mode: api` avoids it entirely.
-
-```bash
-sudo install -d -o protonsync -g protonsync /opt/proton-to-immich-pipeline
-sudo cp -r sync.py src systemd config.example.yaml /opt/proton-to-immich-pipeline/
-
-sudo install -d /etc/proton-to-immich-pipeline
-sudo cp config.example.yaml /etc/proton-to-immich-pipeline/config.yaml
-sudo cp systemd/proton-to-immich-pipeline-env.example /etc/proton-to-immich-pipeline/env
-sudo chown root:protonsync /etc/proton-to-immich-pipeline/env
-sudo chmod 640 /etc/proton-to-immich-pipeline/env      # holds IMMICH_API_KEY
-```
-
-PyYAML is used if present but is **not required** — a built-in parser handles
-the config format. No other dependencies. For MQTT you want
-`apt install mosquitto-clients` (or `paho-mqtt`); without either, reporting
-degrades to writing `status.json` only.
-
-Install the Proton CLI from
-[proton.me/download/drive/cli](https://proton.me/download/drive/cli/index.html).
-Run `grep avx2 /proc/cpuinfo` first and take the
-[`linux/x64-baseline`](https://proton.me/download/drive/cli/0.8.0/linux-x64/proton-drive)
-build if that comes back empty. **0.8.0 is the version this was run against:**
-
-```bash
-sudo wget -O /usr/bin/proton-drive \
-  https://proton.me/download/drive/cli/0.8.0/linux-x64/proton-drive
-sudo chmod 755 /usr/bin/proton-drive   # wget leaves it 644 -- exec fails even for root
-proton-drive --version
-```
-
-Flags are not stable between CLI releases; 0.6.0 and 0.8.0 already disagree.
-[proton-drive-cli.md](proton-drive-cli.md) records the differences and how the
-backend absorbs them.
-
-With `upload_mode: cli`, pulling the uploader image once keeps it out of the
-first push, where a registry failure is reported as an upload failure:
-
-```bash
-sudo -u protonsync docker pull ghcr.io/immich-app/immich-cli:latest
-```
-
-Get the Immich API key from **Account Settings → API Keys** and put it in
-`/etc/proton-to-immich-pipeline/env`. Keep it out of `config.yaml`.
-
----
-
-### Configure
-
-Everything in `config.example.yaml` is optional; omitted keys fall back to the
-defaults in `src/config.py`. The three you must set:
-
-```yaml
-proton:
-  roots: ["/my-files/Photos"]    # a list; each entry is walked recursively
-immich:
-  url: http://<vm-ip>:2283/api   # the /api suffix is mandatory
-  api_key: ""                    # leave empty; use IMMICH_API_KEY instead
-```
-
-Worth a look before the first real run:
-
-| Key | Why |
-|---|---|
-| `immich.album_strategy` | `flat` (one `album_name`), `folder` (album per source folder) or `none`. **Decide before the first push** — changing it later means re-tagging. |
-| `reap.keep_days` | How long verified originals linger in staging. Starts at 7; set to 0 once you trust it. |
-| `limits.max_files` / `max_bytes` | Per-run caps. Staging shares the SSD with Immich. |
-| `staging.min_free_gb` | Hard floor; downloads abort below it. |
-| `immich.upload_mode` | `cli` runs the immich-cli container (needs the service account in the `docker` group); `api` uploads over REST with no Docker. A loopback `immich.url` works in both: the container is run with `--network host`. |
-| `immich.precheck_claimed_digests` | See [below](#skipping-what-immich-already-has). |
-
-Finding the right `roots` is covered in
-[proton-drive-cli.md](proton-drive-cli.md#paths).
-
----
-
-### Signing in
-
-There is no loopback callback and no port to forward — the CLI polls Proton
-while you sign in on whatever device you like. The only real problem is getting
-a 200-character URL onto a phone, which `sync.py login` solves by serving it as
-a redirect on a LAN port.
-
-Run it **as the service account** — the Proton session is written into
-`staging/.proton` at mode 700, and the timer has to be able to read it back:
-
-```bash
-sudo -u protonsync bash                  # nologin shell, so name bash explicitly
-export PIS_CONFIG=/etc/proton-to-immich-pipeline/config.yaml
-
-python3 sync.py login                    # port 8399, binds 0.0.0.0
-python3 sync.py login --port 9000        # any port, just not Immich's 2283
-python3 sync.py login --bind 127.0.0.1   # local only
-python3 sync.py login --no-serve         # just print the URL
-```
-
-```
-  Open this on the device you want to sign in with:
-
-      http://192.168.68.52:8399/          <-- phone-friendly
-      http://localhost:8399/
-```
-
-Open it on the phone and it redirects to Proton; if `qrencode` is installed a
-scannable QR is printed too. The command waits for the sign-in and reports the
-result.
-
-Two caveats: the page must be reachable from whatever VLAN the phone is on, and
-while it is up (5 minutes by default) anyone on that network who opens it gets
-a Proton sign-in page. `--bind 127.0.0.1` is there if you would rather not.
-
-**Acceptance:** sign-in must survive a non-interactive shell *and* a reboot.
-
-```bash
-ssh you@vm 'sudo -u protonsync env \
-  PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton \
-  PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file \
-  proton-drive filesystem list / --json'
-```
-
-If this fights back for more than an evening, switch to rclone rather than
-drifting: set `proton.backend: rclone` and configure an `rclone.conf` remote.
-Credentials live in that file, no keyring is involved, and everything
-downstream — state, dedupe, verify, reap — is unchanged.
-
----
-
-### Work through the phases
-
-Check each before moving on. (Worth doing under Docker too — same list, with
-`docker compose run --rm david` in front of each, per
-[Day to day](#day-to-day).)
-
-```bash
-sudo -u protonsync bash             # not root: state and staging stay service-owned
-cd /opt/proton-to-immich-pipeline
-export PIS_CONFIG=/etc/proton-to-immich-pipeline/config.yaml
-export IMMICH_API_KEY=...
-
-python3 sync.py pull --dry-run      # counts only, writes nothing
-python3 sync.py pull                # a second run must report zero new
-python3 sync.py download --limit 20
-python3 sync.py push
-python3 sync.py verify
-python3 sync.py reconcile            # stages nothing unless Immich's trash has
-python3 sync.py status               # something this account uploaded
-```
-
-After `push`, the 20 files should appear in the Immich UI *and* under
-`/mnt/immich/data/library/<user>/...` — the storage template is on, so that
-tree is human-readable; use it.
-
-Then hand it to systemd — the single-account units, for one pipeline. Two
-pipelines use the templated ones instead, see
-[Two pipelines under systemd](#two-pipelines-under-systemd):
-
-```bash
-sudo cp systemd/proton-to-immich-pipeline.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now proton-to-immich-pipeline.timer
-sudo systemctl start proton-to-immich-pipeline.service    # run once, now
-journalctl -u proton-to-immich-pipeline -f
-```
-
-The timer fires nightly at 03:15 with 30 minutes of jitter and
-`Persistent=true`, so a run missed while the VM was off happens at next boot.
-The unit runs as **`protonsync`, which must own `/mnt/immich/staging`** — see
-[known-issues.md](known-issues.md#4-operational-assumptions).
-
 ## The backfill
 
 Only once the nightly cycle has been green for a few days:
 
 ```bash
-python3 sync.py run --backfill      # uses backfill.max_files / max_bytes
-watch df -h /mnt/immich             # and watch dmesg for USB resets
-journalctl -u proton-to-immich-pipeline -f | grep -E 'download.batched|circuit'
-```
-
-Under Docker:
-
-```bash
-docker compose run --rm david run --backfill
+docker compose run --rm david run --backfill   # uses backfill.max_files / max_bytes
 docker compose logs -f david | grep -E 'download.batched|circuit'
+watch df -h /mnt/immich                        # on the host; watch dmesg for USB resets
 ```
 
 Two settings exist for exactly this run, both covered in
@@ -526,8 +359,8 @@ Proton reports a sha1 for every file at discovery and Immich dedupes on sha1,
 so the two can be matched *before* anything transfers:
 
 ```bash
-python3 sync.py precheck          # mark them
-python3 sync.py run --precheck    # or fold it into a run
+docker compose run --rm david precheck        # mark them
+docker compose run --rm david run --precheck  # or fold it into a run
 ```
 
 Matching rows are marked `uploaded` with the existing asset id and
@@ -591,9 +424,9 @@ reads. See [Withdrawing a staged row](#withdrawing-a-staged-row).
 > never been uploaded at all.
 
 ```bash
-python3 sync.py reconcile          # or just let `run` do it
-python3 sync.py staged             # what is waiting
-python3 sync.py staged --csv       # the same, for a spreadsheet or xargs
+docker compose run --rm david reconcile     # or just let `run` do it
+docker compose run --rm david staged        # what is waiting
+docker compose run --rm david staged --csv  # the same, for a spreadsheet or xargs
 ```
 
 ### Why the list lives in our database
@@ -648,11 +481,11 @@ what `proton.roots` ships with — is the `execute` case.
 **Without `--yes` this is a dry run, whatever else you pass.**
 
 ```bash
-python3 sync.py delete-staged                 # dry run, oldest batch_cap rows
-python3 sync.py delete-staged 14 15 --yes     # trash exactly those two
-python3 sync.py delete-staged --limit 5 --yes # the oldest five
-python3 sync.py unstage 14                    # take a row back off the queue
-python3 sync.py unstage --all --resync        # ...and sync them again properly
+docker compose run --rm david delete-staged                 # dry run, oldest batch_cap rows
+docker compose run --rm david delete-staged 14 15 --yes     # trash exactly those two
+docker compose run --rm david delete-staged --limit 5 --yes # the oldest five
+docker compose run --rm david unstage 14                    # take a row off the queue
+docker compose run --rm david unstage --all --resync        # ...and sync them again properly
 ```
 
 `unstage` alone returns the asset to `purged` — right when the photo *is* in
@@ -711,23 +544,9 @@ combines them, so it never takes a write lock a pipeline needs.
 
 Standard library only: no framework, no Node, nothing to build.
 
-**Under Docker** it is already running — the `ui` service, on
-`PIS_WEB_PORT` (8080 by default). Nothing below applies; skip to
-[Force sync](#force-sync-never-runs-inside-a-request).
-
-**By hand:**
-
-```bash
-python3 sync.py web-password        # prints a web.password_hash line
-python3 sync.py serve               # http://127.0.0.1:8080
-
-sudo cp systemd/proton-to-immich-pipeline-web.service /etc/systemd/system/
-sudo cp systemd/proton-to-immich-pipeline-env.web.example \
-        /etc/proton-to-immich-pipeline/env.web
-sudo chown root:protonsync /etc/proton-to-immich-pipeline/env.web
-sudo chmod 640 /etc/proton-to-immich-pipeline/env.web
-sudo systemctl enable --now proton-to-immich-pipeline-web
-```
+It is already running: the `ui` service, on `PIS_WEB_PORT` (8080 by default).
+Without Docker it is a unit of its own — see
+[bare-metal.md → The web UI](bare-metal.md#the-web-ui).
 
 The UI holds **no Proton session and no Immich key** — it never talks to
 either. That is why it validates its config on structure alone and starts
@@ -737,8 +556,8 @@ tree.
 ### Setting the password
 
 ```bash
-python3 sync.py web-password                 # bare metal
 docker compose run --rm ui web-password      # containers
+python3 sync.py web-password                 # without Docker
 ```
 
 It prompts twice and prints the hash in both forms — a
@@ -955,72 +774,6 @@ merging databases possible in either direction — see
 files can hold the same id for different photos without either noticing.
 
 ---
-
-## Two pipelines under systemd
-
-The same thing without containers. More to install, and the pieces the
-container layout gets for free have to be done by hand — but it keeps the
-single-binary, no-daemon shape if that is what you want.
-
-### Setting it up by hand
-
-Start from [`config.accounts.example.yaml`](../config.accounts.example.yaml).
-That form **needs PyYAML** (`apt install python3-yaml`) — the built-in fallback
-parser cannot read maps inside a list, and says so rather than guessing.
-
-**Test the session isolation by hand before anything else.** Sign both in,
-then list from each within the same minute and check neither session died:
-
-```bash
-export PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file
-PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton/david  proton-drive auth login
-PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton/mirjam proton-drive auth login
-PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton/david  proton-drive filesystem list /
-PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton/mirjam proton-drive filesystem list /
-PROTON_DRIVE_CACHE_DIR=/mnt/immich/staging/.proton/david  proton-drive filesystem list /
-```
-
-The last line is the test: if David's session was invalidated by Mirjam's
-login, the cache dirs are not isolating anything and the rest will not work.
-
-Then, per account:
-
-```bash
-python3 sync.py --account david login
-python3 sync.py --account david pull --dry-run
-python3 sync.py --account david run
-python3 sync.py status                       # no --account: reports on both
-```
-
-### Nightly
-
-One templated timer per account, **staggered** — each holds only its own lock,
-so nothing else would stop them competing for Proton bandwidth and the staging
-free-space floor:
-
-```bash
-sudo cp systemd/proton-to-immich-pipeline@.{service,timer} /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now proton-to-immich-pipeline@david.timer
-sudo systemctl enable --now proton-to-immich-pipeline@mirjam.timer
-
-sudo systemctl edit proton-to-immich-pipeline@mirjam.timer
-# [Timer]
-# OnCalendar=
-# OnCalendar=*-*-* 04:45:00
-```
-
-The empty `OnCalendar=` first is required — systemd *appends* otherwise, and
-the unit would fire at both times.
-
-**Disable the single-account unit** once accounts are listed
-(`systemctl disable --now proton-to-immich-pipeline.timer`), or it will also
-try to process an account called `default`.
-
-**And delete `IMMICH_API_KEY` from the shared env file.** It applies to the
-base config and therefore to every account. That is the one mistake the
-config check cannot save you from silently, so it refuses to run at all when
-two accounts end up with the same key.
 
 ## Upgrading an existing install: `sync.py migrate`
 
@@ -1288,7 +1041,7 @@ sudo -u protonsync python3 sync.py --account mirjam login
 ```
 
 Then run the **session isolation test** from
-[Setting it up by hand](#setting-it-up-by-hand) above, with the new
+[bare-metal.md](bare-metal.md#setting-it-up-by-hand), with the new
 per-account cache dirs.
 Do it now, before the timers exist: if the sessions are not isolated, nothing
 after this point works and you want to find that out by hand.
@@ -1328,8 +1081,9 @@ step 4.
 
 **Docker:** write `config.yaml` from
 [`config.docker.yaml`](../config.docker.yaml) and `.env` from `.env.example`,
-set `PIS_STATE_DIR` to the `.state` directory you just migrated and the two
-`*_STAGING` paths to the per-account trees from step 1, then:
+set `PIS_STATE_DIR` to the `.state` directory you just migrated and
+`PIS_STAGING_DIR` to the tree holding the per-account subdirectories from
+step 1, put each key in `secrets/<account>.key`, then:
 
 ```bash
 sudo systemctl disable --now proton-to-immich-pipeline.timer
@@ -1354,7 +1108,7 @@ sudo systemctl start proton-to-immich-pipeline-web       # if you use the UI
 untemplated unit, which has no `--account` and will happily process an account
 called `default` — a third, empty library alongside the two real ones.
 
-Then stagger them, per [Nightly](#nightly) above.
+Then stagger them, per [bare-metal.md → Nightly](bare-metal.md#nightly).
 
 #### What this does to Home Assistant
 
@@ -1412,7 +1166,7 @@ broker (the Home Assistant host, if you run the Mosquitto add-on).
 ### Testing it
 
 ```bash
-python3 sync.py status --probe -v
+docker compose run --rm david status --probe -v
 ```
 
 `--probe` checks Proton and Immich, rewrites `status.json` **and publishes to
@@ -1437,8 +1191,11 @@ If nothing publishes, work down this list:
    systemd that means the interpreter named in `ExecStart`, which is not
    necessarily the one on your `$PATH`. The container image ships
    `paho-mqtt` already.
-3. **Is the broker reachable from the service account, not just from your
-   shell?** `sudo -u protonsync mosquitto_pub -d -h <broker> -p 1883 -t test -m hi`
+3. **Is the broker reachable from where the pipeline runs, not just from your
+   shell?** From a container: `docker compose run --rm david ping -c1 <broker>`
+   — a broker on the host is not on the container network unless you put it
+   there. Without Docker, test as the service account:
+   `sudo -u protonsync mosquitto_pub -d -h <broker> -p 1883 -t test -m hi`
 4. **Watch the other end** while you run `status --probe`:
    `mosquitto_sub -h <broker> -v -t 'proton_immich_sync/#' -t 'homeassistant/#'`
 
@@ -1518,7 +1275,7 @@ everything, restore the relevant file, and downgrade the code.
 | `217/USER` at unit start | The `User=` account does not exist. Create it, or point the unit at one that does. |
 | `Permission denied` running `proton-drive` | Missing execute bit — a download arrives `644`, and exec fails for root too. `sudo chmod 755 /usr/bin/proton-drive`. |
 | `Cannot autolaunch D-Bus without X11 $DISPLAY` | The CLI fell back to its `keychain` credentials store. Use `sync.py login`, which sets `PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file`, or export that before calling `proton-drive` by hand. |
-| Files under staging owned by `root` | A phase was run as root. `sudo chown -R protonsync:protonsync /mnt/immich/staging` — that also catches `.state/*-wal` and the `.proton` session, which fail separately. |
+| Files under staging owned by `root` | A phase was run as root. `sudo chown -R 1000:1000 /mnt/immich/pis/staging` (or `protonsync:protonsync` without Docker) — that also catches `.state/*-wal` and the `.proton` session, which fail separately. Scope it to the mount, never a parent. |
 | `Unable to find image ... locally` then exit 1 | The first push pulls immich-cli and the pull failed (DNS, registry, disk). Pre-pull it as the service account to see the real error. |
 | exit 2, `auth.failed` | Proton session gone. Re-run `sync.py login`. Signing in as the wrong user looks identical — `staging/.proton` is mode 700. |
 | exit 3, `lock.held` | A previous run is still going. Normal during a backfill. |

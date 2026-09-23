@@ -228,8 +228,8 @@ mutation at all.
 - **Two Proton sessions in two cache dirs.** The isolation argument is sound —
   `unsafe_file` keeps the session in `PROTON_DRIVE_CACHE_DIR` — but the CLI's
   keyring path uses one fixed service name, and nobody has confirmed that
-  nothing else is shared. [operations.md](operations.md#setting-it-up) has the
-  five-command test to run before writing any config.
+  nothing else is shared. [bare-metal.md](bare-metal.md#setting-it-up-by-hand)
+  has the five-command test to run before writing any config.
 - **The UI in a browser.** The page is served, its JS parses and every
   endpoint it calls is tested over real HTTP, but no browser has rendered it.
 - **`/api/staged-deletes.csv` filename handling.** Account names are validated

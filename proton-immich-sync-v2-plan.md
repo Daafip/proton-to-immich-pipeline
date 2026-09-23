@@ -366,7 +366,7 @@ Everything above is code with tests and no live exercise. Two things have to
 happen on the VM before any of it is trusted, and neither is code:
 
 1. **A1, the two-session test.** Five commands, in
-   [operations.md](docs/operations.md#setting-it-up-by-hand). If the cache dirs do not
+   [bare-metal.md](docs/bare-metal.md#setting-it-up-by-hand). If the cache dirs do not
    isolate the Proton sessions, Phase A does not work and no amount of config
    fixes it.
 2. **The delete path, on junk files.** `--dry-run`, then `--yes` on two or

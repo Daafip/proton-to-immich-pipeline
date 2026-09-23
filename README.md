@@ -90,7 +90,8 @@ Exit codes: **0** ok · **1** partial failure · **2** auth failure · **3** loc
 
 | | |
 |---|---|
-| [docs/operations.md](docs/operations.md) | Install, configure, sign in, run the phases, the delete queue, the web UI, two accounts, systemd, backfill, Home Assistant, state model, troubleshooting. |
+| [docs/operations.md](docs/operations.md) | Install with Docker, configure, sign in, run the phases, the delete queue, the web UI, two accounts, backfill, migrations, Home Assistant, state model, troubleshooting. |
+| [docs/bare-metal.md](docs/bare-metal.md) | The same install without Docker: service account, CLI binary, env file, systemd units and timers. Everything after the install is in operations.md. |
 | [docs/proton-drive-cli.md](docs/proton-drive-cli.md) | How `cli-drive` actually behaves (verified on 0.6.0, flags re-checked on 0.8.0): command surface, environment, sign-in, the `--json` schema and its four traps. |
 | [docs/known-issues.md](docs/known-issues.md) | What is not solved, and what has and has not run against live services. |
 | [proton-immich-sync-v2-plan.md](proton-immich-sync-v2-plan.md) | The v2 plan: the schema move, the delete queue, the web UI, two accounts. |
@@ -117,7 +118,8 @@ docker compose run --rm -p 8399:8399 default login   # once per pipeline
 docker compose up -d
 ```
 
-**By hand:**
+**By hand** — a service account, the binary and systemd units, set up in
+[docs/bare-metal.md](docs/bare-metal.md):
 
 ```bash
 sudo cp config.example.yaml /etc/proton-to-immich-pipeline/config.yaml
@@ -153,8 +155,9 @@ Already running with one account? Follow
 rather than editing the config in place — renaming the existing account without
 renaming it in the database re-downloads the whole library.
 
-Full deployment, including systemd, the backfill, the delete queue and the UI,
-is in [docs/operations.md](docs/operations.md). **Read
+Full deployment — the backfill, the delete queue and the UI — is in
+[docs/operations.md](docs/operations.md); the systemd side of a non-Docker
+install is in [docs/bare-metal.md](docs/bare-metal.md). **Read
 [docs/known-issues.md](docs/known-issues.md) before a large backfill.**
 
 ---
@@ -178,7 +181,7 @@ web/index.html          the whole frontend: one file, no build step
 Dockerfile              one image, two roles: agent and serve
 docker-compose.yml      one container per pipeline + one for the UI
 systemd/                templated per-account units, nightly timers, web service
-tests/                  486 tests, no network, no Docker
+tests/                  497 tests, no network, no Docker
 ```
 
 `config.py`, `log.py`, `login.py` and `pipeline.py` are additions to the layout
@@ -192,7 +195,7 @@ the build plan sketched; the rest matches it.
 python3 -m unittest discover -s tests -t . -v
 ```
 
-486 tests, no network and no Docker. The Proton backend and Immich server are
+497 tests, no network and no Docker. The Proton backend and Immich server are
 faked in-process, so `pull → download → push → verify → reap → reconcile` runs
 end to end, including the failure paths: truncated transfers, checksum
 mismatches, sessions expiring mid-run, killed runs resuming, quarantine after
