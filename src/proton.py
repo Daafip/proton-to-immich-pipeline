@@ -323,6 +323,18 @@ def safe_filename(name: str, fallback: str = "asset") -> str:
     return cleaned or fallback
 
 
+# The Photos section: the timeline the phone apps back up into. It is not a
+# folder under /my-files and the `filesystem` verbs refuse it ("Path type
+# photos is not supported"); cli-drive reaches it through `photo timeline` and
+# `photo download` instead. Both /photos/<name> and /photos/<full uid> download.
+PHOTOS_ROOT = "/photos"
+
+
+def is_photos_path(path: str | None) -> bool:
+    path = str(path or "")
+    return path.rstrip("/") == PHOTOS_ROOT or path.startswith(PHOTOS_ROOT + "/")
+
+
 def should_include(node: RemoteNode, extensions: list[str], exclude_globs: list[str],
                    media_prefixes: list[str] | None = None) -> bool:
     if node.is_folder:
@@ -425,6 +437,17 @@ def _set_conflict_args(args: list[str], variant: list[str]) -> list[str]:
     return out[:at] + list(variant) + out[at:]
 
 
+def _refuse_photos(path: str, verb: str) -> None:
+    """`filesystem info` and `filesystem trash` reject Photos paths, and
+    cli-drive has no photo equivalent. Say so plainly rather than pass on
+    "Path type photos is not supported"."""
+    if is_photos_path(path):
+        raise ProtonError(
+            f"cannot {verb} {path}: cli-drive has no way to {verb} a photo in "
+            f"the Photos timeline. Use delete.action: mark_only for this "
+            f"account and delete it in the Proton app")
+
+
 class ProtonCliBackend(Backend):
     name = "proton-cli"
 
@@ -432,6 +455,7 @@ class ProtonCliBackend(Backend):
         self.binary = cfg.get("proton.binary", "proton-drive")
         self.cache_dir = cfg.proton_cache_dir
         self.timeout = int(cfg.get("proton.timeout_sec", 900))
+        self.timeline_timeout = int(cfg.get("proton.timeline_timeout_sec", 3600))
         self.max_depth = int(cfg.get("proton.max_depth", 25))
         self.cmd = cfg.get("proton.cmd", {})
         self.credentials_store = cfg.get("proton.credentials_store")
@@ -597,7 +621,31 @@ class ProtonCliBackend(Backend):
                 nodes.append(node)
         return nodes
 
+    def walk_timeline(self) -> Iterator[RemoteNode]:
+        """`photo timeline -d --json` -- the whole Photos section in one call.
+
+        The timeline is flat: every photo shares one parent, so paths are
+        /photos/<name>. With `-d` each entry has the same shape as a
+        `filesystem list` file entry, only with `"type": "photo"` and an extra
+        `photo` block, so it goes through the same normalisation.
+        """
+        args = self._template("timeline", ["photo", "timeline", "-d", "--json"])
+        proc = self._run(args, timeout=self.timeline_timeout)
+        entries = extract_entries(parse_json_output(proc.stdout))
+        log.debug("proton.listed", path=PHOTOS_ROOT, entries=len(entries))
+        for entry in entries:
+            node = normalize_entry(entry, PHOTOS_ROOT)
+            if node and not node.is_folder:
+                yield node
+
     def walk(self, root: str) -> Iterator[RemoteNode]:
+        if is_photos_path(root):
+            if root.rstrip("/") != PHOTOS_ROOT:
+                raise ProtonError(
+                    f"root {root!r}: the Photos timeline is flat and has no "
+                    f"subfolders; use {PHOTOS_ROOT!r} on its own")
+            yield from self.walk_timeline()
+            return
         queue: list[tuple[str, int]] = [(root, 0)]
         seen: set[str] = set()
         while queue:
@@ -663,13 +711,16 @@ class ProtonCliBackend(Backend):
         """
         dest_dir = dest.parent
         dest_dir.mkdir(parents=True, exist_ok=True)
-        args = self._template(
-            "download",
-            ["filesystem", "download", "--conflict-strategy", "skip",
-             "{path}", "{dest_dir}"],
-            path=node.path, dest=str(dest), dest_dir=str(dest_dir),
-        )
-        self._run_download(args)
+        if is_photos_path(node.path):
+            self._run_photo_download([node], dest_dir)
+        else:
+            args = self._template(
+                "download",
+                ["filesystem", "download", "--conflict-strategy", "skip",
+                 "{path}", "{dest_dir}"],
+                path=node.path, dest=str(dest), dest_dir=str(dest_dir),
+            )
+            self._run_download(args)
         produced = dest_dir / node.name
         if not dest.exists() and produced.exists():
             produced.replace(dest)
@@ -698,6 +749,14 @@ class ProtonCliBackend(Backend):
             self.download(nodes[0], dest_dir / nodes[0].name)
             return
         dest_dir.mkdir(parents=True, exist_ok=True)
+        photos = [n for n in nodes if is_photos_path(n.path)]
+        if photos:
+            # Batches are grouped by parent folder, so a mix is not expected;
+            # anything else in the batch still takes the filesystem route.
+            self._run_photo_download(photos, dest_dir)
+            nodes = [n for n in nodes if not is_photos_path(n.path)]
+            if not nodes:
+                return
         args = self._template_multi(
             "download",
             ["filesystem", "download", "--conflict-strategy", "skip",
@@ -715,6 +774,22 @@ class ProtonCliBackend(Backend):
         # should not be thrown away.
         self._run_download(args, timeout=self.timeout * len(nodes))
 
+    def _run_photo_download(self, nodes: Sequence[RemoteNode], dest_dir: Path) -> None:
+        """`photo download path... localFolder`, addressing each photo by its
+        full uid. Names repeat in the timeline and may not decrypt; the uid
+        never does either. The file still lands under the photo's name.
+
+        No conflict-flag negotiation: that fallback is for `filesystem
+        download`, and this verb still accepts `-c` on 0.8.0.
+        """
+        args = self._template_multi(
+            "photo_download",
+            ["photo", "download", "-c", "rename", "{path}", "{dest_dir}"],
+            [f"{PHOTOS_ROOT}/{node.node_id}" for node in nodes],
+            dest_dir=str(dest_dir), dest=str(dest_dir),
+        )
+        self._run(args, timeout=self.timeout * len(nodes))
+
     # -- the delete path ---------------------------------------------------
     def resolve(self, path: str) -> RemoteNode | None:
         """`filesystem info path --json` -- what is at that path right now.
@@ -724,6 +799,7 @@ class ProtonCliBackend(Backend):
         recorded path still matches the one that was staged, so a path since
         reused for a different file is skipped rather than deleted.
         """
+        _refuse_photos(path, "look up")
         args = self._template("info", ["filesystem", "info", "{path}", "--json"],
                               path=path)
         try:
@@ -761,6 +837,7 @@ class ProtonCliBackend(Backend):
         the only destructive call in the pipeline, so an unambiguous result
         per node is worth the ~1.2 s of CLI startup.
         """
+        _refuse_photos(path, "trash")
         args = self._template("trash", ["filesystem", "trash", "{path}"], path=path)
         self._run(args)
 

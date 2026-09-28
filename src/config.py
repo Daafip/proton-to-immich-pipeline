@@ -35,6 +35,9 @@ DEFAULTS: dict[str, Any] = {
         # everything under it, or list individual folders to sync a subset
         # (handy for spreading a backfill over several nights).
         # `proton-drive filesystem list /` prints the top-level sections.
+        # `/photos` is the Photos section (the phone-backup timeline), read
+        # with `photo timeline` rather than walked; `/my-files/Photos` is just
+        # an ordinary folder that happens to be called Photos.
         "roots": ["/my-files/Photos"],
         # Files per `filesystem download` invocation. The CLI costs ~1.2 s of
         # Bun and SDK startup per call whatever it does, so a 25k-file
@@ -80,7 +83,21 @@ DEFAULTS: dict[str, Any] = {
             # `empty-trash` are not and are never invoked.
             "info": ["filesystem", "info", "{path}", "--json"],
             "trash": ["filesystem", "trash", "{path}"],
+            # The Photos section (a `/photos` root) is not a filesystem path:
+            # `filesystem list /photos` answers "Path type photos is not
+            # supported". It has its own verbs. `-d` loads the full node
+            # details -- without it each entry is only a uid and a capture
+            # time. Downloads name the photo by uid ({path} is
+            # /photos/<uid>), because names repeat in the timeline. `photo
+            # download` still takes `-c` on 0.8.0; rename, so a collision
+            # shows up as a missing file rather than a silently kept one.
+            "timeline": ["photo", "timeline", "-d", "--json"],
+            "photo_download": ["photo", "download", "-c", "rename",
+                               "{path}", "{dest_dir}"],
         },
+        # One `photo timeline -d` call returns the whole timeline, ~2 KB of
+        # JSON per photo, so it needs more than a per-file budget.
+        "timeline_timeout_sec": 3600,
         "rclone": {
             "binary": "rclone",
             "remote": "protondrive:",

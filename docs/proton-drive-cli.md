@@ -75,7 +75,9 @@ prints the node currently at a path, so the staged `uid` can be compared with
 whatever is there now before anything is touched. A path since reused for a
 different file is then skipped rather than deleted.
 
-**Still unverified:** whether any of these work on the **Photos** section.
+**Verified not to work on the Photos section (`/photos`):** the
+`filesystem` verbs reject that path type outright; see
+[the Photos section](#the-photos-section-photos). Earlier notes, for context:
 Proton's support docs say items there cannot be deleted from desktop apps, and
 a third-party GUI wrapper reports delete/rename/restore as unavailable in the
 Photos view. That is why `delete.action` is per account and defaults to
@@ -110,6 +112,51 @@ Spaces and hyphens need no quoting (quote only if a name contains a colon).
 Nothing is passed through a shell, so `Photos from 2024` stays one argument.
 
 With `album_strategy: folder` these folder names become the Immich album names.
+
+### The Photos section (`/photos`)
+
+The timeline the phone apps back up into is **not** a folder under
+`/my-files`. `/my-files/Photos` is just an ordinary folder that happens to be
+called Photos. The `filesystem` verbs refuse the real section outright:
+
+```
+$ proton-drive filesystem list /photos
+Path type photos is not supported
+```
+
+It is reached with `photo timeline` and `photo download` instead (verified on
+0.8.0, 2026-09-28). Put `/photos` on its own in `proton.roots` and the backend
+switches to those verbs:
+
+```yaml
+proton:
+  roots:
+    - /photos
+```
+
+- **`photo timeline --json`** returns only `nodeUid`, `captureTime` and `tags`
+  per photo: no name, size or digest, which is not enough to sync.
+  **`photo timeline -d --json`** loads the details, and each entry then has the
+  same shape as a `filesystem list` file entry, with `"type": "photo"` and an
+  extra `photo` block (`captureTime`, `contentHash`, `albums`,
+  `relatedPhotoNodeUids`). Sample: `tests/fixtures/proton_photo_timeline.json`.
+- **The timeline is flat.** Every photo has the same `parentUid`, so paths are
+  `/photos/<name>` and `/photos/<subfolder>` is rejected. There is no
+  pagination: one call returns everything, ~2 KB of JSON per photo (5.5 MB for
+  roughly 2,700 photos), under its own `proton.timeline_timeout_sec`
+  (default 3600).
+- **Names repeat.** The CLI's own help says so. `photo download` accepts both
+  `/photos/<name>` and `/photos/<full uid>`. The pipeline always uses the
+  **full** uid (`<volume>~<node>`, both halves; a truncated uid answers
+  `Photo not found`). The file still lands under the photo's name, and the
+  usual batching rule (no two equal names per batch) keeps duplicates apart.
+- **`photo download` still takes `-c`** on 0.8.0. The default is
+  `-c rename`, so a collision shows up as a missing file, not a silently kept
+  wrong one. Override with `proton.cmd.photo_download`.
+- **No delete.** `filesystem info` and `filesystem trash` reject `/photos`
+  paths and there is no photo equivalent, so with `delete.action: execute`
+  those rows are marked `delete_failed` with a message pointing at
+  `mark_only`. Use `mark_only` for an account that syncs `/photos`.
 
 ---
 

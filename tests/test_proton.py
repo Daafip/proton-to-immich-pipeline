@@ -547,5 +547,91 @@ class TestRcloneBackend(unittest.TestCase):
         self.assertEqual(backend._remote_path("/Photos/a.jpg"), "protondrive:Photos/a.jpg")
 
 
+class TestPhotosTimeline(unittest.TestCase):
+    """The Photos section: `filesystem list /photos` answers "Path type photos
+    is not supported", so a /photos root goes through `photo timeline` and
+    `photo download` instead."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.backend = proton.ProtonCliBackend(load(None))
+        self.calls = []
+        self.timeouts = []
+
+        class Result:
+            stdout = (FIXTURES / "proton_photo_timeline.json").read_text()
+            stderr, returncode = "", 0
+
+        def fake_run(args, timeout=None):
+            self.calls.append(list(args))
+            self.timeouts.append(timeout)
+            if "download" in args:
+                folder = Path(args[-1])
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / "PXL_20260927_140716866.jpg").write_bytes(b"data")
+            return Result()
+
+        self.backend._run = fake_run
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_root_lists_the_timeline_with_details(self):
+        nodes = list(self.backend.walk("/photos"))
+        self.assertEqual(self.calls, [["photo", "timeline", "-d", "--json"]])
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(self.timeouts[0], self.backend.timeline_timeout,
+                         "one call returns the whole timeline")
+
+    def test_photo_entries_parse_like_files(self):
+        node = list(self.backend.walk("/photos/"))[0]
+        self.assertFalse(node.is_folder)
+        self.assertEqual(node.node_id, "VOLUME==~PHOTO-NODE-0==")
+        self.assertEqual(node.path, "/photos/PXL_20260927_140716866.jpg")
+        self.assertEqual(node.size, 3892497, "claimedSize, not the encrypted size")
+        self.assertEqual(node.capture_time, "2026-09-27T14:07:16Z")
+        self.assertEqual(node.media_type, "image/jpeg")
+        self.assertTrue(node.sha1)
+
+    def test_duplicate_names_keep_distinct_ids(self):
+        nodes = list(self.backend.walk("/photos"))
+        self.assertEqual(nodes[0].name, nodes[2].name)
+        self.assertNotEqual(nodes[0].node_id, nodes[2].node_id)
+
+    def test_subpaths_are_refused(self):
+        with self.assertRaises(proton.ProtonError):
+            list(self.backend.walk("/photos/2026"))
+
+    def test_download_addresses_the_photo_by_full_uid(self):
+        node = list(self.backend.walk("/photos"))[0]
+        dest = Path(self.tmp.name) / "scratch" / "wanted.jpg"
+        self.backend.download(node, dest)
+        self.assertEqual(self.calls[-1],
+                         ["photo", "download", "-c", "rename",
+                          "/photos/VOLUME==~PHOTO-NODE-0==", str(dest.parent)])
+        self.assertTrue(dest.exists())
+
+    def test_batch_download_is_one_photo_call(self):
+        nodes = list(self.backend.walk("/photos"))[:2]
+        self.backend.download_many(nodes, Path(self.tmp.name) / "batch")
+        call = self.calls[-1]
+        self.assertEqual(call[:2], ["photo", "download"])
+        self.assertEqual(call[4:6], ["/photos/VOLUME==~PHOTO-NODE-0==",
+                                     "/photos/VOLUME==~PHOTO-NODE-1=="])
+
+    def test_delete_path_refuses_photos_with_a_useful_message(self):
+        for op in (self.backend.resolve, self.backend.trash):
+            with self.assertRaises(proton.ProtonError) as ctx:
+                op("/photos/PXL_20260927_140716866.jpg")
+            self.assertIn("mark_only", str(ctx.exception))
+        self.assertEqual(self.calls, [], "nothing may reach the CLI")
+
+    def test_my_files_photos_folder_is_not_the_photos_section(self):
+        self.assertFalse(proton.is_photos_path("/my-files/Photos"))
+        self.assertFalse(proton.is_photos_path("/photosarchive"))
+        self.assertTrue(proton.is_photos_path("/photos"))
+
+
 if __name__ == "__main__":
     unittest.main()

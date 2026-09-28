@@ -37,6 +37,11 @@ proton:
   #   proton-drive filesystem list /              # top-level sections
   #   proton-drive filesystem list /my-files/Photos
   #
+  # /photos is the Photos section (the phone-backup timeline), which the
+  # `filesystem` commands refuse. Use it as a root on its own and it is read
+  # with `proton-drive photo timeline -d` instead; keep delete.action at
+  # mark_only for it -- the CLI cannot trash timeline photos.
+  #
   # Quotes are only needed if a name contains a colon; spaces are fine either
   # way. Paths are always posix, and a literal / inside a folder name is
   # escaped with a backslash.

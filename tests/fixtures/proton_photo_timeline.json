@@ -1,0 +1,191 @@
+[
+ {
+  "uid": "VOLUME==~PHOTO-NODE-0==",
+  "parentUid": "VOLUME==~PHOTO-TIMELINE-0==",
+  "name": {
+   "ok": true,
+   "value": "PXL_20260927_140716866.jpg"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "owner@example.invalid"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "owner@example.invalid"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "owner@example.invalid"
+  },
+  "type": "photo",
+  "mediaType": "image/jpeg",
+  "isShared": false,
+  "isSharedByUrl": false,
+  "creationTime": "2026-09-27T14:07:38.000Z",
+  "modificationTime": "2026-09-27T14:07:41.000Z",
+  "totalStorageSize": 4543994,
+  "activeRevision": {
+   "uid": "VOLUME==~PHOTO-NODE-0==~PHOTO-REV-0==",
+   "state": "active",
+   "creationTime": "2026-09-27T14:07:38.000Z",
+   "contentAuthor": {
+    "ok": true,
+    "value": "owner@example.invalid"
+   },
+   "storageSize": 4543994,
+   "isImported": false,
+   "claimedSize": 3892497,
+   "claimedModificationTime": "2026-09-27T14:07:19.000Z",
+   "claimedDigests": {
+    "sha1": "3cfb4bbac69f8571149564ec05da0c2d8cf4bf61",
+    "sha1Verified": false
+   },
+   "claimedAdditionalMetadata": {
+    "Media": {
+     "Width": 3000,
+     "Height": 4000
+    },
+    "Camera": {
+     "CaptureTime": "2026-09-27T14:07:16Z",
+     "Device": "Pixel 10",
+     "Orientation": 1
+    }
+   }
+  },
+  "treeEventScopeId": "VOLUME==",
+  "photo": {
+   "captureTime": "2026-09-27T14:07:16.000Z",
+   "relatedPhotoNodeUids": [],
+   "contentHash": "358dc26ec8b649867d5bf794efd20145524da18e7b658d01fa445a6e3a848f01",
+   "tags": [],
+   "albums": []
+  }
+ },
+ {
+  "uid": "VOLUME==~PHOTO-NODE-1==",
+  "parentUid": "VOLUME==~PHOTO-TIMELINE-0==",
+  "name": {
+   "ok": true,
+   "value": "PXL_20260927_140600303.jpg"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "owner@example.invalid"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "owner@example.invalid"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "owner@example.invalid"
+  },
+  "type": "photo",
+  "mediaType": "image/jpeg",
+  "isShared": false,
+  "isSharedByUrl": false,
+  "creationTime": "2026-09-27T14:06:21.000Z",
+  "modificationTime": "2026-09-27T14:06:27.000Z",
+  "totalStorageSize": 4239796,
+  "activeRevision": {
+   "uid": "VOLUME==~PHOTO-NODE-1==~PHOTO-REV-1==",
+   "state": "active",
+   "creationTime": "2026-09-27T14:06:21.000Z",
+   "contentAuthor": {
+    "ok": true,
+    "value": "owner@example.invalid"
+   },
+   "storageSize": 4239796,
+   "isImported": false,
+   "claimedSize": 3593685,
+   "claimedModificationTime": "2026-09-27T14:06:02.000Z",
+   "claimedDigests": {
+    "sha1": "2ac65ff259b6b2e896bcc9b21a86b3fffd55f7a2",
+    "sha1Verified": false
+   },
+   "claimedAdditionalMetadata": {
+    "Media": {
+     "Width": 3000,
+     "Height": 4000
+    },
+    "Camera": {
+     "CaptureTime": "2026-09-27T14:06:00Z",
+     "Device": "Pixel 10",
+     "Orientation": 1
+    }
+   }
+  },
+  "treeEventScopeId": "VOLUME==",
+  "photo": {
+   "captureTime": "2026-09-27T14:06:00.000Z",
+   "relatedPhotoNodeUids": [],
+   "contentHash": "3582246f913c0a8437d0a3b0f5dfe6b440e17864eef7d6282c3e80ab771ccef5",
+   "tags": [],
+   "albums": []
+  }
+ },
+ {
+  "uid": "VOLUME==~PHOTO-NODE-2==",
+  "parentUid": "VOLUME==~PHOTO-TIMELINE-0==",
+  "name": {
+   "ok": true,
+   "value": "PXL_20260927_140716866.jpg"
+  },
+  "keyAuthor": {
+   "ok": true,
+   "value": "owner@example.invalid"
+  },
+  "nameAuthor": {
+   "ok": true,
+   "value": "owner@example.invalid"
+  },
+  "directRole": "admin",
+  "ownedBy": {
+   "email": "owner@example.invalid"
+  },
+  "type": "photo",
+  "mediaType": "image/jpeg",
+  "isShared": false,
+  "isSharedByUrl": false,
+  "creationTime": "2026-09-26T16:58:16.000Z",
+  "modificationTime": "2026-09-26T16:59:44.000Z",
+  "totalStorageSize": 3428720,
+  "activeRevision": {
+   "uid": "VOLUME==~PHOTO-NODE-2==~PHOTO-REV-2==",
+   "state": "active",
+   "creationTime": "2026-09-26T16:58:16.000Z",
+   "contentAuthor": {
+    "ok": true,
+    "value": "owner@example.invalid"
+   },
+   "storageSize": 3428720,
+   "isImported": false,
+   "claimedSize": 2903392,
+   "claimedModificationTime": "2026-09-26T16:57:44.000Z",
+   "claimedDigests": {
+    "sha1": "385c4199c608a3321f35d0e914d96ec88eb76ed5",
+    "sha1Verified": false
+   },
+   "claimedAdditionalMetadata": {
+    "Media": {
+     "Width": 3000,
+     "Height": 4000
+    },
+    "Camera": {
+     "CaptureTime": "2026-09-26T16:57:42Z",
+     "Device": "Pixel 10",
+     "Orientation": 1
+    }
+   }
+  },
+  "treeEventScopeId": "VOLUME==",
+  "photo": {
+   "captureTime": "2026-09-26T16:57:42.000Z",
+   "relatedPhotoNodeUids": [],
+   "contentHash": "5c102d7791b70e85179b83eb72e481c7cdf4ddf20c13589f83a18ed403633e60",
+   "tags": [],
+   "albums": []
+  }
+ }
+]
