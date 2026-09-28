@@ -755,6 +755,33 @@ def mark_failed(
     return status
 
 
+def relocate_local_path(conn: sqlite3.Connection, account: str, node_id: str,
+                        local_path: str) -> None:
+    """Point a row at where its staged file actually is now.
+
+    For rows staged under a different staging root -- bare metal's
+    /mnt/immich/staging before the move to a container's /staging/<account>.
+    The caller has checked the sha1; nothing else about the row changes.
+    """
+    conn.execute("UPDATE assets SET local_path=? WHERE account=? AND node_id=?",
+                 (local_path, account, node_id))
+    conn.commit()
+
+
+def send_back_for_download(conn: sqlite3.Connection, account: str, node_id: str,
+                           error: str) -> None:
+    """The staged file is gone: retry this row from download, not upload.
+
+    A `failed` row's retry stage is derived from `sha1`, so clearing it (and
+    the dead path) is what makes the next run fetch the file again. Attempts
+    start over -- the file vanishing locally says nothing about the asset, and
+    charging it would quarantine rows that were never tried again at all.
+    """
+    _set_status(conn, account, node_id, FAILED, sha1=None, local_path=None,
+                attempts=0, last_error=f"push: {error}"[:2000])
+    conn.commit()
+
+
 def requeue(conn: sqlite3.Connection, account: str,
             node_ids: Iterable[str] | None = None) -> int:
     """Put quarantined/failed rows back in play (operator escape hatch).

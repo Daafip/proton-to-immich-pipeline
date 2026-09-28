@@ -605,6 +605,39 @@ class Pipeline:
             mapping[row["node_id"]] = row
         return batch, mapping
 
+    def _relocate(self, row: sqlite3.Row, dry: bool) -> sqlite3.Row | None:
+        """Find a staged file whose recorded path went stale.
+
+        Rows staged on bare metal carry /mnt/immich/staging/ready/...; in the
+        container the same tree is /staging/<account>/ready/... The part after
+        `ready/` is ours (capture month / name), so it is looked for under the
+        current ready_dir and accepted only if the sha1 still matches.
+        """
+        old = row["local_path"]
+        if not old or not row["sha1"]:
+            return None
+        parts = Path(old).parts
+        if "ready" not in parts:
+            return None
+        last_ready = len(parts) - 1 - parts[::-1].index("ready")
+        tail = parts[last_ready + 1:]
+        if not tail:
+            return None
+        candidate = self.cfg.ready_dir.joinpath(*tail)
+        if str(candidate) == old or not candidate.is_file():
+            return None
+        try:
+            if sha1_file(candidate) != row["sha1"]:
+                return None
+        except OSError:
+            return None
+        log.info("push.local_path_relocated", node_id=row["node_id"],
+                 old=old, new=str(candidate))
+        if dry:
+            return None
+        state.relocate_local_path(self.conn, self.account, row["node_id"], str(candidate))
+        return state.get(self.conn, self.account, row["node_id"])
+
     def push(self, limit: int | None = None, dry_run: bool | None = None) -> Stats:
         dry = self.dry_run if dry_run is None else dry_run
         rows = state.select_for_upload(
@@ -615,12 +648,28 @@ class Pipeline:
         )
         present, missing = [], []
         for row in rows:
-            target = present if (row["local_path"] and Path(row["local_path"]).exists()) else missing
-            target.append(row)
+            if row["local_path"] and Path(row["local_path"]).exists():
+                present.append(row)
+                continue
+            relocated = self._relocate(row, dry)
+            if relocated is not None:
+                present.append(relocated)
+            else:
+                missing.append(row)
         for row in missing:
             # Reaped too early, or removed by hand: send it back for re-download.
-            self._fail(row["node_id"], "push",
-                       f"local file missing: {row['local_path']}", row["status"])
+            # Failing it on the upload side would only retry the same dead path
+            # until the row quarantines.
+            error = f"local file missing: {row['local_path']}"
+            if dry:
+                log.info("push.dry_run_redownload", node_id=row["node_id"],
+                         path=row["local_path"])
+                continue
+            state.send_back_for_download(self.conn, self.account, row["node_id"], error)
+            log.warn("push.local_file_missing_redownload", node_id=row["node_id"],
+                     path=row["local_path"])
+            log.transition(row["node_id"], row["status"], state.FAILED,
+                           stage="push", error=error, retry="download")
         rows = present
         if not rows:
             log.info("push.nothing_to_do")

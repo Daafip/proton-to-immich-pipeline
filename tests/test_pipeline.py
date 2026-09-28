@@ -242,6 +242,60 @@ class TestPush(PipelineTest):
         self.assertEqual(row["status"], state.FAILED)
         self.assertIn("local file missing", row["last_error"])
 
+    def test_missing_local_file_retries_from_download_not_upload(self):
+        # A stale path used to keep sha1, so the row retried upload against the
+        # same dead path each run and quarantined without ever re-downloading.
+        self.seed(1)
+        pipeline = self.prepared()
+        Path(state.get(self.conn, ACCOUNT, "node-1")["local_path"]).unlink()
+        self.conn.execute("UPDATE assets SET attempts=3")
+        stats = pipeline.push()
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        self.assertIsNone(row["sha1"])
+        self.assertIsNone(row["local_path"])
+        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(state.select_for_upload(self.conn, ACCOUNT), [])
+        self.assertEqual([r["node_id"] for r in state.select_for_download(self.conn, ACCOUNT)],
+                         ["node-1"])
+
+        stats = self.pipe(run_id="r2").run()
+        self.assertEqual(stats.downloaded, 1)
+        self.assertEqual(stats.failed, 0)
+        self.assertEqual(state.get(self.conn, ACCOUNT, "node-1")["status"], state.PURGED)
+
+    def test_file_under_an_old_staging_root_is_relocated(self):
+        # Bare metal staged to /mnt/immich/staging/ready/...; the container
+        # holds the same tree under its own ready_dir.
+        self.seed(1)
+        pipeline = self.prepared()
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        current = Path(row["local_path"])
+        rel = current.relative_to(self.cfg.ready_dir)
+        old = Path("/mnt/immich/staging/ready") / rel
+        self.conn.execute("UPDATE assets SET local_path=?", (str(old),))
+        self.conn.commit()
+        pipeline.push()
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        self.assertEqual(row["status"], state.UPLOADED)
+        self.assertEqual(row["local_path"], str(current))
+        self.assertEqual(len(self.uploader.calls), 1)
+
+    def test_relocation_rejects_a_different_file(self):
+        self.seed(1)
+        pipeline = self.prepared()
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        current = Path(row["local_path"])
+        current.write_bytes(b"not the same bytes")
+        old = Path("/mnt/immich/staging/ready") / current.relative_to(self.cfg.ready_dir)
+        self.conn.execute("UPDATE assets SET local_path=?", (str(old),))
+        self.conn.commit()
+        pipeline.push()
+        row = state.get(self.conn, ACCOUNT, "node-1")
+        self.assertEqual(row["status"], state.FAILED)
+        self.assertIsNone(row["sha1"])
+        self.assertEqual(self.uploader.calls, [])
+
     def test_api_mode_upload(self):
         self.cfg.set("immich.upload_mode", "api")
         self.seed(2)
