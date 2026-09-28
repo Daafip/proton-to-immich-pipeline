@@ -263,6 +263,22 @@ Three deliberate departures from the plans:
   `pip install fastapi uvicorn` plus a Node toolchain and a committed bundle on
   a box that is awkward to debug. The endpoints are the contract and do not
   change if that trade ever stops making sense.
+- **Embedding the UI in Home Assistant.** Set `PIS_WEB_FRAME_ANCESTORS` in
+  `.env` (e.g. `'self',http://homeassistant.local:8123,http://<ha-ip>:8123`)
+  and recreate the `ui` container; it becomes the CSP `frame-ancestors`
+  value. Empty means nobody may frame it. CSP has no CIDR syntax, so list the
+  real address. There is no `X-Frame-Options` header — CSP supersedes it.
+  Two things that can still stop it working, neither fixed by loosening:
+  - **The session cookie is `SameSite=Lax`.** Browsers only send it in an
+    iframe when the UI and Home Assistant are the *same site* — same scheme
+    and host (the port does not count), e.g. both on `http://192.168.68.50`.
+    From a different hostname or IP the cookie is dropped and the frame keeps
+    showing the login. The fix is `SameSite=None; Secure`, which requires
+    serving the UI over **HTTPS** (a reverse proxy); it is deliberately not
+    done over plain HTTP.
+  - **Mixed content.** If Home Assistant is served over HTTPS (Nabu Casa,
+    a proxy), the browser refuses an `http://…:8080` iframe outright. The UI
+    must then be HTTPS too.
 
 Everything the build plan had to guess about the Proton CLI — credentials,
 sign-in, flags, JSON shape — has since been verified against the real binary

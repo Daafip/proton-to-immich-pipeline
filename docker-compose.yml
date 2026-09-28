@@ -112,6 +112,8 @@ services:
       # no password (exit 4, `web.refusing_unauthenticated_bind`) and allows a
       # loopback one, which compose cannot tell apart.
       PIS_WEB_PASSWORD_HASH: ${PIS_WEB_PASSWORD_HASH:-}
+      # Who may iframe the UI (Home Assistant). Empty = nobody. See .env.example.
+      PIS_WEB_FRAME_ANCESTORS: ${PIS_WEB_FRAME_ANCESTORS:-}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${PIS_STATE_DIR:-./state}:/state

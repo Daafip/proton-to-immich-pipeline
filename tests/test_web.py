@@ -6,6 +6,7 @@ cookies, the CSP headers, path traversal) lives in the HTTP layer.
 """
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -14,6 +15,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -542,7 +544,7 @@ class TestHttpAuth(HttpTest):
         _, _, headers = self.request("/api/login", {"password": PASSWORD})
         cookie = headers["Set-Cookie"]
         self.assertIn("HttpOnly", cookie)
-        self.assertIn("SameSite=Strict", cookie)
+        self.assertIn("SameSite=Lax", cookie)
 
     def test_a_forged_cookie_is_rejected(self):
         self.login()
@@ -642,7 +644,7 @@ class TestHttpRoutes(HttpTest):
         self.assertEqual(self.request("/api/nope", {})[0], 404)
 
     def test_a_form_post_is_refused(self):
-        """The CSRF pairing: JSON-only bodies plus a SameSite=Strict cookie.
+        """The CSRF pairing: JSON-only bodies plus a SameSite=Lax cookie.
         A cross-site form cannot set this content type without a preflight."""
         url = f"http://127.0.0.1:{self.port}/api/jobs"
         req = urllib.request.Request(url, data=b"type=sync", method="POST")
@@ -700,9 +702,14 @@ class TestHttpStatic(HttpTest):
 
     def test_security_headers_are_present(self):
         _, _, headers = self.request("/")
-        self.assertEqual(headers["X-Frame-Options"], "DENY")
+        # Superseded by CSP frame-ancestors; ALLOW-FROM no longer exists.
+        self.assertNotIn("X-Frame-Options", headers)
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
-        self.assertIn("default-src 'none'", headers["Content-Security-Policy"])
+        csp = headers["Content-Security-Policy"]
+        self.assertIn("default-src 'none'", csp)
+        self.assertIn("form-action 'self'", csp)
+        # Unset env: still not embeddable anywhere.
+        self.assertTrue(csp.endswith("frame-ancestors 'none'"))
 
     def test_path_traversal_is_refused(self):
         for path in ("/../sync.py", "/../../etc/passwd", "/web/../sync.py",
@@ -848,3 +855,37 @@ class TestReauth(WebTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFrameAncestors(unittest.TestCase):
+    def setUp(self):
+        silence_logs()
+
+    def test_unset_is_none(self):
+        self.assertEqual(web.frame_ancestors(""), "'none'")
+
+    def test_home_assistant_origins(self):
+        self.assertEqual(
+            web.frame_ancestors("'self', http://homeassistant.local:8123,"
+                                "http://192.168.68.50:8123"),
+            "'self' http://homeassistant.local:8123 http://192.168.68.50:8123")
+
+    def test_bare_keywords_are_quoted_and_duplicates_dropped(self):
+        self.assertEqual(web.frame_ancestors("self self https://ha.example"),
+                         "'self' https://ha.example")
+
+    def test_none_wins(self):
+        self.assertEqual(web.frame_ancestors("'none', 'self'"), "'none'")
+
+    def test_anything_that_could_break_out_fails_closed(self):
+        for raw in ("http://a; script-src *", "'unsafe-inline'",
+                    "http://a\r\nX-Evil: 1", "'self' \"x\""):
+            self.assertEqual(web.frame_ancestors(raw), "'none'", raw)
+
+    def test_the_env_var_reaches_the_header(self):
+        with mock.patch.dict(os.environ, {web.FRAME_ANCESTORS_ENV:
+                                          "'self',http://homeassistant.local:8123"}):
+            csp = web.security_headers()["Content-Security-Policy"]
+        self.assertTrue(csp.endswith(
+            "frame-ancestors 'self' http://homeassistant.local:8123"))
+        self.assertNotIn("X-Frame-Options", web.security_headers("'none'"))

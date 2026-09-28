@@ -699,18 +699,68 @@ class Api:
 
 MAX_BODY = 256 * 1024
 
-SECURITY_HEADERS = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
-    # The page is one self-contained file: no external scripts, styles or
-    # images to allow, so the policy can be this tight.
-    "Content-Security-Policy": (
-        "default-src 'none'; style-src 'unsafe-inline'; "
-        "script-src 'unsafe-inline'; connect-src 'self'; "
-        "img-src 'self' data:; form-action 'none'; base-uri 'none'; "
-        "frame-ancestors 'none'"),
-}
+# Who may put the UI in an iframe -- Home Assistant, typically. Comma or space
+# separated CSP sources, e.g. "'self', http://homeassistant.local:8123".
+# Unset means 'none': not embeddable, exactly as before.
+FRAME_ANCESTORS_ENV = "PIS_WEB_FRAME_ANCESTORS"
+
+# A CSP source must not be able to end the directive or the header.
+_FRAME_SOURCE = re.compile(
+    r"^(?:'self'|'none'|[A-Za-z][A-Za-z0-9+.-]*:(?://[^\s;,'\"]+)?|[^\s;,'\":/][^\s;,'\"]*)$")
+
+
+def frame_ancestors(raw: str | None = None) -> str:
+    """The `frame-ancestors` source list, from PIS_WEB_FRAME_ANCESTORS.
+
+    Fails closed: anything that is not a plain CSP source is logged and the
+    policy stays 'none', rather than letting a typo open the UI to any site.
+    CSP has no CIDR syntax -- list Home Assistant's actual address.
+    """
+    raw = os.environ.get(FRAME_ANCESTORS_ENV, "") if raw is None else raw
+    if any(ord(ch) < 32 and ch != "\t" for ch in raw.strip()):
+        log.warn("web.frame_ancestors_invalid", source=repr(raw)[:100],
+                 detail="control characters; the UI stays unembeddable")
+        return "'none'"
+    sources = []
+    for token in re.split(r"[ \t,]+", raw.strip()):
+        if not token:
+            continue
+        if token in ("self", "none"):
+            token = f"'{token}'"
+        if not _FRAME_SOURCE.match(token):
+            log.warn("web.frame_ancestors_invalid", source=token[:100],
+                     detail="not a CSP source; the UI stays unembeddable")
+            return "'none'"
+        sources.append(token)
+    if not sources or "'none'" in sources:
+        # 'none' combined with anything is 'none' anyway; say it plainly.
+        return "'none'"
+    return " ".join(dict.fromkeys(sources))
+
+
+def security_headers(ancestors: str | None = None) -> dict[str, str]:
+    """Headers on every response.
+
+    No X-Frame-Options: its only scoped form, ALLOW-FROM, is gone from every
+    current browser, so it could only ever say DENY -- and CSP frame-ancestors
+    overrides it wherever both are understood.
+    """
+    ancestors = frame_ancestors() if ancestors is None else ancestors
+    return {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        # The page is one self-contained file: no external scripts, styles or
+        # images to allow, so the policy can be this tight.
+        "Content-Security-Policy": (
+            "default-src 'none'; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; connect-src 'self'; "
+            "img-src 'self' data:; form-action 'self'; base-uri 'none'; "
+            f"frame-ancestors {ancestors}"),
+    }
+
+
+# The default policy, for anything reading it without a running server.
+SECURITY_HEADERS = security_headers("'none'")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -729,7 +779,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        for key, value in SECURITY_HEADERS.items():
+        headers = getattr(self.server, "security_headers", None) or SECURITY_HEADERS
+        for key, value in headers.items():
             self.send_header(key, value)
         for key, value in (extra or {}).items():
             self.send_header(key, value)
@@ -760,7 +811,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return {}
         # JSON only. A cross-site form POST cannot set this content type
         # without a CORS preflight, which is the CSRF defence that pairs with
-        # the SameSite=Strict cookie.
+        # the SameSite=Lax cookie (Lax only adds top-level GETs, which read).
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
         if ctype != "application/json":
             raise ValueError("expected application/json")
@@ -812,7 +863,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/logout" and method == "POST":
             return self._json({"ok": True}, extra={
                 "Set-Cookie": f"{SESSION_COOKIE}=; Path=/; Max-Age=0; "
-                              f"HttpOnly; SameSite=Strict"})
+                              f"HttpOnly; SameSite=Lax"})
         if path == "/api/config" and method == "GET":
             # The only unauthenticated read: it tells the page whether to show
             # a login form, and carries nothing worth protecting.
@@ -899,7 +950,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         max_age = api.session_hours * 3600
         return self._json({"ok": True}, extra={
             "Set-Cookie": (f"{SESSION_COOKIE}={token}; Path=/; "
-                           f"Max-Age={max_age}; HttpOnly; SameSite=Strict")})
+                           f"Max-Age={max_age}; HttpOnly; SameSite=Lax")})
 
     # -- static ------------------------------------------------------------
     def _static(self, path: str) -> None:
@@ -954,6 +1005,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     api: Api
+    # Read from the environment once, when the server is built.
+    security_headers: dict[str, str] | None = None
 
     def handle_error(self, request, client_address) -> None:
         """One log line, not a traceback on stderr.
@@ -975,6 +1028,7 @@ def build_server(cfg, bind: str, port: int, require_auth: bool = True) -> Server
     api = Api(cfg, require_auth=require_auth)
     server = Server((bind, port), Handler)
     server.api = api
+    server.security_headers = security_headers()
     return server
 
 
@@ -1052,10 +1106,12 @@ def serve(cfg, port: int | None = None, bind: str | None = None,
 
     server = Server((bind, port), Handler)
     server.api = api  # the handler reads it off the server, one per process
+    server.security_headers = security_headers()
     log.info("web.listening", bind=bind, port=port,
              accounts=",".join(api.accounts),
              auth="on" if api.require_auth else "off",
-             runner=str(cfg.get("web.job_runner", "subprocess")))
+             runner=str(cfg.get("web.job_runner", "subprocess")),
+             frame_ancestors=frame_ancestors())
     print(f"proton-immich-sync UI on http://{bind}:{port}", file=sys.stderr)
     try:
         server.serve_forever(poll_interval=0.5)

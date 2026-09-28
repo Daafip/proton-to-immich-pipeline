@@ -673,7 +673,8 @@ POST /api/login  ·  /api/logout
 ```
 
 Everything but `/api/config` needs the session cookie. Bodies are JSON only,
-which together with `SameSite=Strict` is the CSRF defence.
+which together with the `SameSite=Lax` cookie is the CSRF defence (Lax only
+adds top-level GET navigations, and every GET is a read).
 
 ---
 
