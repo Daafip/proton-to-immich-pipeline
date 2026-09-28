@@ -649,6 +649,7 @@ ignores the backoff.
 | **failed** | Will be retried, after a backoff. |
 | **quarantined** | Used up `limits.max_attempts`; not retried until `requeue`. |
 | **staged** | Pending rows in the delete queue: trashed in Immich, Proton original not yet dealt with. |
+| **GB free of N** | The disk the staging tree is on, as measured by the pipeline at its last run: free space, total size, % used and the host path (`PIS_STAGING_DIR`). Red from 90% used; downloads stop at `staging.min_free_gb`. The UI container does not mount staging, so this is never its own disk. |
 
 `in immich` used to count only the three pre-staging statuses, which is exactly
 the set staging moves a row *out* of — so every photo staged took one off the

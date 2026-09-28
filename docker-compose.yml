@@ -64,6 +64,9 @@ x-pipeline: &pipeline
     MQTT_PORT: ${MQTT_PORT:-}
     MQTT_USERNAME: ${MQTT_USERNAME:-}
     MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+    # The host side of the /staging mount, so "free GB" can say which disk
+    # it measured. Display only.
+    PIS_STAGING_HOST_DIR: ${PIS_STAGING_DIR:-./staging}
   volumes:
     - ./config.yaml:/config/config.yaml:ro
     - ${PIS_STATE_DIR:-./state}:/state

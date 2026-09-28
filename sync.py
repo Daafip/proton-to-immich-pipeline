@@ -261,11 +261,23 @@ def print_human_status(status: dict) -> None:
     row("auth ok", status.get("auth_ok"))
     row("immich ok", status.get("immich_ok"))
     row("stale", status.get("stale"))
-    row("staging free", f"{status.get('staging_free_gb')} GB")
+    row("staging free", _disk_line(status))
     print("  states")
     for key, value in sorted((status.get("counts") or {}).items()):
         if value:
             print(f"    {key:<16} {value}")
+
+
+def _disk_line(status: dict) -> str:
+    free, total = status.get("staging_free_gb"), status.get("staging_total_gb")
+    if free is None:
+        return "unknown"
+    line = f"{free:.1f} of {total:.1f} GB" if total else f"{free:.1f} GB"
+    if status.get("staging_used_pct") is not None:
+        line += f" ({status['staging_used_pct']:.0f}% used)"
+    if status.get("staging_host_path"):
+        line += f"  {status['staging_host_path']}"
+    return line
 
 
 def _status_for(cfg, conn, args) -> dict:

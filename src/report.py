@@ -24,22 +24,42 @@ from typing import Any
 from . import log, state
 
 
-def _disk(path: Path) -> tuple[float | None, float | None]:
-    """Free space on the filesystem holding `path`.
+DISK_KEYS = ("staging_free_gb", "staging_total_gb", "staging_used_pct",
+             "staging_host_path")
+
+
+def _disk(path: Path) -> dict[str, Any]:
+    """Free and total space on the filesystem holding `path`.
 
     Walks up to the nearest existing ancestor: an account whose staging
     subtree has not been created yet still lives on a filesystem with a
     known amount of free space, and reporting "None GB" for it would look
     like a broken sensor rather than an empty directory.
+
+    It stops short of `/`, though. The UI container has no /staging at all,
+    and walking up to its root measured the container's own disk -- the VM
+    disk, not the SSD the staging tree is on. Unknown is the honest answer
+    there; the UI takes the pipeline's own figures from status.json instead.
     """
+    out: dict[str, Any] = {"staging_free_gb": None, "staging_total_gb": None,
+                           "staging_used_pct": None}
     for candidate in (path, *path.parents):
+        if candidate == Path(candidate.anchor) and candidate != path:
+            break
         try:
             usage = shutil.disk_usage(str(candidate))
         except OSError:
             continue
-        return (round(usage.free / 1e9, 2),
-                round(usage.used / usage.total * 100, 1) if usage.total else None)
-    return None, None
+        out.update(
+            staging_free_gb=round(usage.free / 1e9, 2),
+            staging_total_gb=round(usage.total / 1e9, 2),
+            staging_used_pct=(round(usage.used / usage.total * 100, 1)
+                              if usage.total else None))
+        break
+    # Inside a container `path` is /staging/<account>, which says nothing
+    # about which disk that is. Compose passes the host side of the mount.
+    out["staging_host_path"] = os.environ.get("PIS_STAGING_HOST_DIR") or str(path)
+    return out
 
 
 def build_status(conn: sqlite3.Connection, cfg, auth_ok: bool | None = None,
@@ -56,8 +76,6 @@ def build_status(conn: sqlite3.Connection, cfg, auth_ok: bool | None = None,
     stale = True
     if parsed is not None:
         stale = datetime.now(timezone.utc) - parsed > timedelta(hours=stale_hours)
-
-    free_gb, used_pct = _disk(cfg.staging)
 
     return {
         "schema": 2,
@@ -85,8 +103,7 @@ def build_status(conn: sqlite3.Connection, cfg, auth_ok: bool | None = None,
         "immich_ok": bool(immich_ok) if immich_ok is not None else None,
         "counts": {k: v for k, v in counts.items() if k != "total"},
         "total_assets": counts.get("total", 0),
-        "staging_free_gb": free_gb,
-        "staging_used_pct": used_pct,
+        **_disk(cfg.staging),
     }
 
 
@@ -114,6 +131,8 @@ SENSORS: list[dict[str, Any]] = [
     {"key": "staged_deletes", "name": "Staged for deletion",
      "icon": "mdi:delete-clock", "unit": "files"},
     {"key": "staging_free_gb", "name": "Staging free", "icon": "mdi:harddisk", "unit": "GB"},
+    {"key": "staging_total_gb", "name": "Staging size", "icon": "mdi:harddisk", "unit": "GB"},
+    {"key": "staging_used_pct", "name": "Staging used", "icon": "mdi:harddisk", "unit": "%"},
     {"key": "last_run", "name": "Last run", "device_class": "timestamp"},
     {"key": "last_success", "name": "Last success", "device_class": "timestamp"},
 ]

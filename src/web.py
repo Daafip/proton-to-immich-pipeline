@@ -464,6 +464,11 @@ class Api:
             return {}
         out = {k: data.get(k) for k in ("auth_ok", "immich_ok")
                if data.get(k) is not None}
+        # This container does not mount the staging tree (it holds Proton
+        # sessions), so it cannot measure that disk itself. The pipeline did,
+        # when it wrote this file.
+        out.update({k: data[k] for k in report.DISK_KEYS
+                    if data.get(k) is not None})
         # When the flags were last established: a days-old "signed in" is
         # a different claim from one made a minute ago.
         if data.get("generated_at"):

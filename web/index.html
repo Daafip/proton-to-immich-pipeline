@@ -78,6 +78,7 @@
   .stat { background: var(--panel-2); padding: 9px 10px; }
   .stat .n { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .stat .k { font-size: 11px; color: var(--ink-dim); text-transform: uppercase; letter-spacing: .04em; }
+  .stat .where { font-size: 11px; color: var(--ink-faint); overflow-wrap: anywhere; margin-top: 2px; }
   .stat.alert .n { color: var(--bad); }
   .stat.note .n { color: var(--warn); }
 
@@ -360,7 +361,7 @@ function renderCards() {
       stat("failed", s.failed, s.failed > 0 ? "alert" : ""),
       stat("quarantined", s.quarantined, s.quarantined > 0 ? "alert" : ""),
       stat("staged", s.staged_deletes, s.staged_deletes > 0 ? "note" : ""),
-      stat("free GB", s.staging_free_gb),
+      diskStat(s),
     ]);
 
     const actions = el("div", { class: "row" }, [
@@ -488,6 +489,24 @@ async function reauth(account) {
     + "the current session is replaced once you finish.",
     "Start sign-in");
   if (ok) startJob(account, "login");
+}
+
+// Free space on the staging disk, with its size and host path when the
+// pipeline reported them. Under 10% free is the same warning colour as a
+// backlog: downloads stop at staging.min_free_gb.
+function diskStat(s) {
+  const free = s.staging_free_gb, total = s.staging_total_gb;
+  const pct = s.staging_used_pct;
+  const cls = pct != null && pct >= 90 ? "alert" : "";
+  const node = stat(total ? `GB free of ${fmtNum(Math.round(total))}` : "free GB",
+                    free == null ? null : Math.round(free), cls);
+  const where = [s.staging_host_path, pct != null ? `${pct}% used` : null]
+    .filter(Boolean).join(" · ");
+  if (where) {
+    node.title = where;
+    node.appendChild(el("div", { class: "where", text: where }));
+  }
+  return node;
 }
 
 function stat(key, value, cls = "") {

@@ -24,6 +24,9 @@ from src import log, report, state  # noqa: E402
 from src.config import DEFAULTS, Config  # noqa: E402
 from tests.helpers import silence_logs  # noqa: E402
 
+# One discovery message per entity, plus the state message itself.
+MESSAGES = len(report.SENSORS) + len(report.BINARY_SENSORS) + 1
+
 
 def make_paho(api_version_required: bool, fail_on: str | None = None):
     """A stand-in paho module.
@@ -171,14 +174,14 @@ class TestPahoVersions(ReportTest):
         "Unsupported callback API version", and publishing stopped dead."""
         module = self.install_paho(api_version_required=True)
         self.assertTrue(self.publish())
-        self.assertEqual(len(module.SENT), 12)
+        self.assertEqual(len(module.SENT), MESSAGES)
         self.assertIn("construct", module.ORDER)
 
     def test_paho_1x_is_still_constructed_bare(self):
         """1.x has no such parameter and rejects a positional argument."""
         module = self.install_paho(api_version_required=False)
         self.assertTrue(self.publish())
-        self.assertEqual(len(module.SENT), 12)
+        self.assertEqual(len(module.SENT), MESSAGES)
 
     def test_a_broken_paho_falls_through_to_mosquitto_pub(self):
         """The regression this is really about: the two transports shared one
@@ -187,7 +190,7 @@ class TestPahoVersions(ReportTest):
         self.install_paho(api_version_required=True, fail_on="connect")
         self.install_mosquitto()
         self.assertTrue(self.publish())
-        self.assertEqual(len(self.mosquitto_runs), 12)
+        self.assertEqual(len(self.mosquitto_runs), MESSAGES)
         failed = self.events_named("mqtt.transport_failed")
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0]["transport"], "paho-mqtt")
@@ -228,7 +231,7 @@ class TestDiagnostics(ReportTest):
         sent = self.events_named("mqtt.published")
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["transport"], "paho-mqtt")
-        self.assertEqual(sent[0]["messages"], 12)
+        self.assertEqual(sent[0]["messages"], MESSAGES)
         self.assertEqual(sent[0]["topic"], "proton_immich_sync/state")
 
     def test_the_mosquitto_transport_names_itself_too(self):
@@ -242,7 +245,7 @@ class TestDiagnostics(ReportTest):
         self.assertFalse(self.publish())
         detail = self.events_named("mqtt.transport_failed")[0]["detail"]
         self.assertIn("Connection refused", detail)
-        self.assertIn("1/12", detail)
+        self.assertIn(f"1/{MESSAGES}", detail)
 
     def test_disabled_mqtt_is_visible_under_v(self):
         """Debug level, not info: most installs do not use MQTT and do not
@@ -338,6 +341,31 @@ class TestDiscoveryShape(ReportTest):
     def test_unique_ids_do_not_collide(self):
         ids = [p["unique_id"] for _, p in report.discovery_payloads(self.account)]
         self.assertEqual(len(ids), len(set(ids)))
+
+
+
+class TestDisk(unittest.TestCase):
+    def test_reports_free_total_and_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = report._disk(Path(tmp) / "not-created-yet")
+        self.assertGreater(disk["staging_total_gb"], 0)
+        self.assertLessEqual(disk["staging_free_gb"], disk["staging_total_gb"])
+        self.assertIsNotNone(disk["staging_used_pct"])
+
+    def test_never_falls_back_to_the_root_filesystem(self):
+        """The UI container has no /staging: walking up to / measured the
+        container's own disk and showed it as the staging SSD."""
+        disk = report._disk(Path("/no-such-staging-mount/default"))
+        self.assertIsNone(disk["staging_free_gb"])
+        self.assertIsNone(disk["staging_total_gb"])
+
+    def test_host_path_comes_from_compose(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ,
+                             {"PIS_STAGING_HOST_DIR": "/mnt/immich/pis/staging"}):
+            disk = report._disk(Path("/staging/default"))
+        self.assertEqual(disk["staging_host_path"], "/mnt/immich/pis/staging")
 
 
 if __name__ == "__main__":

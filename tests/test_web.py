@@ -181,6 +181,20 @@ class TestApiReads(WebTest):
                     "staged_deletes", "last_run", "last_success", "auth_ok"):
             self.assertIn(key, row)
 
+    def test_disk_figures_come_from_the_pipeline_not_this_container(self):
+        """The UI container does not mount /staging, so what it could measure
+        itself is its own root disk. The pipeline's status.json wins."""
+        self.seed_asset()
+        self.cfg.status_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.status_path.write_text(json.dumps({
+            "staging_free_gb": 123.4, "staging_total_gb": 931.5,
+            "staging_used_pct": 86.8,
+            "staging_host_path": "/mnt/immich/pis/staging"}))
+        row = self.api().get_accounts()["accounts"][0]
+        self.assertEqual(row["staging_free_gb"], 123.4)
+        self.assertEqual(row["staging_total_gb"], 931.5)
+        self.assertEqual(row["staging_host_path"], "/mnt/immich/pis/staging")
+
     def test_no_endpoint_leaks_the_immich_key(self):
         self.stage()
         api = self.api()
