@@ -1250,12 +1250,23 @@ class Pipeline:
             node_id = row["node_id"]
             path = row["remote_path"]
 
-            if action == "mark_only":
+            # A Photos-timeline row cannot be trashed from the CLI at all:
+            # `filesystem info` and `filesystem trash` refuse /photos, and
+            # cli-drive has no photo equivalent. Under execute it would only
+            # ever fail, so it is handled exactly as mark_only handles it --
+            # the operator deletes it in the Proton app -- while /my-files
+            # rows in the same pass are still trashed for real.
+            photos_row = action == "execute" and proton.is_photos_path(path)
+
+            if action == "mark_only" or photos_row:
                 # Nothing is called on Proton. The row records that the
                 # operator is doing the deletion themselves, which is the
                 # honest state for a Photos-section library the CLI may refuse.
+                extra = ({"reason": "photos section: delete it in the Proton app"}
+                         if photos_row else {})
                 if dry:
-                    log.info("delete.dry_run_mark_only", node_id=node_id, path=path)
+                    log.info("delete.dry_run_mark_only", node_id=node_id, path=path,
+                             **extra)
                     self.stats.delete_skipped += 1
                     continue
                 state.mark_remote_trashed(self.conn, self.account, row,
@@ -1263,7 +1274,7 @@ class Pipeline:
                 self.stats.trashed += 1
                 log.transition(node_id, state.STAGED_FOR_DELETE,
                                state.REMOTE_TRASHED, path=path,
-                               action="mark_only")
+                               action="mark_only", **extra)
                 continue
 
             if not path:

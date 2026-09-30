@@ -603,6 +603,13 @@ function renderProblems(data) {
   ]));
 }
 
+// The Photos timeline cannot be trashed from the CLI, so under execute these
+// rows are only marked done: they are deleted by hand in the Proton app.
+function isPhotosPath(path) {
+  const p = String(path || "");
+  return p === "/photos" || p.startsWith("/photos/");
+}
+
 function renderStaged() {
   const host = $("#staged-body");
   host.textContent = "";
@@ -623,6 +630,14 @@ function renderStaged() {
       ? "delete.action is mark_only: nothing is sent to Proton. Delete these there yourself, then mark them done here."
       : "delete.action is execute: confirming runs `filesystem trash` in Proton. Proton's trash is the undo.",
   ]));
+
+  const manualRows = markOnly ? [] : pending.filter((r) => isPhotosPath(r.remote_path));
+  if (manualRows.length) {
+    host.appendChild(el("div", { class: "note" }, [
+      `${manualRows.length} staged file(s) are in the Photos timeline (/photos), which the CLI cannot trash. `
+      + "Those are only marked done: delete them in the Proton app yourself, before or after confirming.",
+    ]));
+  }
 
   if (!rows.length) {
     host.appendChild(el("div", { class: "center muted",
@@ -685,7 +700,14 @@ function renderStaged() {
         : el("span", { class: "faint", text: "–" })]),
       el("td", { text: r.remote_name || "–" }),
       el("td", { text: fmtDate(r.capture_time) }),
-      el("td", { class: "path mono", text: r.remote_path || "–" }),
+      el("td", { class: "path mono" }, [
+        r.remote_path || "–",
+        !markOnly && isPhotosPath(r.remote_path)
+          ? el("span", { class: "pill", style: "margin-left:6px",
+                         title: "Photos timeline: marked done only, delete it in the Proton app",
+                         text: "manual" })
+          : null,
+      ]),
       el("td", { class: "mono faint", title: r.node_id, text: String(r.node_id).slice(0, 12) + "…" }),
       el("td", { title: r.staged_at, text: fmtWhen(r.staged_at) }),
       el("td", {}, [el("span", { class: "pill " + (r.state === "failed" ? "bad" : ""), text: r.state })]),
@@ -776,10 +798,16 @@ async function executeSelected() {
 
   if (!S.dryRun) {
     const title = markOnly ? `Mark ${ids.length} as deleted?` : `Trash ${ids.length} in Proton?`;
+    const manual = markOnly ? 0 : (data.staged || [])
+      .filter((r) => S.selected.has(r.id) && isPhotosPath(r.remote_path)).length;
     const body = markOnly
       ? `This records that you deleted ${ids.length} file(s) in Proton yourself. Nothing is sent to Proton.`
-      : `This moves ${ids.length} file(s) to Proton's trash, where they can be restored. `
-        + `Each node is re-checked against Proton first, and anything that has changed is skipped.`;
+      : `This moves ${ids.length - manual} file(s) to Proton's trash, where they can be restored. `
+        + `Each node is re-checked against Proton first, and anything that has changed is skipped.`
+        + (manual
+            ? ` ${manual} file(s) in the Photos timeline cannot be trashed from here: they are only `
+              + `marked done, so delete them in the Proton app yourself.`
+            : "");
     if (!await confirmDialog(title, body, markOnly ? "Mark done" : "Trash them")) return;
   }
 

@@ -887,6 +887,57 @@ class TestMarkOnly(DeleteTest):
         self.assertEqual(state.count_staged(self.conn, ACCOUNT), 1)
 
 
+class TestExecuteWithAPhotosRoot(DeleteTest):
+    """An execute account that also syncs the Photos timeline. cli-drive
+    cannot look up or trash /photos, so those rows are handled as mark_only
+    would handle them while /my-files-style rows are still trashed for real."""
+
+    PHOTO = "/photos/PXL_20260926_165737780.jpg"
+    FILE = "/Photos/IMG_0.jpg"
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.set("delete.action", "execute")
+        self.cfg.set("proton.roots", ["/Photos", "/photos"])
+        # What the real backend does with a /photos path.
+        self.backend.resolve_fail_paths.add(self.PHOTO)
+        self.backend.trash_fail_paths.add(self.PHOTO)
+
+    def stage(self):
+        self.backend.add(self.FILE, b"file" * 10)
+        self.backend.add(self.PHOTO, b"photo" * 10)
+        self.pipe(run_id="r1").run()
+        for node_id in ("node-1", "node-2"):
+            self.trash_in_immich(node_id)
+        self.pipe(run_id="r2").reconcile()
+        return self.staged_ids()
+
+    def test_the_photo_is_marked_done_and_the_file_is_trashed(self):
+        ids = self.stage()
+        pipeline = self.pipe(run_id="r3")
+        pipeline.execute_deletes(ids=ids)
+        self.assertEqual(pipeline.stats.trashed, 2)
+        self.assertEqual(pipeline.stats.delete_failed, 0)
+        self.assertEqual(self.backend.trash_calls, [self.FILE])
+        self.assertIn(self.PHOTO, self.backend.files)
+        for node_id in ("node-1", "node-2"):
+            self.assertEqual(state.get(self.conn, ACCOUNT, node_id)["status"],
+                             state.REMOTE_TRASHED)
+        results = {r["remote_path"]: r["result"]
+                   for r in state.deletions(self.conn, ACCOUNT)}
+        self.assertEqual(results, {self.FILE: "trashed", self.PHOTO: "mark_only"})
+
+    def test_dry_run_changes_nothing(self):
+        ids = self.stage()
+        pipeline = self.pipe(run_id="r3")
+        pipeline.execute_deletes(ids=ids, dry_run=True)
+        self.assertEqual(pipeline.stats.delete_skipped, 2)
+        self.assertEqual(pipeline.stats.delete_failed, 0)
+        self.assertEqual(self.backend.trash_calls, [])
+        self.assertEqual(state.count_staged(self.conn, ACCOUNT), 2)
+        self.assertEqual(state.deletions(self.conn, ACCOUNT), [])
+
+
 class TestUnstage(DeleteTest):
     def test_a_row_can_be_taken_back_off_the_queue(self):
         """The escape hatch: restore it in Immich, unstage it here, and it is
