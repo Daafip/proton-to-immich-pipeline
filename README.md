@@ -1,5 +1,8 @@
 # proton-to-immich-pipeline
 
+> [!Warning]
+> Although extensively tested, prompted by me and in my own use, this is 100% coded by AI. Use with caution. 
+
 One-way, incremental, resumable sync: **Proton Drive → staging → Immich**.
 Python 3.11+, standard library only. Runs unattended under systemd and reports
 its health to Home Assistant.

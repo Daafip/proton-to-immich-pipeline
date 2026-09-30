@@ -717,12 +717,8 @@ def frame_ancestors(raw: str | None = None) -> str:
     CSP has no CIDR syntax -- list Home Assistant's actual address.
     """
     raw = os.environ.get(FRAME_ANCESTORS_ENV, "") if raw is None else raw
-    if any(ord(ch) < 32 and ch != "\t" for ch in raw.strip()):
-        log.warn("web.frame_ancestors_invalid", source=repr(raw)[:100],
-                 detail="control characters; the UI stays unembeddable")
-        return "'none'"
     sources = []
-    for token in re.split(r"[ \t,]+", raw.strip()):
+    for token in re.split(r"[\s,]+", raw.strip()):
         if not token:
             continue
         if token in ("self", "none"):
