@@ -287,3 +287,12 @@ Everything the build plan had to guess about the Proton CLI — credentials,
 sign-in, flags, JSON shape — has since been verified against the real binary
 and corrected. [docs/proton-drive-cli.md](docs/proton-drive-cli.md) records
 what it actually does and which assumptions were wrong.
+
+## License
+
+Copyright (C) 2026 David Haasnoot
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE) for the full text.
