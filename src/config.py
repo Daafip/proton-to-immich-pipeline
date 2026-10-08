@@ -240,6 +240,10 @@ DEFAULTS: dict[str, Any] = {
         # supply a plaintext password instead; it is hashed at load time and
         # never written anywhere.
         "password_hash": "",
+        # sha256 hash from `sync.py web-token`, for a proxy that sends
+        # `Authorization: Bearer <token>` (Home Assistant's hass_ingress).
+        # PIS_WEB_TOKEN_HASH wins. Empty means no token login.
+        "token_hash": "",
         "session_hours": 168,
         # Cookie signing key. Generated and kept in the state dir when unset,
         # so sessions survive a restart.

@@ -291,6 +291,9 @@ function confirmDialog(title, body, confirmLabel) {
 }
 
 // ---------------------------------------------------------------- fetch
+// Paths are relative -- api/accounts, with no leading slash. Opened directly
+// that is the same URL; opened through Home Assistant's ingress the page lives
+// under /api/ingress/<panel>/, and an absolute path would reach HA's own API.
 async function api(path, options = {}) {
   const init = { credentials: "same-origin", headers: {}, ...options };
   if (init.body !== undefined) {
@@ -676,7 +679,7 @@ function renderStaged() {
     // is invalid and does not reliably navigate.
     el("a", {
       class: "btn-link", download: "",
-      href: `/api/staged-deletes.csv?account=${encodeURIComponent(data.account)}`,
+      href: `api/staged-deletes.csv?account=${encodeURIComponent(data.account)}`,
       text: "CSV",
     }),
   ]);
@@ -775,7 +778,7 @@ function checkbox(checked, onchange) {
 // ---------------------------------------------------------------- actions
 async function startJob(account, type) {
   try {
-    const result = await api("/api/jobs", { body: { account, type } });
+    const result = await api("api/jobs", { body: { account, type } });
     if (result.rejected) {
       // The plan's "a second click while running is rejected with a clear
       // message" -- the server decides, so both job runners behave alike.
@@ -812,7 +815,7 @@ async function executeSelected() {
   }
 
   try {
-    const result = await api("/api/staged-deletes/execute", {
+    const result = await api("api/staged-deletes/execute", {
       body: { account: data.account, ids, dry_run: S.dryRun },
     });
     if (result.rejected) { toast(result.reason, true); return; }
@@ -841,7 +844,7 @@ async function unstage(row) {
     "Unstage");
   if (!ok) return;
   try {
-    await api("/api/staged-deletes/unstage", {
+    await api("api/staged-deletes/unstage", {
       body: { account: S.staged.account, ids: [row.id] },
     });
     S.selected.delete(row.id);
@@ -889,7 +892,7 @@ function schedule(assumeBusy = false) {
 async function refresh() {
   if (!S.authed) return;
   try {
-    const accounts = await api("/api/accounts");
+    const accounts = await api("api/accounts");
     S.accounts = accounts.accounts || [];
     if (!S.account || !S.accounts.some((a) => a.account === S.account)) {
       S.account = S.accounts.length ? S.accounts[0].account : null;
@@ -898,18 +901,18 @@ async function refresh() {
     $("#updated").textContent = "updated " + new Date().toLocaleTimeString();
 
     if (S.account) {
-      S.staged = await api(`/api/staged-deletes?account=${encodeURIComponent(S.account)}`);
+      S.staged = await api(`api/staged-deletes?account=${encodeURIComponent(S.account)}`);
       // Drop selections for rows that are no longer staged.
       const live = new Set(S.staged.staged.filter((r) => r.state === "staged").map((r) => r.id));
       for (const id of [...S.selected]) if (!live.has(id)) S.selected.delete(id);
       renderStaged();
       renderProblems(
-        await api(`/api/problems?account=${encodeURIComponent(S.account)}`));
+        await api(`api/problems?account=${encodeURIComponent(S.account)}`));
     }
 
     const runs = [];
     for (const a of S.accounts) {
-      const data = await api(`/api/runs?account=${encodeURIComponent(a.account)}&limit=10`);
+      const data = await api(`api/runs?account=${encodeURIComponent(a.account)}&limit=10`);
       for (const r of data.runs) runs.push({ ...r, account: a.account });
     }
     runs.sort((x, y) => String(y.started_at || "").localeCompare(String(x.started_at || "")));
@@ -931,7 +934,8 @@ function showLogin() {
 function showApp() {
   $("#login").hidden = true;
   $("#app").hidden = false;
-  $("#logout").hidden = !S.cfg.auth_required;
+  // Signed in by a proxy's token (Home Assistant), signing out cannot stick.
+  $("#logout").hidden = !S.cfg.auth_required || S.cfg.token_auth;
   const pill = $("#runner-pill");
   pill.textContent = S.cfg.job_runner === "systemd" ? "systemd" : "worker";
   pill.title = S.cfg.job_runner === "systemd"
@@ -953,7 +957,7 @@ async function login() {
   const err = $("#login-err");
   err.hidden = true;
   try {
-    await api("/api/login", { body: { password: $("#pw").value } });
+    await api("api/login", { body: { password: $("#pw").value } });
     $("#pw").value = "";
     S.authed = true;
     await start();
@@ -969,7 +973,7 @@ async function start() {
 }
 
 async function boot() {
-  S.cfg = await api("/api/config");
+  S.cfg = await api("api/config");
   if (!S.cfg.auth_required) {
     S.authed = true;
     await start();
@@ -978,7 +982,7 @@ async function boot() {
   // Probe with a real request: a valid cookie from a previous visit means we
   // are already in, and there is no endpoint that just says so.
   try {
-    await api("/api/accounts");
+    await api("api/accounts");
     S.authed = true;
     await start();
   } catch (_) {
@@ -991,7 +995,7 @@ $("#pw").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); })
 $("#refresh").addEventListener("click", () => refresh());
 $("#copybox-close").addEventListener("click", () => $("#copybox").close());
 $("#logout").addEventListener("click", async () => {
-  await api("/api/logout", { body: {} });
+  await api("api/logout", { body: {} });
   S.authed = false;
   showLogin();
 });

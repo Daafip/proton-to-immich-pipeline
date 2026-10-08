@@ -68,6 +68,7 @@ against live services — see
 | `agent` | Run one pipeline forever: its schedule plus its job queue. What a container runs. |
 | `migrate` | Move an existing install to the layout the config asks for. |
 | `web-password` | Hash a password for `web.password_hash`. |
+| `web-token` | Generate a bearer token for a Home Assistant ingress panel, plus its `web.token_hash`. |
 
 Every command works on one account (`--account`, or `$PIS_ACCOUNT`, implicit
 when there is one). `status` and `serve` span all of them.
@@ -282,6 +283,13 @@ Three deliberate departures from the plans:
   - **Mixed content.** If Home Assistant is served over HTTPS (Nabu Casa,
     a proxy), the browser refuses an `http://…:8080` iframe outright. The UI
     must then be HTTPS too.
+
+  **[hass_ingress](https://github.com/lovelylain/hass_ingress) avoids both
+  problems.** It serves the UI from HA's own origin, and HA can log you in by
+  sending a token from `sync.py web-token` in the panel's `headers:`. Requests
+  that come through ingress allow framing by `'self'` (which is HA there)
+  without any `PIS_WEB_FRAME_ANCESTORS` setting. See
+  [operations.md → The UI as a Home Assistant panel](docs/operations.md#the-ui-as-a-home-assistant-panel-hass_ingress).
 
 Everything the build plan had to guess about the Proton CLI — credentials,
 sign-in, flags, JSON shape — has since been verified against the real binary

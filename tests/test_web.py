@@ -482,7 +482,7 @@ class HttpTest(WebTest):
         self.thread.join(timeout=5)
         super().tearDown()
 
-    def request(self, path, body=None, method=None, cookie=True):
+    def request(self, path, body=None, method=None, cookie=True, headers=None):
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data,
@@ -491,6 +491,8 @@ class HttpTest(WebTest):
             req.add_header("Content-Type", "application/json")
         if cookie and self.cookie:
             req.add_header("Cookie", self.cookie)
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return resp.status, resp.read(), dict(resp.headers)
@@ -889,3 +891,206 @@ class TestFrameAncestors(unittest.TestCase):
         self.assertTrue(csp.endswith(
             "frame-ancestors 'self' http://homeassistant.local:8123"))
         self.assertNotIn("X-Frame-Options", web.security_headers("'none'"))
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant ingress: bearer token, frame-ancestors, relative paths
+# ---------------------------------------------------------------------------
+
+class TestToken(WebTest):
+    def test_the_hash_has_no_dollar_and_matches_its_token(self):
+        token = web.new_token()
+        digest = web.hash_token(token)
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        self.assertNotIn(token, digest)
+        self.assertTrue(web.verify_token(digest, f"Bearer {token}"))
+        self.assertTrue(web.verify_token(digest, f"bearer  {token} "))
+
+    def test_anything_else_is_refused(self):
+        token = web.new_token()
+        digest = web.hash_token(token)
+        for header in (None, "", token, f"Basic {token}", "Bearer ",
+                       f"Bearer {token}x", f"Bearer {web.new_token()}"):
+            self.assertFalse(web.verify_token(digest, header), header)
+        self.assertFalse(web.verify_token("", f"Bearer {token}"))
+
+    def test_a_malformed_hash_stops_the_server(self):
+        self.cfg.set("web.token_hash", "sha256$abc")
+        with self.assertRaises(ValueError) as ctx:
+            web.Api(self.cfg, require_auth=True)
+        self.assertIn("web-token", str(ctx.exception))
+
+    def test_the_config_key_works_and_the_env_wins(self):
+        from_cfg, from_env = web.new_token(), web.new_token()
+        self.cfg.set("web.token_hash", web.hash_token(from_cfg))
+        self.assertTrue(web.Api(self.cfg).token_ok(f"Bearer {from_cfg}"))
+        with mock.patch.dict(os.environ,
+                             {web.TOKEN_ENV: web.hash_token(from_env)}):
+            api = web.Api(self.cfg)
+        self.assertTrue(api.token_ok(f"Bearer {from_env}"))
+        self.assertFalse(api.token_ok(f"Bearer {from_cfg}"))
+
+    def test_a_token_alone_counts_as_auth_configured(self):
+        self.cfg.set("web.password_hash", "")
+        self.cfg.set("web.token_hash", web.hash_token(web.new_token()))
+        api = web.Api(self.cfg, require_auth=True)
+        self.assertTrue(api.auth_configured)
+        self.assertTrue(api.require_auth)
+        self.assertFalse(api.authorised(None, None))
+
+    def test_no_token_configured_changes_nothing(self):
+        api = web.Api(self.cfg, require_auth=True)
+        self.assertEqual(api.token_hash, "")
+        self.assertFalse(api.authorised(None, f"Bearer {web.new_token()}"))
+
+
+class TestHttpToken(HttpTest):
+    """What hass_ingress does: `headers: authorization: Bearer <token>`."""
+
+    def setUp(self):
+        self.token = web.new_token()
+        with mock.patch.dict(os.environ,
+                             {web.TOKEN_ENV: web.hash_token(self.token)}):
+            super().setUp()
+
+    def bearer(self, token=None):
+        return {"Authorization": f"Bearer {token or self.token}"}
+
+    def test_the_token_gets_in_without_a_login(self):
+        status, _, _ = self.request("/api/accounts", headers=self.bearer())
+        self.assertEqual(status, 200)
+        status, _, _ = self.request("/api/jobs", {"type": "sync"},
+                                    headers=self.bearer())
+        self.assertEqual(status, 202)
+
+    def test_a_wrong_or_missing_token_does_not(self):
+        self.assertEqual(self.request("/api/accounts")[0], 401)
+        self.assertEqual(self.request(
+            "/api/accounts", headers=self.bearer(web.new_token()))[0], 401)
+        self.assertEqual(self.request(
+            "/api/accounts", headers={"Authorization": f"Basic {self.token}"})[0],
+            401)
+
+    def test_the_password_still_works_alongside_it(self):
+        self.assertEqual(self.login()[0], 200)
+        self.assertEqual(self.request("/api/accounts")[0], 200)
+
+    def test_config_says_when_the_token_signed_the_page_in(self):
+        _, body, _ = self.request("/api/config", headers=self.bearer())
+        self.assertTrue(json.loads(body)["token_auth"])
+        _, body, _ = self.request("/api/config")
+        self.assertFalse(json.loads(body)["token_auth"])
+
+    def test_a_form_post_is_still_refused_with_the_token(self):
+        """The JSON-only rule is the CSRF defence; the token does not
+        replace it."""
+        url = f"http://127.0.0.1:{self.port}/api/jobs"
+        req = urllib.request.Request(url, data=b"type=sync", method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        req.add_header("Authorization", f"Bearer {self.token}")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(ctx.exception.code, 400)
+
+
+class TestHttpTokenOnly(HttpTest):
+    """No password at all: the UI is only ever opened through HA."""
+
+    def setUp(self):
+        self.token = web.new_token()
+        with mock.patch.dict(os.environ,
+                             {web.TOKEN_ENV: web.hash_token(self.token)}):
+            WebTest.setUp(self)
+            self.cfg.set("web.password_hash", "")
+            self.server = web.build_server(self.cfg, "127.0.0.1", 0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": 0.05},
+                                       daemon=True)
+        self.thread.start()
+        self.cookie = None
+
+    def test_routes_still_need_the_token(self):
+        self.assertEqual(self.request("/api/accounts")[0], 401)
+        self.assertEqual(self.request(
+            "/api/accounts",
+            headers={"Authorization": f"Bearer {self.token}"})[0], 200)
+
+    def test_login_explains_there_is_no_password(self):
+        status, payload = self.login("anything")
+        self.assertEqual(status, 400)
+        self.assertIn("no web password", payload["error"])
+
+    def test_a_token_satisfies_the_lan_bind_check(self):
+        """A token is a credential, so this is not the unauthenticated bind
+        that `serve` refuses."""
+        with mock.patch.dict(os.environ,
+                             {web.TOKEN_ENV: web.hash_token(self.token)}):
+            api = web.Api(self.cfg, require_auth=True)
+        self.assertTrue(api.auth_configured)
+
+
+class TestIngressAncestors(unittest.TestCase):
+    def test_none_becomes_self(self):
+        self.assertEqual(web.ingress_ancestors("'none'"), "'self'")
+
+    def test_self_is_added_once(self):
+        self.assertEqual(web.ingress_ancestors("http://ha:8123"),
+                         "'self' http://ha:8123")
+        self.assertEqual(web.ingress_ancestors("'self' http://ha:8123"),
+                         "'self' http://ha:8123")
+
+
+class TestHttpIngress(HttpTest):
+    INGRESS = {"X-Ingress-Path": "/api/ingress/immich_sync"}
+
+    def test_through_ingress_home_assistant_may_frame_it(self):
+        """The error this fixes: Firefox's "will not allow Firefox to display
+        the page if another site has embedded it" inside the HA panel."""
+        _, _, headers = self.request("/", headers=self.INGRESS)
+        csp = headers["Content-Security-Policy"]
+        self.assertTrue(csp.endswith("frame-ancestors 'self'"), csp)
+        _, _, headers = self.request("/api/config", headers=self.INGRESS)
+        self.assertTrue(headers["Content-Security-Policy"].endswith(
+            "frame-ancestors 'self'"))
+
+    def test_without_ingress_nothing_changes(self):
+        _, _, headers = self.request("/")
+        self.assertTrue(headers["Content-Security-Policy"].endswith(
+            "frame-ancestors 'none'"))
+        self.assertNotIn("X-Frame-Options", headers)
+
+    def test_configured_ancestors_are_kept(self):
+        self.server.ingress_security_headers = web.security_headers(
+            web.ingress_ancestors("http://homeassistant.local:8123"))
+        _, _, headers = self.request("/", headers=self.INGRESS)
+        self.assertTrue(headers["Content-Security-Policy"].endswith(
+            "frame-ancestors 'self' http://homeassistant.local:8123"))
+
+    def test_the_page_uses_only_relative_api_paths(self):
+        """Under ingress the page lives at /api/ingress/<panel>/; an absolute
+        "/api/..." would hit Home Assistant's own API instead of this one."""
+        _, body, _ = self.request("/")
+        text = body.decode()
+        for needle in ('"/api/', "'/api/", "`/api/"):
+            self.assertNotIn(needle, text)
+        self.assertIn('"api/config"', text)
+
+
+class TestWebTokenCommand(unittest.TestCase):
+    def test_prints_a_matching_token_and_hash(self):
+        import contextlib
+        import io
+        import re as re_mod
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import sync
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(sync.cmd_web_token(None, None), 0)
+        text = out.getvalue()
+        token = re_mod.search(r'^immich-auth: "Bearer ([A-Za-z0-9_-]+)"$',
+                              text, re_mod.M).group(1)
+        digest = re_mod.search(r"^PIS_WEB_TOKEN_HASH=(\S+)$",
+                               text, re_mod.M).group(1)
+        self.assertEqual(digest, web.hash_token(token))
+        self.assertNotIn("$", digest)

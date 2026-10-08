@@ -144,6 +144,48 @@ def load_secret(cfg) -> bytes:
     return secret
 
 
+# --------------------------------------------------------------------------
+# bearer token -- for a proxy that has already authenticated the person
+# --------------------------------------------------------------------------
+#
+# Home Assistant's hass_ingress serves the UI from HA's own origin and can add
+# a header to every request it forwards (`headers: authorization: ...`). HA
+# has already checked who is asking by then, so the UI's own login would only
+# be a second password prompt inside the panel. The token is that header.
+#
+# sha256, not scrypt: the token is 32 random bytes, so there is no dictionary
+# to slow down, and it is checked on every poll -- scrypt there would cost
+# ~100 ms per request. The hash is colon-separated for the same reason the
+# password hash is: a `$` would not survive a .env file.
+
+TOKEN_ENV = "PIS_WEB_TOKEN_HASH"
+_TOKEN_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def new_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def hash_token(token: str) -> str:
+    return f"sha256:{sha256(token.encode('utf-8')).hexdigest()}"
+
+
+def verify_token(stored: str, authorization: str | None) -> bool:
+    """`Authorization: Bearer <token>` against the stored hash.
+
+    Browsers never attach a Bearer header on their own -- only the Basic and
+    Digest credentials they prompted for -- so this adds no CSRF exposure:
+    a cross-site page cannot make a victim's browser send it.
+    """
+    if not stored or not authorization:
+        return False
+    scheme, _, token = authorization.strip().partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        return False
+    return hmac.compare_digest(hash_token(token), stored)
+
+
 def sign_session(secret: bytes, expires_at: int) -> str:
     payload = base64.urlsafe_b64encode(
         json.dumps({"exp": expires_at}).encode()).decode().rstrip("=")
@@ -349,8 +391,21 @@ class Api:
                 f"file, the `$` characters were interpolated away -- "
                 f"regenerate it with `sync.py web-password`, which now emits "
                 f"a colon-separated hash that survives that trip.")
-        self.require_auth = bool(require_auth and self.password_hash)
-        self.auth_configured = bool(self.password_hash)
+        self.token_hash = str(
+            os.environ.get(TOKEN_ENV)
+            or cfg.get("web.token_hash", "") or "").strip()
+        if self.token_hash and not _TOKEN_HASH.match(self.token_hash):
+            # Same reasoning as the password: a token that can never match
+            # should stop the server, not quietly show a login form in HA.
+            raise ValueError(
+                f"web.token_hash / {TOKEN_ENV} is not a sha256:<64 hex> "
+                f"hash ({self.token_hash[:24]!r}...). Generate one with "
+                f"`sync.py web-token`.")
+        # Either credential counts as "auth is set up": a token alone is a
+        # legitimate setup for a UI only ever opened through Home Assistant.
+        self.require_auth = bool(
+            require_auth and (self.password_hash or self.token_hash))
+        self.auth_configured = bool(self.password_hash or self.token_hash)
         self.session_hours = int(cfg.get("web.session_hours", 168))
 
     # -- db ----------------------------------------------------------------
@@ -687,10 +742,16 @@ class Api:
         expires = int(time.time() + self.session_hours * 3600)
         return sign_session(self.secret, expires)
 
-    def authorised(self, cookie_value: str | None) -> bool:
+    def authorised(self, cookie_value: str | None,
+                   authorization: str | None = None) -> bool:
         if not self.require_auth:
             return True
-        return check_session(self.secret, cookie_value)
+        return (check_session(self.secret, cookie_value)
+                or self.token_ok(authorization))
+
+    def token_ok(self, authorization: str | None) -> bool:
+        return bool(self.token_hash) and verify_token(self.token_hash,
+                                                      authorization)
 
 
 # --------------------------------------------------------------------------
@@ -732,6 +793,28 @@ def frame_ancestors(raw: str | None = None) -> str:
         # 'none' combined with anything is 'none' anyway; say it plainly.
         return "'none'"
     return " ".join(dict.fromkeys(sources))
+
+
+# Set by Home Assistant's ingress proxies -- hass_ingress and the Supervisor's
+# own -- on every request they forward.
+INGRESS_PATH_HEADER = "X-Ingress-Path"
+
+
+def ingress_ancestors(ancestors: str) -> str:
+    """frame-ancestors for a response that goes out through HA's ingress.
+
+    Ingress serves the UI from Home Assistant's own origin, inside an iframe
+    on that same origin, so 'self' *is* Home Assistant there. Adding it opens
+    nothing: a document on the same origin can already script the frame, and
+    a page on any other site still fails the check. Nor can a framing site
+    switch this on, because a browser does not send custom headers when it
+    loads an iframe -- only the proxy does.
+    """
+    if ancestors == "'none'":
+        return "'self'"
+    if "'self'" in ancestors.split():
+        return ancestors
+    return f"'self' {ancestors}"
 
 
 def security_headers(ancestors: str | None = None) -> dict[str, str]:
@@ -776,6 +859,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         headers = getattr(self.server, "security_headers", None) or SECURITY_HEADERS
+        if self.headers.get(INGRESS_PATH_HEADER):
+            headers = (getattr(self.server, "ingress_security_headers", None)
+                       or headers)
         for key, value in headers.items():
             self.send_header(key, value)
         for key, value in (extra or {}).items():
@@ -863,9 +949,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/config" and method == "GET":
             # The only unauthenticated read: it tells the page whether to show
             # a login form, and carries nothing worth protecting.
-            return self._json(api.get_config())
+            config = api.get_config()
+            # Behind a proxy that adds the token, "Sign out" cannot work --
+            # the next request carries the header again -- so the page hides
+            # the button.
+            config["token_auth"] = api.token_ok(
+                self.headers.get("Authorization"))
+            return self._json(config)
 
-        if not api.authorised(self._cookie()):
+        if not api.authorised(self._cookie(), self.headers.get("Authorization")):
             return self._error(401, "authentication required")
 
         try:
@@ -933,7 +1025,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = self._body()
         except ValueError as exc:
             return self._error(400, str(exc))
-        if not api.auth_configured:
+        if not api.password_hash:
+            # Includes a token-only setup: that UI is meant to be opened
+            # through the proxy that adds the token, not logged into.
             return self._error(400, "no web password is configured")
         token = api.login(str(body.get("password") or ""))
         if token is None:
@@ -1003,6 +1097,8 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     api: Api
     # Read from the environment once, when the server is built.
     security_headers: dict[str, str] | None = None
+    # The same, for requests that arrive through Home Assistant's ingress.
+    ingress_security_headers: dict[str, str] | None = None
 
     def handle_error(self, request, client_address) -> None:
         """One log line, not a traceback on stderr.
@@ -1025,6 +1121,8 @@ def build_server(cfg, bind: str, port: int, require_auth: bool = True) -> Server
     server = Server((bind, port), Handler)
     server.api = api
     server.security_headers = security_headers()
+    server.ingress_security_headers = security_headers(
+        ingress_ancestors(frame_ancestors()))
     return server
 
 
@@ -1103,9 +1201,12 @@ def serve(cfg, port: int | None = None, bind: str | None = None,
     server = Server((bind, port), Handler)
     server.api = api  # the handler reads it off the server, one per process
     server.security_headers = security_headers()
+    server.ingress_security_headers = security_headers(
+        ingress_ancestors(frame_ancestors()))
     log.info("web.listening", bind=bind, port=port,
              accounts=",".join(api.accounts),
              auth="on" if api.require_auth else "off",
+             token_auth="on" if api.token_hash else "off",
              runner=str(cfg.get("web.job_runner", "subprocess")),
              frame_ancestors=frame_ancestors())
     print(f"proton-immich-sync UI on http://{bind}:{port}", file=sys.stderr)

@@ -114,6 +114,10 @@ services:
       PIS_WEB_PASSWORD_HASH: ${PIS_WEB_PASSWORD_HASH:-}
       # Who may iframe the UI (Home Assistant). Empty = nobody. See .env.example.
       PIS_WEB_FRAME_ANCESTORS: ${PIS_WEB_FRAME_ANCESTORS:-}
+      # Bearer token for Home Assistant's hass_ingress panel, which logs you
+      # in without the password. `docker compose run --rm ui web-token`
+      # prints this line for .env. Empty = no token login.
+      PIS_WEB_TOKEN_HASH: ${PIS_WEB_TOKEN_HASH:-}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ${PIS_STATE_DIR:-./state}:/state

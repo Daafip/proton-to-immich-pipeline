@@ -3,7 +3,7 @@
 
     sync.py pull | download | push | verify | reap | reconcile | run | status
     sync.py staged | delete-staged | unstage        the delete queue
-    sync.py serve | web-password                    the web UI
+    sync.py serve | web-password | web-token        the web UI
 
 Exit codes: 0 ok, 1 partial failure, 2 auth failure, 3 lock held.
 
@@ -224,6 +224,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("web-password", parents=[common],
                    help="hash a password for web.password_hash")
+
+    sub.add_parser("web-token", parents=[common],
+                   help="generate a bearer token for a proxy such as Home "
+                        "Assistant's hass_ingress, plus its web.token_hash")
 
     sub.add_parser("agent", parents=[common],
                    help="run one pipeline forever: the schedule plus the job "
@@ -596,6 +600,32 @@ def cmd_web_password(cfg, args) -> int:
     return EXIT_OK
 
 
+def cmd_web_token(cfg, args) -> int:
+    """Generate a bearer token and its hash.
+
+    Generated rather than chosen, unlike the password: nobody types it, it
+    lives in Home Assistant's secrets.yaml, and being random is what lets the
+    server keep a fast sha256 of it instead of scrypt. Printing it is the
+    point -- this is the only time it exists in the clear here.
+    """
+    from src.web import hash_token, new_token
+    token = new_token()
+    digest = hash_token(token)
+    print("Home Assistant -- secrets.yaml (referenced from the ingress "
+          "panel's\n`headers: authorization: !secret immich-auth`):\n")
+    print(f"immich-auth: \"Bearer {token}\"")
+    print("\nDocker -- put this line in .env, then recreate the ui "
+          "container:\n")
+    print(f"PIS_WEB_TOKEN_HASH={digest}")
+    print("\nBare metal -- put this in the config, or use the same env")
+    print("line above in the service's EnvironmentFile:\n")
+    print("web:")
+    print(f"  token_hash: \"{digest}\"")
+    print("\nRun this again to rotate it; the old token stops working once "
+          "the\nnew hash is in place.")
+    return EXIT_OK
+
+
 def exit_code_for(stats) -> int:
     if (stats.failed or stats.quarantined or stats.aborted
             or stats.delete_failed):
@@ -619,6 +649,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "web-password":
         return cmd_web_password(cfg, args)
+
+    if args.command == "web-token":
+        return cmd_web_token(cfg, args)
 
     if args.command == "migrate":
         return cmd_migrate(cfg, args)

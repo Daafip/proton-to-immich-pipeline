@@ -595,6 +595,55 @@ delete queue to the LAN. `--no-auth` is for localhost development only.
 Immich API keys never leave the server: no endpoint returns one, and there is
 no build step that could inline one into the page.
 
+### The UI as a Home Assistant panel (hass_ingress)
+
+[hass_ingress](https://github.com/lovelylain/hass_ingress) proxies the UI
+through Home Assistant: the panel is served from HA's own origin, so the
+cookie, mixed-content and `frame-ancestors` problems of a plain iframe do not
+apply, and HA can log you in by adding a header.
+
+1. Generate a token:
+
+   ```bash
+   docker compose run --rm ui web-token      # containers
+   python3 sync.py web-token                 # without Docker
+   ```
+
+   It prints an `immich-auth: "Bearer …"` line for HA's `secrets.yaml` and a
+   `PIS_WEB_TOKEN_HASH=sha256:…` line for `.env` (or `web.token_hash` for the
+   config). Then `docker compose up -d ui` to recreate the container.
+
+2. In HA's `configuration.yaml`, then restart HA (or reload Ingress from
+   Developer tools):
+
+   ```yaml
+   ingress:
+     immich_sync:
+       title: Immich-sync
+       icon: mdi:image-sync
+       url: http://<ui-host>:8080/
+       headers:
+         authorization: !secret immich-auth
+   ```
+
+What the UI does for this:
+
+- **`Authorization: Bearer <token>`** is accepted as an alternative to the
+  session cookie. Only a sha256 of the token is stored. The password keeps
+  working, and with a token set and no password, the UI can only be opened
+  through HA. "Sign out" is hidden when the token signed you in, because HA
+  would just send the token again.
+- **`frame-ancestors` gains `'self'`** on requests that carry the
+  `X-Ingress-Path` header the proxy adds. Behind ingress, `'self'` *is* Home
+  Assistant. A browser never sends that header when it loads an iframe, so
+  another site cannot use it to frame the UI. `PIS_WEB_FRAME_ANCESTORS` is
+  not needed for this.
+- **The page uses relative URLs** (`api/accounts`), so it works under
+  `/api/ingress/immich_sync/` as well as at `/`.
+
+The token travels from HA to the UI over the LAN in plain HTTP, like the
+password does. Anyone who can reach port 8080 still needs the token.
+
 ### Force sync never runs inside a request
 
 A handler that shelled out to a download would time out, and a page refresh
@@ -672,9 +721,13 @@ POST /api/staged-deletes/unstage    {ids: [...]}
 POST /api/login  ·  /api/logout
 ```
 
-Everything but `/api/config` needs the session cookie. Bodies are JSON only,
-which together with the `SameSite=Lax` cookie is the CSRF defence (Lax only
-adds top-level GET navigations, and every GET is a read).
+Everything but `/api/config` needs the session cookie, or an
+`Authorization: Bearer <token>` header when `web.token_hash` is set (see
+[the Home Assistant panel](#the-ui-as-a-home-assistant-panel-hass_ingress)).
+Bodies are JSON only, which together with the `SameSite=Lax` cookie is the
+CSRF defence (Lax only adds top-level GET navigations, and every GET is a
+read). Browsers never attach a Bearer header by themselves, so the token adds
+no CSRF exposure.
 
 ---
 
